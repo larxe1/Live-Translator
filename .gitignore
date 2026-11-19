@@ -1,0 +1,22 @@
+# Virtual environments & caches (must stay on D:)
+.venv/
+cache/
+models/
+bin/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Large weights & secrets
+*.gguf
+*.env
+.env*
+
+# Runtime SQLite / temp artifacts
+*.db
+*.db-wal
+*.db-shm
+*.lnk

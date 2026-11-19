@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Manga &amp; Manhwa Translator</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: rgba(148, 163, 184, 0.22);
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 14px;
+      width: 340px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .header {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.9);
+      border: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      width: 100%;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--err);
+    }
+
+    .status-dot.ready {
+      background: var(--ok);
+    }
+
+    .status-dot.loading {
+      background: var(--warn);
+    }
+
+    .status-sub {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+    }
+
+    .site-toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .site-label {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .site-label-main {
+      font-weight: 600;
+      font-size: 13px;
+    }
+
+    .site-host {
+      font-size: 11.5px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: #334155;
+      border-radius: 999px;
+      transition: background-color 0.16s ease;
+    }
+
+    .slider::before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: #ffffff;
+      border-radius: 50%;
+      transition: transform 0.16s ease;
+    }
+
+    .switch input:checked + .slider {
+      background-color: var(--accent);
+    }
+
+    .switch input:checked + .slider::before {
+      transform: translateX(20px);
+    }
+
+    .switch input:disabled + .slider {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .section-title {
+      font-size: 11.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 7px;
+    }
+
+    .lang-group {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+
+    .lang-btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.55);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .lang-btn.active {
+      background: var(--accent);
+      border-color: #818cf8;
+      color: #ffffff;
+    }
+
+    .glossary-form {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    input[type="text"],
+    input[type="url"] {
+      width: 100%;
+      background: #0f172a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 6px 8px;
+      font-size: 12px;
+      outline: none;
+    }
+
+    input[type="text"]:focus,
+    input[type="url"]:focus {
+      border-color: var(--accent);
+    }
+
+    .btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: #334155;
+      color: var(--text);
+      border-radius: 7px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .btn:hover {
+      background: #475569;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      border-color: #818cf8;
+      color: #ffffff;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.14);
+      border-color: rgba(239, 68, 68, 0.35);
+      color: #fca5a5;
+    }
+
+    .btn-danger:hover {
+      background: rgba(239, 68, 68, 0.24);
+    }
+
+    .glossary-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      max-height: 112px;
+      overflow-y: auto;
+    }
+
+    .glossary-empty {
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .glossary-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+
+    .glossary-pair {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .glossary-del {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+      padding: 0 3px;
+    }
+
+    .glossary-del:hover {
+      color: #fca5a5;
+    }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    .actions .btn-full {
+      grid-column: 1 / -1;
+    }
+
+    details.advanced {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 12px;
+    }
+
+    details.advanced summary {
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      list-style: none;
+    }
+
+    .server-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .feedback {
+      min-height: 16px;
+      margin-top: 6px;
+      font-size: 11.5px;
+      color: #a5b4fc;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title-row">
+      <div class="title">Live Manga Translator</div>
+    </div>
+    <div class="status-pill" id="statusPill">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Checking local engine...</span>
+      <span class="status-sub" id="statusVram"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="site-toggle-row">
+      <div class="site-label">
+        <span class="site-label-main">Translate this site</span>
+        <span class="site-host" id="siteHost">Detecting site...</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="siteToggle" />
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Language</div>
+    <div class="lang-group" id="langGroup">
+      <button type="button" class="lang-btn" data-lang="auto">Auto</button>
+      <button type="button" class="lang-btn" data-lang="ja">Japanese</button>
+      <button type="button" class="lang-btn" data-lang="ko">Korean</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Character Name Glossary</div>
+    <form class="glossary-form" id="glossaryForm">
+      <input type="text" id="glossaryOrig" placeholder="Original (e.g. 藍星)" />
+      <input type="text" id="glossaryEng" placeholder="English (e.g. Ranshin)" />
+      <button type="submit" class="btn btn-primary">Add</button>
+    </form>
+    <div class="glossary-list" id="glossaryList">
+      <div class="glossary-empty">No pinned character names yet.</div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button type="button" class="btn" id="clearMemoryBtn">Clear Chapter Memory</button>
+    <button type="button" class="btn" id="openTestBtn">Open Test Page</button>
+    <button type="button" class="btn btn-danger btn-full" id="shutdownBtn">Stop Local GPU Engine</button>
+  </div>
+
+  <details class="advanced">
+    <summary>Advanced: Local / LAN Server URL</summary>
+    <div class="server-row">
+      <input type="url" id="serverUrlInput" placeholder="http://127.0.0.1:8765" />
+      <button type="button" class="btn btn-primary" id="saveServerUrlBtn">Save</button>
+    </div>
+  </details>
+
+  <div class="feedback" id="feedback"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "llama_port": 8766,
+  "detector_model_id": "ogkalu/comic-text-and-bubble-detector",
+  "llm_repo_id": "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF",
+  "llm_filename_pattern": "*Q4_K_M*.gguf",
+  "llm_model_path": null,
+  "llm_ctx_size": 4096,
+  "llm_gpu_layers": 23,
+  "max_cache_entries": 2000,
+  "allow_lan": false,
+  "max_image_bytes": 25000000,
+  "max_image_width": 2400,
+  "max_queue_size": 12,
+  "idle_unload_minutes": 20
+}

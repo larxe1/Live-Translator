@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Live Manga & Manhwa Translator",
+  "version": "1.0.0",
+  "description": "Free local GPU-accelerated live dialogue translator for Japanese manga and Korean manhwa.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "contextMenus",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["overlay.js", "content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["fonts/ComicNeue-Bold.woff2"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

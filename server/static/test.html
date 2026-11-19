@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Visual Test Harness — Manga Translator</title>
+  <link rel="stylesheet" href="/ext/styles.css" />
+  <style>
+    :root {
+      --bg: #0c0f16;
+      --surface: #151a24;
+      --surface-2: #1c2331;
+      --border: #2a3447;
+      --text: #eef2ff;
+      --muted: #9aa5be;
+      --accent: #6c8cff;
+      --green: #22c55e;
+      --amber: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+      background: rgba(15, 19, 28, 0.94);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      justify-content: space-between;
+    }
+    .group {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn, select, input[type="text"] {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 8px 13px;
+      font-size: 0.9rem;
+      font-family: inherit;
+    }
+    .btn {
+      cursor: pointer;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn.active {
+      background: rgba(108, 140, 255, 0.2);
+      border-color: var(--accent);
+      color: #dbe4ff;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0b1020;
+      border-color: transparent;
+    }
+    .btn-primary:hover { background: #86a1ff; }
+    .btn-primary:disabled { opacity: 0.55; cursor: wait; }
+    .peek-banner {
+      background: #141b2d;
+      border-bottom: 1px solid var(--border);
+      padding: 8px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.88rem;
+      color: var(--muted);
+    }
+    .peek-banner strong { color: #dbe4ff; }
+    .peek-active-pill {
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      font-weight: 600;
+      color: var(--text);
+    }
+    .mlt-peek-original .peek-active-pill {
+      background: rgba(245, 158, 11, 0.22);
+      border-color: var(--amber);
+      color: #fde68a;
+    }
+    .main-layout {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 20px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+      gap: 20px;
+      align-items: start;
+    }
+    @media (max-width: 980px) {
+      .main-layout { grid-template-columns: 1fr; }
+    }
+    .stage-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .image-frame {
+      position: relative;
+      display: inline-block;
+      max-width: 100%;
+    }
+    #sample-img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border-radius: 6px;
+      background: #080a0f;
+    }
+    .sidebar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+      position: sticky;
+      top: 74px;
+    }
+    .sidebar h2 {
+      margin: 0;
+      font-size: 1rem;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+    .metric {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+    }
+    .metric span {
+      display: block;
+      font-size: 0.74rem;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+    .metric strong {
+      font-size: 1rem;
+    }
+    textarea {
+      width: 100%;
+      min-height: 68px;
+      background: #0b0e14;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 8px 10px;
+      font-family: Consolas, monospace;
+      font-size: 0.85rem;
+      resize: vertical;
+    }
+    .bubble-list {
+      max-height: 430px;
+      overflow-y: auto;
+      display: grid;
+      gap: 8px;
+    }
+    .bubble-item {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 11px;
+      font-size: 0.85rem;
+    }
+    .bubble-item .meta {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 0.76rem;
+      margin-bottom: 4px;
+    }
+    .bubble-item .orig {
+      color: #a5b4fc;
+      margin-bottom: 3px;
+      word-break: break-word;
+    }
+    .bubble-item .trans {
+      color: var(--text);
+      font-weight: 600;
+      word-break: break-word;
+    }
+    .status-line {
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+    .status-line.ok { color: #86efac; }
+    .status-line.err { color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="group">
+      <a class="btn" href="/">&larr; Dashboard</a>
+      <button id="tab-jp" class="btn active" type="button">Japanese Manga Sample</button>
+      <button id="tab-ko" class="btn" type="button">Korean Webtoon Strip</button>
+      <label class="btn" for="upload-input">Upload Custom Image</label>
+      <input id="upload-input" type="file" accept="image/*" hidden />
+    </div>
+    <div class="group">
+      <select id="lang-select" aria-label="Language">
+        <option value="auto" selected>Lang: Auto</option>
+        <option value="ja">Lang: Japanese (ja)</option>
+        <option value="ko">Lang: Korean (ko)</option>
+      </select>
+      <button id="translate-btn" class="btn btn-primary" type="button">Translate Page</button>
+      <button id="clear-btn" class="btn" type="button">Clear Overlay</button>
+    </div>
+  </div>
+
+  <div class="peek-banner">
+    <div>
+      <strong>Hold <code>Alt</code></strong> anytime to peek at the original Japanese/Korean artwork underneath, or hover any translated bubble for full text + original OCR.
+    </div>
+    <div class="group">
+      <button id="peek-btn" class="btn" type="button">Peek Original (Alt)</button>
+      <span id="peek-indicator" class="peek-active-pill">Overlay Visible</span>
+    </div>
+  </div>
+
+  <div class="main-layout">
+    <main class="stage-card">
+      <div class="image-frame" id="image-frame">
+        <img id="sample-img" src="/assets/samples/jp_centipede.jpg" alt="Manga sample page" />
+      </div>
+    </main>
+
+    <aside class="sidebar">
+      <h2>Live Results</h2>
+      <div id="status-line" class="status-line">Checking server readiness...</div>
+
+      <div class="metrics">
+        <div class="metric">
+          <span>Latency</span>
+          <strong id="metric-ms">-- ms</strong>
+        </div>
+        <div class="metric">
+          <span>Bubbles</span>
+          <strong id="metric-count">--</strong>
+        </div>
+        <div class="metric">
+          <span>Detected Lang</span>
+          <strong id="metric-lang">--</strong>
+        </div>
+        <div class="metric">
+          <span>Cache</span>
+          <strong id="metric-cached">--</strong>
+        </div>
+      </div>
+
+      <div>
+        <h2 style="margin-bottom:6px;">Character Name Glossary</h2>
+        <textarea id="glossary-input" spellcheck="false" aria-label="Glossary entries">藍星 = Ranshin</textarea>
+      </div>
+
+      <div>
+        <h2 style="margin-bottom:8px;">Detected Bubbles</h2>
+        <div id="bubble-list" class="bubble-list">
+          <div class="status-line">Click <strong>Translate Page</strong> to run the local RTX GPU pipeline.</div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/ext/overlay.js"></script>
+  <script>
+    const SAMPLES = {
+      jp: {
+        url: "/assets/samples/jp_centipede.jpg",
+        lang: "auto",
+        glossary: "藍星 = Ranshin",
+        chapterId: "test_jp_centipede",
+      },
+      ko: {
+        url: "/assets/samples/ko_webtoon_strip.png",
+        lang: "auto",
+        glossary: "",
+        chapterId: "test_ko_strip",
+      },
+    };
+
+    const imgEl = document.getElementById("sample-img");
+    const tabJp = document.getElementById("tab-jp");
+    const tabKo = document.getElementById("tab-ko");
+    const uploadInput = document.getElementById("upload-input");
+    const langSelect = document.getElementById("lang-select");
+    const glossaryInput = document.getElementById("glossary-input");
+    const translateBtn = document.getElementById("translate-btn");
+    const clearBtn = document.getElementById("clear-btn");
+    const peekBtn = document.getElementById("peek-btn");
+    const peekIndicator = document.getElementById("peek-indicator");
+    const statusLine = document.getElementById("status-line");
+    const metricMs = document.getElementById("metric-ms");
+    const metricCount = document.getElementById("metric-count");
+    const metricLang = document.getElementById("metric-lang");
+    const metricCached = document.getElementById("metric-cached");
+    const bubbleList = document.getElementById("bubble-list");
+
+    let activeSample = "jp";
+    let customFile = null;
+    let customObjectUrl = null;
+    let manualPeek = false;
+
+    function parseGlossaryText(text) {
+      const out = {};
+      const trimmed = (text || "").trim();
+      if (!trimmed) return out;
+      if (trimmed.startsWith("{")) {
+        try {
+          const obj = JSON.parse(trimmed);
+          if (obj && typeof obj === "object") {
+            for (const [k, v] of Object.entries(obj)) {
+              if (String(k).trim() && String(v).trim()) out[String(k).trim()] = String(v).trim();
+            }
+            return out;
+          }
+        } catch {}
+      }
+      for (const line of trimmed.split(/\r?\n/)) {
+        const sepIdx = line.includes("=") ? line.indexOf("=") : line.indexOf(":");
+        if (sepIdx > 0) {
+          const k = line.slice(0, sepIdx).trim();
+          const v = line.slice(sepIdx + 1).trim();
+          if (k && v) out[k] = v;
+        }
+      }
+      return out;
+    }
+
+    function clearCurrentOverlay() {
+      if (window.MangaOverlay && typeof window.MangaOverlay.clearOverlay === "function") {
+        window.MangaOverlay.clearOverlay(imgEl);
+      }
+    }
+
+    function selectSample(kind) {
+      activeSample = kind;
+      customFile = null;
+      if (customObjectUrl) {
+        URL.revokeObjectURL(customObjectUrl);
+        customObjectUrl = null;
+      }
+      tabJp.classList.toggle("active", kind === "jp");
+      tabKo.classList.toggle("active", kind === "ko");
+      const cfg = SAMPLES[kind];
+      clearCurrentOverlay();
+      imgEl.src = cfg.url;
+      langSelect.value = cfg.lang;
+      glossaryInput.value = cfg.glossary;
+      bubbleList.innerHTML = '<div class="status-line">Ready to translate selected sample.</div>';
+    }
+
+    tabJp.addEventListener("click", () => selectSample("jp"));
+    tabKo.addEventListener("click", () => selectSample("ko"));
+
+    uploadInput.addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      activeSample = "custom";
+      customFile = file;
+      tabJp.classList.remove("active");
+      tabKo.classList.remove("active");
+      clearCurrentOverlay();
+      if (customObjectUrl) URL.revokeObjectURL(customObjectUrl);
+      customObjectUrl = URL.createObjectURL(file);
+      imgEl.src = customObjectUrl;
+      bubbleList.innerHTML = '<div class="status-line">Custom image loaded. Click Translate Page.</div>';
+    });
+
+    clearBtn.addEventListener("click", () => {
+      clearCurrentOverlay();
+      statusLine.className = "status-line";
+      statusLine.textContent = "Overlay cleared.";
+    });
+
+    function updatePeekUi(peeking) {
+      if (window.MangaOverlay && typeof window.MangaOverlay.setPeekOriginal === "function") {
+        window.MangaOverlay.setPeekOriginal(peeking);
+      } else {
+        document.documentElement.classList.toggle("mlt-peek-original", peeking);
+      }
+      peekIndicator.textContent = peeking ? "Peeking Original" : "Overlay Visible";
+    }
+
+    peekBtn.addEventListener("mousedown", () => updatePeekUi(true));
+    peekBtn.addEventListener("mouseup", () => updatePeekUi(manualPeek));
+    peekBtn.addEventListener("mouseleave", () => updatePeekUi(manualPeek));
+    peekBtn.addEventListener("click", () => {
+      manualPeek = !manualPeek;
+      updatePeekUi(manualPeek);
+    });
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Alt") updatePeekUi(true);
+    });
+    window.addEventListener("keyup", (e) => {
+      if (e.key === "Alt") updatePeekUi(manualPeek);
+    });
+    window.addEventListener("blur", () => updatePeekUi(manualPeek));
+
+    async function getCurrentImageBlob() {
+      if (customFile) return customFile;
+      const res = await fetch(imgEl.src);
+      if (!res.ok) throw new Error("Failed to load sample image: HTTP " + res.status);
+      return await res.blob();
+    }
+
+    function renderBubbleList(bubbles) {
+      if (!bubbles || bubbles.length === 0) {
+        bubbleList.innerHTML = '<div class="status-line">No dialogue bubbles detected.</div>';
+        return;
+      }
+      bubbleList.innerHTML = "";
+      for (const b of bubbles) {
+        const div = document.createElement("div");
+        div.className = "bubble-item";
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `#${b.id} • ${b.is_dark ? "Dark Bubble" : "Light Bubble"} (${b.text_color})`;
+
+        const orig = document.createElement("div");
+        orig.className = "orig";
+        orig.textContent = b.original;
+
+        const trans = document.createElement("div");
+        trans.className = "trans";
+        trans.textContent = b.translated;
+
+        div.append(meta, orig, trans);
+        bubbleList.appendChild(div);
+      }
+    }
+
+    translateBtn.addEventListener("click", async () => {
+      translateBtn.disabled = true;
+      statusLine.className = "status-line";
+      statusLine.textContent = "Running detection, OCR, and uncensored LLM translation...";
+      try {
+        const blob = await getCurrentImageBlob();
+        const glossary = parseGlossaryText(glossaryInput.value);
+        const form = new FormData();
+        form.append("file", blob, "page.png");
+        form.append("lang", langSelect.value);
+        form.append("chapter_id", SAMPLES[activeSample]?.chapterId || "test_custom");
+        form.append("priority", "0");
+        form.append("glossary", JSON.stringify(glossary));
+
+        const res = await fetch("/translate", { method: "POST", body: form });
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`HTTP ${res.status}: ${errText}`);
+        }
+        const data = await res.json();
+
+        metricMs.textContent = `${data.elapsed_ms} ms`;
+        metricCount.textContent = String(data.bubbles.length);
+        metricLang.textContent = String(data.lang).toUpperCase();
+        metricCached.textContent = data.cached ? "HIT" : "MISS";
+
+        renderBubbleList(data.bubbles);
+
+        if (window.MangaOverlay && typeof window.MangaOverlay.renderOverlay === "function") {
+          window.MangaOverlay.renderOverlay(imgEl, data);
+        }
+
+        statusLine.className = "status-line ok";
+        statusLine.textContent = `Translated ${data.bubbles.length} bubbles in ${data.elapsed_ms} ms.`;
+      } catch (err) {
+        statusLine.className = "status-line err";
+        statusLine.textContent = err.message || String(err);
+      } finally {
+        translateBtn.disabled = false;
+      }
+    });
+
+    async function checkReady() {
+      try {
+        const r = await fetch("/health", { cache: "no-store" });
+        const h = await r.json();
+        if (h.ready) {
+          statusLine.className = "status-line ok";
+          statusLine.textContent = `Ready (${h.gpu_name})`;
+        } else {
+          statusLine.className = "status-line";
+          statusLine.textContent = `Loading models (${h.loading_stage || "..."})...`;
+          setTimeout(checkReady, 1500);
+        }
+      } catch {
+        statusLine.className = "status-line err";
+        statusLine.textContent = "Server offline";
+      }
+    }
+
+    checkReady();
+  </script>
+</body>
+</html>

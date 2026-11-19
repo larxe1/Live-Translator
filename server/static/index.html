@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Manga & Manhwa Translator — Local GPU Engine</title>
+  <style>
+    :root {
+      --bg: #0d1017;
+      --surface: #151a24;
+      --surface-2: #1c2331;
+      --border: #2a3447;
+      --text: #eef2ff;
+      --muted: #9aa5be;
+      --accent: #6c8cff;
+      --accent-hover: #85a0ff;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at top right, #1a2238 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 28px 20px 48px;
+      line-height: 1.5;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    .title-wrap h1 {
+      margin: 0;
+      font-size: 1.65rem;
+      letter-spacing: -0.02em;
+    }
+    .title-wrap p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      border-radius: 999px;
+      font-weight: 600;
+      font-size: 0.92rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--amber);
+      box-shadow: 0 0 10px currentColor;
+    }
+    .status-badge.ready .dot { background: var(--green); color: var(--green); }
+    .status-badge.loading .dot {
+      background: var(--amber);
+      color: var(--amber);
+      animation: pulse 1.3s ease-in-out infinite;
+    }
+    .status-badge.offline .dot { background: var(--red); color: var(--red); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.82); }
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 22px 24px;
+      box-shadow: 0 14px 35px rgba(0, 0, 0, 0.28);
+    }
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 1.12rem;
+    }
+    .gpu-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+    .stat-box {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+    }
+    .stat-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .stat-value {
+      margin-top: 4px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      word-break: break-word;
+    }
+    .vram-track {
+      width: 100%;
+      height: 12px;
+      background: #0b0e14;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .vram-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3b82f6, #22c55e);
+      transition: width 0.35s ease;
+    }
+    .vram-caption {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 18px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 20px;
+      border-radius: 11px;
+      font-size: 0.96rem;
+      font-weight: 600;
+      border: 1px solid transparent;
+      cursor: pointer;
+      text-decoration: none;
+      transition: transform 0.1s ease, background 0.18s ease, border-color 0.18s ease;
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary {
+      background: var(--accent);
+      color: #0b1020;
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.14);
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.4);
+    }
+    .btn-danger:hover {
+      background: rgba(239, 68, 68, 0.24);
+      border-color: rgba(239, 68, 68, 0.7);
+    }
+    .btn-secondary {
+      background: var(--surface-2);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--accent); }
+    .steps {
+      display: grid;
+      gap: 14px;
+      margin-top: 8px;
+    }
+    .step {
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .step-num {
+      flex: 0 0 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #0b1020;
+      font-weight: 700;
+      display: grid;
+      place-items: center;
+      font-size: 0.92rem;
+    }
+    .step-body { flex: 1; }
+    .step-body strong { display: block; margin-bottom: 4px; }
+    .copy-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    code.path-pill {
+      background: #0b0e14;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.88rem;
+      color: #c7d2fe;
+      user-select: all;
+    }
+    .hint {
+      margin-top: 10px;
+      font-size: 0.88rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="title-wrap">
+        <h1>Live Manga &amp; Manhwa Translator</h1>
+        <p>100% local RTX GPU translation engine &bull; Strictly bound to <code>127.0.0.1:8765</code></p>
+      </div>
+      <div id="status-badge" class="status-badge loading" role="status">
+        <span class="dot"></span>
+        <span id="status-text">Loading...</span>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>Local GPU Engine Status</h2>
+      <div class="gpu-grid">
+        <div class="stat-box">
+          <div class="stat-label">Graphics Card</div>
+          <div id="gpu-name" class="stat-value">Checking...</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Pipeline Stage</div>
+          <div id="loading-stage" class="stat-value">initializing</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Local Uncensored LLM</div>
+          <div id="llm-model" class="stat-value">Loading...</div>
+        </div>
+      </div>
+
+      <div class="vram-track" aria-label="GPU VRAM usage">
+        <div id="vram-fill" class="vram-fill"></div>
+      </div>
+      <div class="vram-caption">
+        <span id="vram-label">VRAM: -- / -- MB</span>
+        <span id="vram-pct">--%</span>
+      </div>
+
+      <div class="actions">
+        <a class="btn btn-primary" href="/test">Open Live Visual Test Page</a>
+        <button id="shutdown-btn" class="btn btn-danger" type="button">Stop Translator &amp; Free GPU</button>
+      </div>
+      <p id="action-msg" class="hint"></p>
+    </section>
+
+    <section class="card">
+      <h2>One-Time Microsoft Edge Setup (3 Easy Steps)</h2>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <strong>Open Edge Extensions</strong>
+            <span>Open a new tab in Microsoft Edge, paste <code class="path-pill">edge://extensions</code> in the address bar, and press Enter.</span>
+            <div class="copy-row">
+              <button class="btn btn-secondary copy-btn" type="button" data-copy="edge://extensions">Copy edge://extensions</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <strong>Turn On Developer Mode</strong>
+            <span>Toggle the <strong>Developer mode</strong> switch ON (on the left sidebar or top-right of the Extensions page).</span>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <strong>Load the Extension Folder</strong>
+            <span>Click <strong>Load unpacked</strong>, paste this folder path, and select the folder. It stays installed permanently!</span>
+            <div class="copy-row">
+              <code class="path-pill">D:\Code\manga-live-translator\extension</code>
+              <button class="btn btn-secondary copy-btn" type="button" data-copy="D:\Code\manga-live-translator\extension">Copy Path</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="hint">Tip: The extension stays completely off on normal websites (YouTube, Gmail, etc.). Click its toolbar icon on any manga site to turn live translation on for that site, and hold <strong>Alt</strong> anytime to peek at the original Japanese/Korean page.</p>
+    </section>
+  </div>
+
+  <script>
+    const badge = document.getElementById("status-badge");
+    const statusText = document.getElementById("status-text");
+    const gpuNameEl = document.getElementById("gpu-name");
+    const stageEl = document.getElementById("loading-stage");
+    const llmModelEl = document.getElementById("llm-model");
+    const vramFill = document.getElementById("vram-fill");
+    const vramLabel = document.getElementById("vram-label");
+    const vramPct = document.getElementById("vram-pct");
+    const shutdownBtn = document.getElementById("shutdown-btn");
+    const actionMsg = document.getElementById("action-msg");
+
+    let pollingStopped = false;
+
+    async function refreshHealth() {
+      if (pollingStopped) return;
+      try {
+        const res = await fetch("/health", { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const h = await res.json();
+
+        const shortGpu = (h.gpu_name || "Local GPU").replace("NVIDIA GeForce ", "");
+        gpuNameEl.textContent = h.gpu_name || "Unknown GPU";
+        stageEl.textContent = h.loading_stage || (h.ready ? "ready" : "loading");
+        llmModelEl.textContent = (h.llm_model || "Qwen2.5-7B-Instruct-abliterated") + (h.llm_ready ? " (Active)" : " (Starting)");
+
+        const used = Number(h.vram_used_mb || 0);
+        const total = Number(h.vram_total_mb || 0);
+        if (total > 0) {
+          const pct = Math.min(100, Math.round((used / total) * 100));
+          vramFill.style.width = pct + "%";
+          vramLabel.textContent = `VRAM: ${used.toLocaleString()} / ${total.toLocaleString()} MB`;
+          vramPct.textContent = pct + "%";
+        } else {
+          vramFill.style.width = "0%";
+          vramLabel.textContent = "VRAM: N/A";
+          vramPct.textContent = "--";
+        }
+
+        if (h.ready) {
+          badge.className = "status-badge ready";
+          statusText.textContent = `Ready — ${shortGpu} Active`;
+        } else if (h.status === "error") {
+          badge.className = "status-badge offline";
+          statusText.textContent = "Startup Error — Check Console";
+        } else {
+          badge.className = "status-badge loading";
+          statusText.textContent = `Loading... (${h.loading_stage || "starting"})`;
+        }
+      } catch (err) {
+        badge.className = "status-badge offline";
+        statusText.textContent = "Server Offline";
+        stageEl.textContent = "offline";
+      }
+    }
+
+    shutdownBtn.addEventListener("click", async () => {
+      shutdownBtn.disabled = true;
+      actionMsg.textContent = "Stopping local GPU engine and releasing 100% of VRAM...";
+      try {
+        await fetch("/shutdown", { method: "POST" });
+        pollingStopped = true;
+        badge.className = "status-badge offline";
+        statusText.textContent = "Stopped — GPU VRAM Freed";
+        vramFill.style.width = "0%";
+        actionMsg.textContent = "Translator stopped cleanly. Use 'Start Manga Translator.bat' whenever you want to read again.";
+      } catch (err) {
+        actionMsg.textContent = "Server already stopped.";
+        badge.className = "status-badge offline";
+        statusText.textContent = "Server Offline";
+      }
+    });
+
+    document.querySelectorAll(".copy-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const value = btn.getAttribute("data-copy") || "";
+        const original = btn.textContent;
+        try {
+          await navigator.clipboard.writeText(value);
+          btn.textContent = "Copied!";
+        } catch {
+          btn.textContent = "Select & Ctrl+C";
+        }
+        setTimeout(() => { btn.textContent = original; }, 1600);
+      });
+    });
+
+    refreshHealth();
+    setInterval(refreshHealth, 1500);
+  </script>
+</body>
+</html>
