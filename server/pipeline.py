@@ -8,6 +8,7 @@ import heapq
 import inspect
 from io import BytesIO
 import itertools
+import logging
 import time
 from typing import Any, Awaitable, Callable, Literal, TypeVar
 
@@ -17,10 +18,12 @@ from PIL import Image
 from server.cache import TranslationCache
 from server.ocr.engine import is_meaningful_dialogue
 from server.schemas import Box, BubbleResult, TranslateResponse
-from server.translator.memory import ChapterMemoryStore
+from server.translator.memory import ChapterMemoryStore, contains_non_english_cjk
 from server.vision.detector import sort_reading_order
 from server.vision.geometry import BubbleStyle, analyze_bubble_appearance
 from server.vision.slicer import RawDetection
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -476,6 +479,14 @@ class TranslationPipeline:
         primary_key: str,
         response: TranslateResponse,
     ) -> None:
+        bad_bubbles = [b.id for b in response.bubbles if contains_non_english_cjk(b.translated)]
+        if bad_bubbles:
+            logger.warning(
+                "Skipping translation cache write: non-English CJK characters remain in bubble(s) %s",
+                bad_bubbles,
+            )
+            return
+
         self.cache.put(primary_key, response)
         if requested_lang != resolved_lang:
             resolved_key = self.cache.make_key(image_bytes, resolved_lang, merged_glossary)

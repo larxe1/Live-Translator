@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import deque
+
+_CJK_SCRIPT_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u3040-\u309f\u30a0-\u30ff\uff65-\uff9f"
+    r"\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]"
+)
+
+
+def contains_non_english_cjk(text: str) -> bool:
+    """Return True if text contains Chinese, Japanese (Kana/Kanji), or Korean (Hangul) characters."""
+    if not text:
+        return False
+    return _CJK_SCRIPT_RE.search(text) is not None
 
 
 class ChapterMemoryStore:
@@ -18,10 +32,12 @@ class ChapterMemoryStore:
         self._glossaries: dict[str, dict[str, str]] = {}
 
     def get_context(self, chapter_id: str) -> list[tuple[str, str]]:
-        """Return recent (original, translated) dialogue pairs for a chapter."""
+        """Return recent (original, translated) English dialogue pairs for a chapter."""
         with self._lock:
             buf = self._contexts.get(chapter_id)
-            return list(buf) if buf is not None else []
+            if buf is None:
+                return []
+            return [(o, t) for o, t in buf if o and t and not contains_non_english_cjk(t)]
 
     def get_glossary(self, chapter_id: str) -> dict[str, str]:
         """Return a shallow copy of the pinned glossary mapping for a chapter."""
@@ -41,7 +57,7 @@ class ChapterMemoryStore:
             self._glossaries[chapter_id] = cleaned
 
     def record_page(self, chapter_id: str, pairs: list[tuple[str, str]]) -> None:
-        """Append translated dialogue pairs to the chapter's rolling window."""
+        """Append English-only translated dialogue pairs to the chapter's rolling window."""
         if self.max_recent == 0 or not pairs:
             return
         with self._lock:
@@ -52,7 +68,7 @@ class ChapterMemoryStore:
             for orig, trans in pairs:
                 o = str(orig).strip()
                 t = str(trans).strip()
-                if o and t:
+                if o and t and not contains_non_english_cjk(t):
                     buf.append((o, t))
 
     def clear(self, chapter_id: str) -> None:

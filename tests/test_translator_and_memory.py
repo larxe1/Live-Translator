@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
+from contextlib import closing
+
 import pytest
 
+from server.cache import CACHE_KEY_VERSION, TranslationCache
 from server.config import AppConfig
+from server.pipeline import TranslationPipeline
+from server.schemas import Box, BubbleResult, TranslateResponse
 from server.translator.llama_manager import LlamaServerManager
 from server.translator.memory import ChapterMemoryStore
-from server.translator.translator import DialogueTranslator, _parse_translation_json, is_refusal
+from server.translator.translator import (
+    DialogueTranslator,
+    _parse_translation_json,
+    contains_non_english_cjk,
+    is_refusal,
+    is_valid_english_translation,
+)
 
 
 def test_refusal_detector_catches_safety_boilerplate_without_false_positives():
@@ -117,3 +131,254 @@ def test_llama_manager_model_resolution_and_vram_capped_command(tmp_path):
     assert "--batch-size" in cmd and "512" in cmd
     assert "--parallel" in cmd and "1" in cmd
     assert "-ngl" in cmd and "99" in cmd
+
+
+def test_contains_non_english_cjk_and_valid_english_translation():
+    # Simplified Chinese, Traditional Chinese, Japanese Kanji/Kana/Halfwidth, Korean Hangul
+    assert contains_non_english_cjk("我们是从富人那里偷来的财物分给平民的义贼团") is True
+    assert contains_non_english_cjk("夢幻團") is True
+    assert contains_non_english_cjk("夢幻団") is True
+    assert contains_non_english_cjk("ぎゃああああっ") is True
+    assert contains_non_english_cjk("テスト") is True
+    assert contains_non_english_cjk("ﾃｽﾄ") is True
+    assert contains_non_english_cjk("환영여단 안녕하세요") is True
+
+    # Normal English with punctuation, ellipsis, numbers
+    assert contains_non_english_cjk("Phantom Troupe") is False
+    assert contains_non_english_cjk("Ranshin...? 100%!") is False
+    assert contains_non_english_cjk("Get the fuck off me! A centipede!!") is False
+
+    # Validation rejects empty, refusal, CJK, and unchanged CJK echo
+    assert is_valid_english_translation("夢幻団", "") is False
+    assert is_valid_english_translation("夢幻団", "   ") is False
+    assert is_valid_english_translation("くそっ", "I cannot translate profanity.") is False
+    assert is_valid_english_translation("夢幻団", "夢幻団") is False
+    assert is_valid_english_translation("金持ちから盗んだ", "我们是从富人那里偷来的") is False
+    assert is_valid_english_translation("환영여단", "환영여단") is False
+
+    # Valid English passes
+    assert is_valid_english_translation("夢幻団", "Phantom Troupe") is True
+    assert is_valid_english_translation("藍星……？", "Ranshin...?") is True
+    assert is_valid_english_translation("...", "...") is True
+
+
+@pytest.mark.asyncio
+async def test_translator_retries_chinese_drift_and_anchors_english_prompt():
+    memory = ChapterMemoryStore()
+    calls: list[list[dict[str, str]]] = []
+
+    async def fake_llm(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            # Reproduces cache/translations.db Row 11 & 14: pure-Kanji title left as-is + Simplified Chinese drift
+            return (
+                '{"0": "夢幻団", '
+                '"1": "我们是从富人那里偷来的财物分给平民的义贼团", '
+                '"2": "Hermes became their leader."}'
+            )
+        return (
+            '{"0": "Phantom Troupe", '
+            '"1": "A band of righteous thieves who stole from the rich and gave to the commoners."}'
+        )
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm)
+    out = await tr.translate_page(
+        [
+            (0, "夢幻団"),
+            (1, "金持ちから盗んだものを庶民にバラ撒く義賊団であった"),
+            (2, "ヘルメスがそんな義賊団のトップになった"),
+        ],
+        lang="ja",
+        chapter_id="ch-row11",
+    )
+
+    assert out == {
+        0: "Phantom Troupe",
+        1: "A band of righteous thieves who stole from the rich and gave to the commoners.",
+        2: "Hermes became their leader.",
+    }
+    assert len(calls) == 2
+
+    # Primary prompt anchors English-only and includes the multi-bubble example
+    primary_sys = calls[0][0]["content"]
+    primary_usr = calls[0][1]["content"]
+    assert "STRICTLY ENGLISH ONLY" in primary_sys
+    assert "Phantom Troupe" in primary_sys
+    assert "ENGLISH ONLY" in primary_usr
+
+    # Batch retry includes ONLY failed IDs (0 and 1, not 2) and warns about non-English characters
+    retry_sys = calls[1][0]["content"]
+    retry_usr = calls[1][1]["content"]
+    assert "Chinese, Japanese, or Korean" in retry_sys
+    assert "non-English" in retry_usr
+    assert '"0"' in retry_usr and '"1"' in retry_usr
+    assert '"2"' not in retry_usr
+
+    # Chapter memory stores only the clean English pairs
+    ctx = memory.get_context("ch-row11")
+    assert len(ctx) == 3
+    assert all(not contains_non_english_cjk(trans) for _, trans in ctx)
+
+
+@pytest.mark.asyncio
+async def test_translator_falls_back_to_single_bubble_isolation_after_batch_retry():
+    memory = ChapterMemoryStore()
+    calls: list[list[dict[str, str]]] = []
+
+    async def stubborn_cjk_llm(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            # Primary: 0 and 1 drift to Chinese, 2 is English
+            return '{"0": "夢幻団", "1": "之前的首领", "2": "Move out!"}'
+        if len(calls) == 2:
+            # Batch retry: 1 recovers to English, 0 STILL fails
+            return '{"0": "梦幻团", "1": "The previous leader"}'
+        # Single-bubble isolation fallback for 0
+        return '{"0": "Phantom Troupe"}'
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=stubborn_cjk_llm)
+    out = await tr.translate_page(
+        [(0, "夢幻団"), (1, "以前の長"), (2, "進め！")],
+        lang="ja",
+        chapter_id="ch-iso",
+    )
+
+    assert out == {
+        0: "Phantom Troupe",
+        1: "The previous leader",
+        2: "Move out!",
+    }
+    assert len(calls) == 3
+    # 3rd call is isolated to bubble 0 only
+    assert '"0"' in calls[2][1]["content"]
+    assert '"1"' not in calls[2][1]["content"]
+    assert '"2"' not in calls[2][1]["content"]
+    assert len(memory.get_context("ch-iso")) == 3
+
+
+@pytest.mark.asyncio
+async def test_translator_never_records_cjk_if_all_fallbacks_fail():
+    memory = ChapterMemoryStore()
+
+    async def always_chinese(_messages):
+        return '{"0": "我们是义贼团"}'
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=always_chinese)
+    out = await tr.translate_page([(0, "義賊団だ")], lang="ja", chapter_id="ch-fail")
+
+    assert out[0] == "義賊団だ"
+    assert memory.get_context("ch-fail") == []
+
+
+def test_chapter_memory_store_rejects_cjk_in_record_and_get_context():
+    mem = ChapterMemoryStore(max_recent=5)
+    mem.record_page(
+        "ch1",
+        [
+            ("夢幻団", "夢幻団"),
+            ("金持ちから", "我们是从富人那里偷来的"),
+            ("환영여단", "환영여단"),
+            ("進め！", "Move out!"),
+        ],
+    )
+    assert mem.get_context("ch1") == [("進め！", "Move out!")]
+
+    # Even if CJK were injected directly into internal deque, get_context filters it out
+    mem._contexts["ch1"].append(("敵だ！", "是敌人！"))
+    assert mem.get_context("ch1") == [("進め！", "Move out!")]
+
+
+def _make_cache_response(translated_text: str, original_text: str = "夢幻団") -> TranslateResponse:
+    return TranslateResponse(
+        lang="ja",
+        width=800,
+        height=1200,
+        elapsed_ms=42,
+        cached=False,
+        bubbles=[
+            BubbleResult(
+                id=0,
+                bbox=Box(x1=10, y1=10, x2=100, y2=80),
+                safe_box=Box(x1=15, y1=15, x2=95, y2=75),
+                bg_color="#FFFFFF",
+                text_color="#000000",
+                is_dark=False,
+                original=original_text,
+                translated=translated_text,
+            )
+        ],
+    )
+
+
+def test_translation_cache_v2_key_evicts_on_get_and_purges_on_init(tmp_path):
+    assert CACHE_KEY_VERSION == "v2-en-only"
+    db_path = tmp_path / "translations.db"
+    cache = TranslationCache(db_path, max_entries=20)
+
+    img_bytes = b"fake-manga-page"
+    v2_key = cache.make_key(img_bytes, "ja", {})
+    legacy_hasher = hashlib.sha256()
+    legacy_hasher.update(img_bytes)
+    legacy_hasher.update(b"\x00ja\x00{}")
+    assert v2_key != legacy_hasher.hexdigest()
+
+    # Poisoned row is rejected and deleted on get()
+    poison_key = cache.make_key(b"poisoned-page", "ja")
+    poison_resp = _make_cache_response("我们是从富人那里偷来的财物")
+    cache.put(poison_key, poison_resp)
+    assert cache.get(poison_key) is None
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT payload FROM translations WHERE cache_key = ?", (poison_key,)
+        ).fetchone()
+        assert row is None
+
+    # Pre-seed DB directly with one CJK row and one clean English row, then re-open cache
+    good_key = cache.make_key(b"good-page", "ja")
+    good_resp = _make_cache_response("Phantom Troupe")
+    bad_key = "stale-v1-poisoned-row"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (bad_key, poison_resp.model_dump_json(), 1),
+        )
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (good_key, good_resp.model_dump_json(), 2),
+        )
+        conn.commit()
+
+    # Re-initializing TranslationCache automatically purges CJK row while preserving English row
+    reopened = TranslationCache(db_path, max_entries=20)
+    with closing(sqlite3.connect(db_path)) as conn:
+        keys = {
+            r[0] for r in conn.execute("SELECT cache_key FROM translations").fetchall()
+        }
+    assert bad_key not in keys
+    assert good_key in keys
+    hit = reopened.get(good_key)
+    assert hit is not None
+    assert hit.bubbles[0].translated == "Phantom Troupe"
+
+
+def test_pipeline_skips_caching_when_translation_contains_cjk(tmp_path):
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=20)
+    pipeline = TranslationPipeline(
+        detector=None,
+        ocr=None,
+        translator=None,
+        memory=memory,
+        cache=cache,
+    )
+
+    bad_key = cache.make_key(b"page-bad", "ja", {})
+    bad_resp = _make_cache_response("梦幻团")
+    pipeline._store_cache(b"page-bad", "auto", "ja", {}, bad_key, bad_resp)
+    assert cache.get(bad_key) is None
+    assert cache.get(cache.make_key(b"page-bad", "auto", {})) is None
+
+    good_key = cache.make_key(b"page-good", "auto", {})
+    good_resp = _make_cache_response("Phantom Troupe")
+    pipeline._store_cache(b"page-good", "auto", "ja", {}, good_key, good_resp)
+    assert cache.get(good_key) is not None

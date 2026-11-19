@@ -29,6 +29,8 @@ class AppConfig:
     max_image_width: int = 2400
     max_queue_size: int = 12
     idle_unload_minutes: int = 20
+    auto_update_enabled: bool = True
+    auto_update_check_interval_sec: int = 1800
     cache_dir: Path | None = None
     models_dir: Path | None = None
     llama_bin_dir: Path | None = None
@@ -101,6 +103,8 @@ def load_config(
         max_image_width=int(raw.get("max_image_width", 2400)),
         max_queue_size=int(raw.get("max_queue_size", 12)),
         idle_unload_minutes=int(raw.get("idle_unload_minutes", 20)),
+        auto_update_enabled=bool(raw.get("auto_update_enabled", True)),
+        auto_update_check_interval_sec=int(raw.get("auto_update_check_interval_sec", 1800)),
         cache_dir=raw.get("cache_dir"),
         models_dir=raw.get("models_dir"),
         llama_bin_dir=raw.get("llama_bin_dir"),

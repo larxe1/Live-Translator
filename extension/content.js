@@ -98,6 +98,14 @@
     return { immediate, lookahead };
   }
 
+  function isContextInvalidatedError(err) {
+    if (typeof chrome !== "undefined" && !chrome?.runtime?.id) {
+      return true;
+    }
+    const msg = String(err?.message || err || "");
+    return /extension context invalidated/i.test(msg);
+  }
+
   function stableGlossaryKey(glossary) {
     if (!glossary || typeof glossary !== "object") return "{}";
     const keys = Object.keys(glossary).sort();
@@ -136,6 +144,7 @@
         : win.IntersectionObserver;
 
     let enabled = false;
+    let contextInvalidated = false;
     let langMode = "auto";
     let glossary = {};
     let reqCounter = 0;
@@ -143,6 +152,7 @@
     let intersectionObserver = null;
     let pillEl = null;
     let pillDot = null;
+    let pillStatusWrap = null;
     let pillStatusText = null;
     let pillLangSelect = null;
     let pillPeekBtn = null;
@@ -184,8 +194,32 @@
       pillStatusText.textContent = label;
     }
 
+    function applyUpdatedPillUI() {
+      if (!pillEl) return;
+      if (pillEl.dataset) pillEl.dataset.updated = "true";
+      if (pillDot?.style) pillDot.style.background = "#6366f1";
+      if (pillStatusWrap) {
+        pillStatusWrap.title = "Extension updated — Click to refresh this page";
+        if (pillStatusWrap.style) pillStatusWrap.style.cursor = "pointer";
+      }
+      if (pillStatusText?.style) {
+        pillStatusText.style.textDecoration = "underline";
+        pillStatusText.style.cursor = "pointer";
+      }
+      updatePillStatus("updated", "Updated — Click to refresh");
+    }
+
+    function handleContextInvalidated() {
+      if (contextInvalidated) return;
+      contextInvalidated = true;
+      stopObservers();
+      inFlightByEl.clear();
+      mountPill();
+      applyUpdatedPillUI();
+    }
+
     function refreshStatusIndicator() {
-      if (!enabled) return;
+      if (!enabled || contextInvalidated) return;
       if (inFlightByEl.size > 0) {
         updatePillStatus("busy", `Translating (${inFlightByEl.size})`);
       } else {
@@ -214,6 +248,11 @@
       statusSpan.textContent = "Ready";
       statusWrap.appendChild(dot);
       statusWrap.appendChild(statusSpan);
+      statusWrap.addEventListener("click", () => {
+        if (contextInvalidated && typeof win?.location?.reload === "function") {
+          win.location.reload();
+        }
+      });
 
       const collapseBtn = doc.createElement("button");
       collapseBtn.type = "button";
@@ -224,6 +263,12 @@
         collapsed = !collapsed;
         pill.classList.toggle("mlt-pill-collapsed", collapsed);
         collapseBtn.textContent = collapsed ? "+" : "—";
+      });
+
+      pill.addEventListener("click", (evt) => {
+        if (contextInvalidated && evt?.target !== collapseBtn && typeof win?.location?.reload === "function") {
+          win.location.reload();
+        }
       });
 
       header.appendChild(statusWrap);
@@ -257,9 +302,17 @@
       }
       langSelect.value = langMode;
       langSelect.addEventListener("change", async () => {
+        if (contextInvalidated) return;
         langMode = langSelect.value;
         if (storage?.set) {
-          await storage.set({ langMode }).catch(() => {});
+          try {
+            await storage.set({ langMode });
+          } catch (err) {
+            if (isContextInvalidatedError(err)) {
+              handleContextInvalidated();
+              return;
+            }
+          }
         }
         retranslateAllActive();
       });
@@ -269,10 +322,18 @@
       offBtn.className = "mlt-pill-btn mlt-pill-btn-off";
       offBtn.textContent = "Off";
       offBtn.addEventListener("click", async () => {
+        if (contextInvalidated) return;
         if (storage?.get && storage?.set) {
-          const cur = await storage.get(["enabledDomains"]);
-          const next = { ...(cur?.enabledDomains || {}), [hostname]: false };
-          await storage.set({ enabledDomains: next });
+          try {
+            const cur = await storage.get(["enabledDomains"]);
+            const next = { ...(cur?.enabledDomains || {}), [hostname]: false };
+            await storage.set({ enabledDomains: next });
+          } catch (err) {
+            if (isContextInvalidatedError(err)) {
+              handleContextInvalidated();
+              return;
+            }
+          }
         }
         disable();
       });
@@ -285,9 +346,13 @@
       host.appendChild(pill);
       pillEl = pill;
       pillDot = dot;
+      pillStatusWrap = statusWrap;
       pillStatusText = statusSpan;
       pillLangSelect = langSelect;
       pillPeekBtn = peekBtn;
+      if (contextInvalidated) {
+        applyUpdatedPillUI();
+      }
     }
 
     function unmountPill() {
@@ -296,6 +361,7 @@
       }
       pillEl = null;
       pillDot = null;
+      pillStatusWrap = null;
       pillStatusText = null;
       pillLangSelect = null;
       pillPeekBtn = null;
@@ -309,14 +375,23 @@
       return next;
     }
 
+    async function sendCancelTranslate(requestId) {
+      if (contextInvalidated || typeof sendMessage !== "function") return;
+      try {
+        await sendMessage({ type: "CANCEL_TRANSLATE", requestId });
+      } catch (err) {
+        if (isContextInvalidatedError(err)) {
+          handleContextInvalidated();
+        }
+      }
+    }
+
     function cancelElementInFlight(el) {
       const active = inFlightByEl.get(el);
       if (!active) return;
       inFlightByEl.delete(el);
-      if (typeof sendMessage === "function") {
-        Promise.resolve(
-          sendMessage({ type: "CANCEL_TRANSLATE", requestId: active.requestId })
-        ).catch(() => {});
+      if (!contextInvalidated && typeof sendMessage === "function") {
+        void sendCancelTranslate(active.requestId);
       }
     }
 
@@ -452,6 +527,12 @@
 
       if (!imageUrl && !imageBase64) return null;
 
+      if (contextInvalidated) return null;
+      if (typeof chrome !== "undefined" && !chrome?.runtime?.id) {
+        handleContextInvalidated();
+        return null;
+      }
+
       const requestId = `mlt-${++reqCounter}-${Date.now()}`;
       inFlightByEl.set(el, { gen, srcKey, requestId });
       refreshStatusIndicator();
@@ -469,14 +550,19 @@
           requestId,
         });
 
-        // Stale-response guard: discard if disabled, generation changed, or src mutated.
+        // Stale-response guard: discard if disabled, invalidated, generation changed, or src mutated.
+        if (contextInvalidated) return null;
         if (!enabled && !force) return null;
         if ((generations.get(el) || 1) !== gen) return null;
         if (getElementSourceKey(el) !== srcKey) return null;
 
         if (!result || result.ok === false || !result.data) {
           if (result && !result.aborted) {
-            updatePillStatus("offline", "Server Offline");
+            if (isContextInvalidatedError(result.error)) {
+              handleContextInvalidated();
+            } else {
+              updatePillStatus("offline", "Server Offline");
+            }
           }
           return null;
         }
@@ -486,17 +572,26 @@
         setCachedResponse(cacheKey, data);
         overlayApi?.renderOverlay(el, data, { document: doc, window: win });
         return data;
+      } catch (err) {
+        if (isContextInvalidatedError(err)) {
+          handleContextInvalidated();
+          return null;
+        }
+        updatePillStatus("offline", "Server Offline");
+        return null;
       } finally {
         const cur = inFlightByEl.get(el);
         if (cur && cur.requestId === requestId) {
           inFlightByEl.delete(el);
         }
-        refreshStatusIndicator();
+        if (!contextInvalidated) {
+          refreshStatusIndicator();
+        }
       }
     }
 
     function refreshVisibleAndLookahead() {
-      if (!enabled) return;
+      if (!enabled || contextInvalidated) return;
 
       // Sort candidates in DOM order if compareDocumentPosition is available.
       if (candidates.length > 1 && typeof candidates[0]?.compareDocumentPosition === "function") {
@@ -532,7 +627,7 @@
     }
 
     function retranslateAllActive() {
-      if (!enabled) return;
+      if (!enabled || contextInvalidated) return;
       for (const el of candidates) {
         bumpGeneration(el);
         completedByEl.delete(el);
@@ -628,7 +723,7 @@
     }
 
     function enable() {
-      if (enabled) return;
+      if (enabled || contextInvalidated) return;
       enabled = true;
       mountPill();
       scanDocumentCandidates();
@@ -664,7 +759,7 @@
     }
 
     function handleStorageChanges(changes) {
-      if (!changes) return;
+      if (!changes || contextInvalidated) return;
       if (changes.langMode) {
         langMode = changes.langMode.newValue || "auto";
         if (pillLangSelect) pillLangSelect.value = langMode;
@@ -685,7 +780,7 @@
     }
 
     function handleManualTranslate(srcUrl) {
-      if (!doc || typeof doc.querySelectorAll !== "function") return null;
+      if (contextInvalidated || !doc || typeof doc.querySelectorAll !== "function") return null;
       const imgs = doc.querySelectorAll("img");
       for (const img of imgs) {
         const key = getElementSourceKey(img);
@@ -701,6 +796,8 @@
       enable,
       disable,
       isEnabled: () => enabled,
+      isContextInvalidated: () => contextInvalidated,
+      handleContextInvalidated,
       registerElement,
       getCandidates: () => [...candidates],
       setVisibility,
@@ -728,23 +825,50 @@
       document,
       window,
       storage: chrome.storage.local,
-      sendMessage: (msg) => chrome.runtime.sendMessage(msg),
+      sendMessage: async (msg) => {
+        if (!chrome?.runtime?.id) {
+          throw new Error("Extension context invalidated");
+        }
+        return await chrome.runtime.sendMessage(msg);
+      },
       overlayApi: root.MangaOverlay,
     });
 
-    controller.init().catch(() => {});
-
-    chrome.storage.onChanged.addListener((changes, areaName) => {
-      if (areaName === "local") {
-        controller.handleStorageChanges(changes);
+    void (async () => {
+      try {
+        await controller.init();
+      } catch (err) {
+        if (isContextInvalidatedError(err)) {
+          controller.handleContextInvalidated();
+        }
       }
-    });
+    })();
 
-    chrome.runtime.onMessage.addListener((msg) => {
-      if (msg?.type === "MANUAL_TRANSLATE_IMAGE") {
-        controller.handleManualTranslate(msg.srcUrl);
+    try {
+      chrome.storage.onChanged.addListener((changes, areaName) => {
+        if (!chrome?.runtime?.id) {
+          controller.handleContextInvalidated();
+          return;
+        }
+        if (areaName === "local") {
+          controller.handleStorageChanges(changes);
+        }
+      });
+
+      chrome.runtime.onMessage.addListener((msg) => {
+        if (!chrome?.runtime?.id) {
+          controller.handleContextInvalidated();
+          return;
+        }
+        if (msg?.type === "MANUAL_TRANSLATE_IMAGE") {
+          void controller.handleManualTranslate(msg.srcUrl);
+        }
+      });
+    } catch (err) {
+      if (isContextInvalidatedError(err)) {
+        controller.handleContextInvalidated();
       }
-    });
+    }
 
     return controller;
   }
@@ -760,6 +884,7 @@
     isCandidateMangaElement,
     getElementSourceKey,
     computeLookaheadTargets,
+    isContextInvalidatedError,
     createPageController,
   };
 

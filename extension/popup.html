@@ -54,6 +54,18 @@
       letter-spacing: -0.01em;
     }
 
+    .version-badge {
+      font-size: 11px;
+      font-weight: 600;
+      color: #a5b4fc;
+      background: rgba(99, 102, 241, 0.16);
+      border: 1px solid rgba(129, 140, 248, 0.35);
+      border-radius: 999px;
+      padding: 2px 8px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
     .status-pill {
       display: inline-flex;
       align-items: center;
@@ -344,6 +356,37 @@
       margin-top: 8px;
     }
 
+    .update-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .update-status-text {
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .update-status-text.has-update {
+      color: var(--warn);
+      font-weight: 600;
+    }
+
+    .update-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .update-actions .btn {
+      flex: 1;
+    }
+
+    .btn[hidden] {
+      display: none;
+    }
+
     .feedback {
       min-height: 16px;
       margin-top: 6px;
@@ -357,6 +400,7 @@
   <div class="header">
     <div class="title-row">
       <div class="title">Live Manga Translator</div>
+      <span class="version-badge" id="versionBadge">v1.1.0</span>
     </div>
     <div class="status-pill" id="statusPill">
       <span class="status-dot" id="statusDot"></span>
@@ -403,6 +447,23 @@
     <button type="button" class="btn" id="clearMemoryBtn">Clear Chapter Memory</button>
     <button type="button" class="btn" id="openTestBtn">Open Test Page</button>
     <button type="button" class="btn btn-danger btn-full" id="shutdownBtn">Stop Local GPU Engine</button>
+  </div>
+
+  <div class="card">
+    <div class="update-row">
+      <div class="site-label">
+        <span class="site-label-main">Auto-update</span>
+        <span class="update-status-text" id="updateStatusText">Checking updates...</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="autoUpdateToggle" checked />
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="update-actions">
+      <button type="button" class="btn" id="checkUpdatesBtn">Check for Updates</button>
+      <button type="button" class="btn btn-primary" id="installUpdateBtn" hidden>Install Update</button>
+    </div>
   </div>
 
   <details class="advanced">

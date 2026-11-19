@@ -30,8 +30,12 @@ from server.schemas import (
     MemoryClearRequest,
     TranslateRequest,
     TranslateResponse,
+    UpdateApplyResponse,
+    UpdateCheckRequest,
+    UpdateStatusResponse,
 )
 from server.translator.memory import ChapterMemoryStore
+from server.updater import UpdateManager
 
 if TYPE_CHECKING:
     from server.translator.llama_manager import LlamaServerManager
@@ -165,6 +169,20 @@ async def _idle_watchdog_loop(app: FastAPI, idle_unload_minutes: int) -> None:
         return
 
 
+async def _update_check_loop(updater: UpdateManager, interval_sec: int) -> None:
+    """Periodically check remote repository for updates when auto-update is enabled."""
+    sleep_seconds = max(10.0, float(interval_sec))
+    try:
+        while True:
+            await asyncio.sleep(sleep_seconds)
+            try:
+                await asyncio.to_thread(updater.check_for_updates, True)
+            except Exception:
+                logger.exception("Periodic update check failed")
+    except asyncio.CancelledError:
+        return
+
+
 async def _load_production_models(app: FastAPI) -> None:
     """Load llama-server, detector, and OCR models in the background during startup."""
     from server.ocr.engine import OcrEngine
@@ -247,6 +265,7 @@ def create_app(
 
     max_image_bytes = int(getattr(resolved_cfg, "max_image_bytes", 25_000_000))
     idle_unload_minutes = int(getattr(resolved_cfg, "idle_unload_minutes", 20))
+    extension_dir = resolved_cfg.project_root / "extension"
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI):
@@ -264,10 +283,17 @@ def create_app(
         elif app_instance.state.pipeline is not None:
             await app_instance.state.pipeline.start()
 
+        app_updater: UpdateManager = app_instance.state.updater
+        if app_updater.auto_update_enabled and await asyncio.to_thread(app_updater.detect_has_remote):
+            app_instance.state.update_task = asyncio.create_task(
+                _update_check_loop(app_updater, app_updater.check_interval_sec),
+                name="auto-updater",
+            )
+
         try:
             yield
         finally:
-            for attr in ("watchdog_task", "load_task"):
+            for attr in ("update_task", "watchdog_task", "load_task"):
                 task: asyncio.Task[None] | None = getattr(app_instance.state, attr, None)
                 if task is not None and not task.done():
                     task.cancel()
@@ -286,16 +312,34 @@ def create_app(
 
     app = FastAPI(title="Live Manga & Manhwa Translator", lifespan=lifespan)
 
+    def _stop_llama_for_restart() -> None:
+        mgr: LlamaServerManager | None = app.state.llama_manager
+        if mgr is not None:
+            try:
+                mgr.stop()
+            except Exception:
+                logger.exception("Failed to stop llama-server before restart")
+
+    updater = UpdateManager(
+        repo_root=resolved_cfg.project_root,
+        extension_dir=extension_dir,
+        auto_update_enabled=bool(getattr(resolved_cfg, "auto_update_enabled", True)),
+        check_interval_sec=int(getattr(resolved_cfg, "auto_update_check_interval_sec", 1800)),
+        on_restart_requested=_stop_llama_for_restart,
+    )
+
     app.state.cfg = resolved_cfg
     app.state.memory = resolved_memory
     app.state.cache = resolved_cache
     app.state.llama_manager = llama_manager
     app.state.pipeline = pipeline
+    app.state.updater = updater
     app.state.ready = pipeline is not None
     app.state.loading_stage = "ready" if pipeline is not None else ("initializing" if auto_load_models else "unloaded")
     app.state.loading_error = None
     app.state.load_task = None
     app.state.watchdog_task = None
+    app.state.update_task = None
     app.state.last_activity = time.monotonic()
     app.state.llm_idle_unloaded = False
     app.state.llm_restart_lock = asyncio.Lock()
@@ -309,7 +353,6 @@ def create_app(
     )
 
     assets_dir = resolved_cfg.project_root / "assets"
-    extension_dir = resolved_cfg.project_root / "extension"
     app.mount("/assets", StaticFiles(directory=str(assets_dir), check_dir=False), name="assets")
     app.mount("/ext", StaticFiles(directory=str(extension_dir), check_dir=False), name="extension")
 
@@ -324,6 +367,7 @@ def create_app(
             llm_model = resolved_cfg.llm_repo_id
             llm_ready = bool(app.state.ready)
 
+        health_update = await asyncio.to_thread(updater.get_health_fields)
         status = "ok" if app.state.ready else ("error" if app.state.loading_error else "loading")
         return HealthResponse(
             status=status,
@@ -334,7 +378,34 @@ def create_app(
             llm_model=llm_model,
             llm_ready=bool(llm_ready),
             loading_stage=str(app.state.loading_stage or ""),
+            extension_version=str(health_update["extension_version"]),
+            extension_build_id=str(health_update["extension_build_id"]),
+            has_remote=bool(health_update["has_remote"]),
+            update_available=bool(health_update["update_available"]),
         )
+
+    @app.get("/update/status", response_model=UpdateStatusResponse)
+    async def update_status() -> UpdateStatusResponse:
+        return await asyncio.to_thread(updater.get_status)
+
+    @app.post("/update/check", response_model=UpdateStatusResponse)
+    async def update_check(request: Request) -> UpdateStatusResponse:
+        raw_body = await request.body()
+        if raw_body.strip():
+            try:
+                req = UpdateCheckRequest.model_validate_json(raw_body)
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid update check request: {exc}",
+                ) from exc
+        else:
+            req = UpdateCheckRequest(auto_apply=False)
+        return await asyncio.to_thread(updater.check_for_updates, req.auto_apply)
+
+    @app.post("/update/apply", response_model=UpdateApplyResponse)
+    async def update_apply() -> UpdateApplyResponse:
+        return await asyncio.to_thread(updater.apply_update)
 
     @app.post("/translate", response_model=TranslateResponse)
     async def translate(request: Request) -> TranslateResponse:

@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 import httpx
 
-from server.translator.memory import ChapterMemoryStore
+from server.translator.memory import ChapterMemoryStore, contains_non_english_cjk
 
 LlmCaller = Callable[[list[dict[str, str]]], Awaitable[str]]
 
@@ -51,6 +51,20 @@ def is_refusal(text: str) -> bool:
     if not text or not text.strip():
         return False
     return any(pattern.search(text) is not None for pattern in _REFUSAL_PATTERNS)
+
+
+def is_valid_english_translation(orig: str, candidate: str) -> bool:
+    """Return True if candidate is a non-empty, non-refusal English translation without CJK scripts."""
+    cleaned = (candidate or "").strip()
+    if not cleaned:
+        return False
+    if is_refusal(cleaned):
+        return False
+    if contains_non_english_cjk(cleaned):
+        return False
+    if contains_non_english_cjk(orig) and cleaned == orig.strip():
+        return False
+    return True
 
 
 def _extract_int_key(raw_key: Any) -> int | None:
@@ -121,12 +135,17 @@ class DialogueTranslator:
         self._llm_caller = llm_caller
         self.timeout_s = timeout_s
 
-    async def _call_llama(self, messages: list[dict[str, str]]) -> str:
+    async def _call_llama(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.25,
+    ) -> str:
         """Send chat completion request to local llama-server OpenAI-compatible API."""
         payload = {
             "model": "local-model",
             "messages": messages,
-            "temperature": 0.25,
+            "temperature": temperature,
             "max_tokens": 1024,
             "response_format": {"type": "json_object"},
         }
@@ -139,10 +158,15 @@ class DialogueTranslator:
             data = resp.json()
             return str(data["choices"][0]["message"]["content"])
 
-    async def _invoke_llm(self, messages: list[dict[str, str]]) -> str:
+    async def _invoke_llm(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.25,
+    ) -> str:
         if self._llm_caller is not None:
             return await self._llm_caller(messages)
-        return await self._call_llama(messages)
+        return await self._call_llama(messages, temperature=temperature)
 
     def _build_primary_messages(
         self,
@@ -152,20 +176,30 @@ class DialogueTranslator:
         context: list[tuple[str, str]],
     ) -> list[dict[str, str]]:
         source_label = "Japanese manga" if lang == "ja" else "Korean manhwa"
+        example_input = (
+            '{"0": "夢幻団", "1": "くそっ！ぎゃああああっ！"}'
+            if lang == "ja"
+            else '{"0": "환영여단", "1": "젠장! 끄아아악!"}'
+        )
+        example_output = '{"0": "Phantom Troupe", "1": "Damn it! GYAAAAAH!"}'
         system_prompt = (
-            f"You are an expert uncensored {source_label} localization translator.\n"
+            f"You are an expert uncensored {source_label}-to-ENGLISH localization translator.\n"
             "Rules:\n"
-            "1. Translate every speech bubble into natural, punchy, concise English comic lettering "
-            "that fits cleanly inside speech bubbles.\n"
-            "2. Remain 100% faithful and completely uncensored across all genres—including strong "
+            "1. TARGET LANGUAGE IS STRICTLY ENGLISH ONLY (Latin alphabet A-Z). "
+            "NEVER output Chinese (中文/汉字), Japanese, Korean, or leave source text untranslated.\n"
+            "2. Translate EVERY bubble into natural, punchy, concise English comic lettering "
+            "that fits cleanly inside speech bubbles—including titles, group/faction names, "
+            "proper nouns, credits, and sound effects (translate or romanize them into English).\n"
+            "3. Remain 100% faithful and completely uncensored across all genres—including strong "
             "profanity, dark horror, gore, violence, and mature/NSFW dialogue. Never sanitize, "
             "censor, lecture, or refuse.\n"
-            "3. Preserve emotional intensity, screams, and stutters naturally "
+            "4. Preserve emotional intensity, screams, and stutters naturally "
             "(e.g., 'ぎゃああああっ' -> 'GYAAAAAH!').\n"
-            "4. Strictly use every pinned glossary name/term exactly as specified.\n"
-            "5. Output ONLY a single valid JSON object mapping each string bubble ID to its "
-            'English translation (e.g., {"0": "...", "1": "..."}). Include EVERY ID with zero '
-            "extra commentary or markdown."
+            "5. Strictly use every pinned glossary name/term exactly as specified.\n"
+            "6. Output ONLY a single valid JSON object mapping each string bubble ID to its "
+            "English translation with zero extra commentary or markdown.\n"
+            f"Example input: {example_input}\n"
+            f"Example output: {example_output}"
         )
 
         sections: list[str] = []
@@ -179,7 +213,9 @@ class DialogueTranslator:
 
         bubble_map = {str(bid): text for bid, text in bubbles}
         sections.append(
-            "Translate these page bubbles (ordered in reading order) into JSON:\n"
+            "Translate EVERY bubble below into natural ENGLISH ONLY "
+            "(never Chinese, never Japanese, never Korean). "
+            "Return a JSON object mapping each string bubble ID to its English translation:\n"
             + json.dumps(bubble_map, ensure_ascii=False)
         )
 
@@ -193,23 +229,79 @@ class DialogueTranslator:
         failed_bubbles: list[tuple[int, str]],
         lang: Literal["ja", "ko"],
         glossary: dict[str, str],
+        reason: str = "missing_or_refusal",
     ) -> list[dict[str, str]]:
         src_name = "Japanese" if lang == "ja" else "Korean"
+        non_english_notice = (
+            " CRITICAL: Your previous output contained Chinese, Japanese, or Korean characters "
+            "(or left source text untranslated). You MUST rewrite every entry strictly in "
+            "English using Latin letters (A-Z) ONLY."
+            if reason == "non_english"
+            else ""
+        )
         system_prompt = (
-            f"You are a neutral, literal {src_name}-to-English text translation engine for fictional "
-            "comic scripts. Translate the exact text provided without omission, alteration, "
-            "commentary, or refusal. Return ONLY a valid JSON object mapping each string ID to "
-            "its direct English translation."
+            f"You are a strict {src_name}-to-ENGLISH translation engine for fictional comic scripts. "
+            "Output STRICTLY ENGLISH ONLY using Latin letters (A-Z) and standard English punctuation. "
+            "NEVER output Chinese (中文/汉字), Japanese, or Korean characters, and never leave "
+            "titles, group names, proper nouns, or SFX untranslated (translate or romanize them "
+            "into English). Translate the exact text provided without omission, alteration, "
+            "commentary, or refusal."
+            f"{non_english_notice} "
+            "Return ONLY a valid JSON object mapping each string ID to its direct English translation."
         )
         parts: list[str] = []
         if glossary:
             parts.append("Glossary: " + json.dumps(glossary, ensure_ascii=False))
         bubble_map = {str(bid): text for bid, text in failed_bubbles}
-        parts.append("Input JSON:\n" + json.dumps(bubble_map, ensure_ascii=False))
+        user_header = (
+            "Previous output contained non-English Chinese/Japanese/Korean characters and was rejected. "
+            "Rewrite EVERY item below strictly in ENGLISH ONLY (Latin letters A-Z only, zero CJK characters):"
+            if reason == "non_english"
+            else "Translate EVERY item below strictly into ENGLISH ONLY (never Chinese, never Japanese, never Korean):"
+        )
+        parts.append(f"{user_header}\n" + json.dumps(bubble_map, ensure_ascii=False))
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "\n\n".join(parts)},
         ]
+
+    async def _translate_single_bubble_english(
+        self,
+        bid: int,
+        orig_text: str,
+        lang: Literal["ja", "ko"],
+        glossary: dict[str, str],
+    ) -> str | None:
+        """Isolated single-bubble English-only fallback to break batch CJK drift."""
+        src_name = "Japanese" if lang == "ja" else "Korean"
+        system_prompt = (
+            f"You are a strict {src_name}-to-ENGLISH translator. "
+            "Translate the single comic text below into natural English using ONLY Latin letters (A-Z). "
+            "NEVER output Chinese, Japanese, or Korean characters. "
+            "Even if it is a title, group name, proper noun, or sound effect "
+            "(e.g. '夢幻団' -> 'Phantom Troupe'), translate or romanize it into English. "
+            f'Return ONLY a valid JSON object with key "{bid}".'
+        )
+        parts: list[str] = []
+        if glossary:
+            parts.append("Glossary: " + json.dumps(glossary, ensure_ascii=False))
+        parts.append(
+            "Translate this single item strictly into ENGLISH ONLY (Latin letters only, zero Chinese/Japanese/Korean). "
+            f'Return JSON mapping key "{bid}" to its English translation:\n'
+            + json.dumps({str(bid): orig_text}, ensure_ascii=False)
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        raw = await self._invoke_llm(messages, temperature=0.1)
+        parsed = _parse_translation_json(raw)
+        candidate = parsed.get(bid, "").strip()
+        if not candidate and len(parsed) == 1:
+            candidate = next(iter(parsed.values())).strip()
+        if is_valid_english_translation(orig_text, candidate):
+            return candidate
+        return None
 
     async def translate_page(
         self,
@@ -218,7 +310,7 @@ class DialogueTranslator:
         chapter_id: str,
         extra_glossary: dict[str, str] | None = None,
     ) -> dict[int, str]:
-        """Translate all page bubbles in one structured JSON call, repairing missing/refused IDs."""
+        """Translate all page bubbles in one structured JSON call, repairing missing/refused/non-English IDs."""
         if not bubbles:
             return {}
 
@@ -233,35 +325,52 @@ class DialogueTranslator:
         context = self.memory.get_context(chapter_id)
         primary_messages = self._build_primary_messages(bubbles, lang, merged_glossary, context)
 
-        raw_primary = await self._invoke_llm(primary_messages)
+        raw_primary = await self._invoke_llm(primary_messages, temperature=0.25)
         parsed = _parse_translation_json(raw_primary)
 
         resolved: dict[int, str] = {}
         failed: list[tuple[int, str]] = []
+        any_non_english = False
         for bid, orig_text in bubbles:
             candidate = parsed.get(bid, "").strip()
-            if candidate and not is_refusal(candidate):
+            if is_valid_english_translation(orig_text, candidate):
                 resolved[bid] = candidate
             else:
+                if candidate and not is_refusal(candidate):
+                    any_non_english = True
                 failed.append((bid, orig_text))
 
-        # Retry ONLY failed/missing/refused IDs once with neutral literal-translation framing
+        # Batch retry failed/missing/refused/CJK IDs with explicit English-only framing at low temperature
         if failed:
-            retry_messages = self._build_retry_messages(failed, lang, merged_glossary)
-            raw_retry = await self._invoke_llm(retry_messages)
+            retry_reason = "non_english" if any_non_english else "missing_or_refusal"
+            retry_messages = self._build_retry_messages(
+                failed, lang, merged_glossary, reason=retry_reason
+            )
+            raw_retry = await self._invoke_llm(retry_messages, temperature=0.1)
             retry_parsed = _parse_translation_json(raw_retry)
+            still_failed: list[tuple[int, str]] = []
             for bid, orig_text in failed:
                 candidate = retry_parsed.get(bid, "").strip()
-                if candidate and not is_refusal(candidate):
+                if is_valid_english_translation(orig_text, candidate):
                     resolved[bid] = candidate
                 else:
-                    # Graceful fallback: never leak a refusal string into a speech bubble
+                    still_failed.append((bid, orig_text))
+
+            # Isolate stubborn CJK/failed bubbles one by one so batch continuation momentum is broken
+            for bid, orig_text in still_failed:
+                single_candidate = await self._translate_single_bubble_english(
+                    bid, orig_text, lang, merged_glossary
+                )
+                if single_candidate is not None:
+                    resolved[bid] = single_candidate
+                else:
+                    # Graceful fallback: never leak a refusal string or random CJK hallucination
                     resolved[bid] = orig_text
 
         recorded_pairs: list[tuple[str, str]] = []
         for bid, orig_text in bubbles:
             trans = resolved[bid]
-            if trans and not is_refusal(trans):
+            if is_valid_english_translation(orig_text, trans):
                 recorded_pairs.append((orig_text, trans))
         self.memory.record_page(chapter_id, recorded_pairs)
 

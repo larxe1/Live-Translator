@@ -62,6 +62,48 @@ class HealthResponse(BaseModel):
     llm_model: str
     llm_ready: bool
     loading_stage: str = ""
+    extension_version: str = "1.0.0"
+    extension_build_id: str = ""
+    has_remote: bool = False
+    update_available: bool = False
+
+
+class UpdateStatusResponse(BaseModel):
+    """Current extension build ID and git repository update status."""
+
+    extension_version: str
+    extension_build_id: str
+    has_remote: bool
+    remote_url: str
+    branch: str
+    current_commit: str
+    remote_commit: str | None = None
+    commits_behind: int = 0
+    update_available: bool = False
+    auto_update_enabled: bool = True
+    working_tree_clean: bool = True
+    last_checked: float | None = None
+    last_error: str | None = None
+    updating: bool = False
+    restart_required: bool = False
+
+
+class UpdateCheckRequest(BaseModel):
+    """Optional request payload for checking and optionally applying updates."""
+
+    auto_apply: bool = False
+
+
+class UpdateApplyResponse(BaseModel):
+    """Result of applying a fast-forward repository update."""
+
+    ok: bool
+    updated: bool
+    message: str
+    extension_changed: bool
+    server_changed: bool
+    restart_scheduled: bool
+    status: UpdateStatusResponse
 
 
 class GlossaryUpdateRequest(BaseModel):
