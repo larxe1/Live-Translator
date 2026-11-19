@@ -71,6 +71,13 @@ def test_dark_bubble_detected_with_white_text_and_light_bubble_dark_text():
     assert light_style.uniform_bg_ratio > 0.95
 
 
+def test_safe_box_uses_six_percent_inset_to_preserve_usable_width():
+    canvas = np.full((260, 160, 3), 255, dtype=np.uint8)
+    style = analyze_bubble_appearance(canvas, Box(x1=20, y1=20, x2=120, y2=220))
+    # 100x200 bubble -> 6% inset = 6px horizontal, 12px vertical -> 88x176 usable interior
+    assert style.safe_box == Box(x1=26, y1=32, x2=114, y2=208)
+
+
 def test_clean_narration_box_rescued_but_artwork_sfx_rejected():
     # Gradient artwork background with stylized SFX text -> low uniform background ratio
     art = np.tile(np.linspace(30, 210, 200, dtype=np.uint8), (200, 1))

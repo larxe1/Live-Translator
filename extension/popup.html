@@ -387,6 +387,17 @@
       display: none;
     }
 
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: progress;
+    }
+
+    .btn-start {
+      width: 100%;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+
     .feedback {
       min-height: 16px;
       margin-top: 6px;
@@ -400,13 +411,14 @@
   <div class="header">
     <div class="title-row">
       <div class="title">Live Manga Translator</div>
-      <span class="version-badge" id="versionBadge">v1.1.0</span>
+      <span class="version-badge" id="versionBadge">v1.2.0</span>
     </div>
     <div class="status-pill" id="statusPill">
       <span class="status-dot" id="statusDot"></span>
       <span id="statusText">Checking local engine...</span>
       <span class="status-sub" id="statusVram"></span>
     </div>
+    <button type="button" class="btn btn-primary btn-start" id="startEngineBtn" hidden>Start Local Engine</button>
   </div>
 
   <div class="card">
@@ -446,7 +458,7 @@
   <div class="actions">
     <button type="button" class="btn" id="clearMemoryBtn">Clear Chapter Memory</button>
     <button type="button" class="btn" id="openTestBtn">Open Test Page</button>
-    <button type="button" class="btn btn-danger btn-full" id="shutdownBtn">Stop Local GPU Engine</button>
+    <button type="button" class="btn btn-danger btn-full" id="shutdownBtn" hidden>Stop Local GPU Engine</button>
   </div>
 
   <div class="card">

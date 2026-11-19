@@ -61,7 +61,7 @@ def test_enforce_d_drive_env_sets_all_caches_under_project_root(tmp_path: Path, 
     assert cfg.max_image_bytes == 25_000_000
     assert cfg.max_image_width == 2400
     assert cfg.max_queue_size == 12
-    assert cfg.idle_unload_minutes == 20
+    assert cfg.idle_unload_minutes == 3
 
 
 def test_load_config_reads_custom_json_overrides(tmp_path: Path) -> None:

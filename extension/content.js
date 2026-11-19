@@ -135,6 +135,8 @@
     const chapterId = deps.chapterId ?? `${hostname}${win.location?.pathname || "/"}`;
     const storage = deps.storage;
     const sendMessage = deps.sendMessage;
+    const connectPort = deps.connectPort;
+    const preloadWholeChapter = deps.preloadWholeChapter !== false;
     const overlayApi = deps.overlayApi || root.MangaOverlay;
     const MutationObserverCtor =
       deps.MutationObserver !== undefined ? deps.MutationObserver : win.MutationObserver;
@@ -158,6 +160,23 @@
     let pillPeekBtn = null;
     let isPeeking = false;
     let collapsed = false;
+
+    // Server lifecycle as seen by this tab: "ok" | "offline" | "starting".
+    let serverState = "ok";
+    let offlineLabel = "Offline — Click to start";
+    let startingLabel = "Starting Engine...";
+    let healthPollTimer = null;
+    let healthPollTries = 0;
+    let preloadTimer = null;
+    let startRequestInFlight = false;
+    const healthPollIntervalMs = deps.healthPollIntervalMs ?? 2000;
+    const healthPollMaxTries = deps.healthPollMaxTries ?? 45;
+    const setTimeoutImpl =
+      deps.setTimeout || (typeof win?.setTimeout === "function" ? win.setTimeout.bind(win) : setTimeout);
+    const clearTimeoutImpl =
+      deps.clearTimeout ||
+      (typeof win?.clearTimeout === "function" ? win.clearTimeout.bind(win) : clearTimeout);
+    const offlineFailedEls = new Set();
 
     const candidates = [];
     const candidateSet = new Set();
@@ -212,19 +231,200 @@
     function handleContextInvalidated() {
       if (contextInvalidated) return;
       contextInvalidated = true;
+      stopHealthPoll();
       stopObservers();
       inFlightByEl.clear();
       mountPill();
+      setOfflineClickable(false);
       applyUpdatedPillUI();
+    }
+
+    function setOfflineClickable(on) {
+      if (pillStatusWrap) {
+        pillStatusWrap.title = on ? "Click to start the local translator engine" : "";
+        if (pillStatusWrap.style) pillStatusWrap.style.cursor = on ? "pointer" : "";
+      }
+      if (pillStatusText?.style) {
+        pillStatusText.style.textDecoration = on ? "underline" : "";
+        pillStatusText.style.cursor = on ? "pointer" : "";
+      }
+    }
+
+    function isElementCompleted(el) {
+      const done = completedByEl.get(el);
+      if (!done) return false;
+      const gen = generations.get(el) || 1;
+      return done.gen === gen && done.srcKey === getElementSourceKey(el);
     }
 
     function refreshStatusIndicator() {
       if (!enabled || contextInvalidated) return;
+      const total = candidates.length;
+      const doneCount = total > 0 ? candidates.filter(isElementCompleted).length : 0;
+
       if (inFlightByEl.size > 0) {
-        updatePillStatus("busy", `Translating (${inFlightByEl.size})`);
+        setOfflineClickable(false);
+        const label =
+          total > 0
+            ? `Translating ${Math.min(doneCount + 1, total)}/${total}...`
+            : `Translating (${inFlightByEl.size})`;
+        updatePillStatus("busy", label);
+      } else if (serverState === "starting") {
+        setOfflineClickable(false);
+        updatePillStatus("starting", startingLabel);
+      } else if (serverState === "offline") {
+        updatePillStatus("offline", offlineLabel);
+        setOfflineClickable(true);
       } else {
-        updatePillStatus("ready", "Ready");
+        setOfflineClickable(false);
+        const label = total > 0 && doneCount >= total ? `Translated ${doneCount}/${total}` : "Ready";
+        updatePillStatus("ready", label);
       }
+    }
+
+    function markServerOffline(label = "Offline — Click to start") {
+      if (serverState === "starting") return;
+      serverState = "offline";
+      offlineLabel = label;
+      refreshStatusIndicator();
+    }
+
+    function stopHealthPoll() {
+      if (healthPollTimer !== null) {
+        clearTimeoutImpl(healthPollTimer);
+        healthPollTimer = null;
+      }
+      healthPollTries = 0;
+    }
+
+    function scheduleHealthPoll() {
+      if (healthPollTimer !== null) return;
+      healthPollTimer = setTimeoutImpl(() => {
+        healthPollTimer = null;
+        void healthPollTick();
+      }, healthPollIntervalMs);
+    }
+
+    /**
+     * Enters "starting" mode and runs a bounded GET_HEALTH poll that
+     * re-triggers translation automatically once the engine is ready.
+     */
+    function beginStartingWatch() {
+      if (contextInvalidated) return;
+      const wasStarting = serverState === "starting";
+      serverState = "starting";
+      startingLabel = "Starting Engine...";
+      refreshStatusIndicator();
+      if (!wasStarting) healthPollTries = 0;
+      scheduleHealthPoll();
+    }
+
+    function stageLabel(stage) {
+      const raw = String(stage || "");
+      if (raw === "starting_llm" || raw === "restarting_llm") return "Loading LLM...";
+      if (raw === "loading_detector") return "Loading detector...";
+      if (raw === "loading_ocr") return "Loading OCR...";
+      if (raw === "initializing_pipeline") return "Preparing pipeline...";
+      return "Starting Engine...";
+    }
+
+    function handleEngineReady() {
+      stopHealthPoll();
+      serverState = "ok";
+      offlineFailedEls.clear();
+      refreshStatusIndicator();
+      if (enabled && !contextInvalidated) {
+        void refreshVisibleAndLookahead();
+      }
+    }
+
+    async function healthPollTick() {
+      if (contextInvalidated || serverState !== "starting" || typeof sendMessage !== "function") {
+        stopHealthPoll();
+        return;
+      }
+      healthPollTries += 1;
+
+      let res = null;
+      try {
+        res = await sendMessage({ type: "GET_HEALTH" });
+      } catch (err) {
+        stopHealthPoll();
+        if (isContextInvalidatedError(err)) {
+          handleContextInvalidated();
+          return;
+        }
+        serverState = "ok";
+        markServerOffline();
+        return;
+      }
+      if (contextInvalidated || serverState !== "starting") return;
+
+      if (res?.ok && res.data?.ready === true) {
+        handleEngineReady();
+        return;
+      }
+
+      const stage = String(res?.data?.loading_stage || "");
+      if (res?.ok && res.data && stage.startsWith("error")) {
+        stopHealthPoll();
+        serverState = "ok";
+        markServerOffline("Engine error — Click to retry");
+        return;
+      }
+      if (!res || (res.ok === false && !res.starting)) {
+        stopHealthPoll();
+        serverState = "ok";
+        markServerOffline();
+        return;
+      }
+
+      if (healthPollTries >= healthPollMaxTries) {
+        stopHealthPoll();
+        serverState = "ok";
+        markServerOffline("Start timed out — Click to retry");
+        return;
+      }
+
+      startingLabel = res?.ok && res.data ? stageLabel(stage) : "Starting Engine...";
+      refreshStatusIndicator();
+      scheduleHealthPoll();
+    }
+
+    async function requestEngineStart() {
+      if (contextInvalidated || startRequestInFlight || typeof sendMessage !== "function") {
+        return false;
+      }
+      if (serverState === "starting") return false;
+      startRequestInFlight = true;
+      serverState = "starting";
+      startingLabel = "Starting Engine...";
+      refreshStatusIndicator();
+
+      let res = null;
+      try {
+        res = await sendMessage({ type: "START_SERVER" });
+      } catch (err) {
+        if (isContextInvalidatedError(err)) {
+          handleContextInvalidated();
+          return false;
+        }
+        res = { ok: false, error: err?.message || String(err) };
+      } finally {
+        startRequestInFlight = false;
+      }
+      if (contextInvalidated) return false;
+
+      if (!res || !res.ok) {
+        serverState = "ok";
+        markServerOffline(
+          res?.hostMissing ? "Launcher missing — run setup.ps1" : "Start failed — Click to retry"
+        );
+        return false;
+      }
+      healthPollTries = 0;
+      beginStartingWatch();
+      return true;
     }
 
     function mountPill() {
@@ -251,6 +451,8 @@
       statusWrap.addEventListener("click", () => {
         if (contextInvalidated && typeof win?.location?.reload === "function") {
           win.location.reload();
+        } else if (serverState === "offline") {
+          void requestEngineStart();
         }
       });
 
@@ -390,8 +592,33 @@
       const active = inFlightByEl.get(el);
       if (!active) return;
       inFlightByEl.delete(el);
+      if (active.port) {
+        try {
+          active.port.disconnect();
+        } catch (_err) {
+          // Ignore already disconnected port.
+        }
+      }
+      if (active.session && typeof active.session.destroy === "function") {
+        active.session.destroy();
+      }
       if (!contextInvalidated && typeof sendMessage === "function") {
         void sendCancelTranslate(active.requestId);
+      }
+    }
+
+    function stopPreloadTimer() {
+      if (preloadTimer !== null) {
+        clearTimeoutImpl(preloadTimer);
+        preloadTimer = null;
+      }
+    }
+
+    function cancelAllActive() {
+      stopPreloadTimer();
+      stopHealthPoll();
+      for (const [el] of [...inFlightByEl.entries()]) {
+        cancelElementInFlight(el);
       }
     }
 
@@ -477,6 +704,7 @@
     async function translateElement(el, priority = 0, force = false) {
       if (!enabled && !force) return null;
       if (!el) return null;
+      if (serverState === "starting" && !force) return null;
 
       const srcKey = getElementSourceKey(el);
       const gen = generations.get(el) || 1;
@@ -534,10 +762,164 @@
       }
 
       const requestId = `mlt-${++reqCounter}-${Date.now()}`;
-      inFlightByEl.set(el, { gen, srcKey, requestId });
+      const entry = { gen, srcKey, requestId, priority, port: null, session: null };
+      inFlightByEl.set(el, entry);
       refreshStatusIndicator();
 
+      const isStale = () =>
+        contextInvalidated ||
+        (!enabled && !force) ||
+        (generations.get(el) || 1) !== gen ||
+        getElementSourceKey(el) !== srcKey;
+
+      const buildFallbackResponse = (meta, bubblesById) => {
+        if (!meta) return null;
+        const bubbles = (meta.bubbles || []).map((b) => {
+          const streamed = bubblesById.get(b.id);
+          return streamed ? { ...b, translated: streamed.translated ?? "" } : { ...b, translated: "" };
+        });
+        return {
+          lang: meta.lang,
+          width: meta.width,
+          height: meta.height,
+          bubbles,
+        };
+      };
+
+      const finishSuccess = (data) => {
+        if (serverState !== "ok") {
+          stopHealthPoll();
+          serverState = "ok";
+        }
+        completedByEl.set(el, { gen, srcKey, response: data });
+        setCachedResponse(cacheKey, data);
+      };
+
+      const translateViaPort = () => {
+        if (typeof connectPort !== "function") return null;
+        let port;
+        try {
+          port = connectPort("mlt-translate-stream");
+        } catch (err) {
+          if (isContextInvalidatedError(err)) {
+            handleContextInvalidated();
+            return Promise.resolve(null);
+          }
+          return null;
+        }
+        if (!port || typeof port.postMessage !== "function") return null;
+        entry.port = port;
+
+        return new Promise((resolve) => {
+          let settled = false;
+          let meta = null;
+          let session = null;
+          const bubblesById = new Map();
+
+          const settle = (value) => {
+            if (settled) return;
+            settled = true;
+            try {
+              port.disconnect();
+            } catch (_err) {
+              // Ignore already disconnected port.
+            }
+            resolve(value);
+          };
+
+          port.onMessage?.addListener((evt) => {
+            if (settled) return;
+            if (isStale()) {
+              session?.destroy?.();
+              settle(null);
+              return;
+            }
+            if (!evt || typeof evt !== "object") return;
+
+            if (evt.type === "meta") {
+              meta = evt;
+              if (typeof overlayApi?.createOverlaySession === "function") {
+                session = overlayApi.createOverlaySession(el, evt, { document: doc, window: win });
+                entry.session = session;
+              }
+              return;
+            }
+
+            if (evt.type === "bubble") {
+              bubblesById.set(evt.id, evt);
+              if (session) {
+                const base = (meta?.bubbles || []).find((b) => b.id === evt.id) || {};
+                session.addBubble({ ...base, ...evt });
+              }
+              return;
+            }
+
+            if (evt.type === "done") {
+              const finalResp = evt.response || buildFallbackResponse(meta, bubblesById);
+              if (session) {
+                session.finish?.();
+              } else if (finalResp) {
+                overlayApi?.renderOverlay(el, finalResp, { document: doc, window: win });
+              }
+              if (finalResp) {
+                finishSuccess(finalResp);
+              }
+              settle(finalResp);
+              return;
+            }
+
+            if (evt.type === "error") {
+              session?.destroy?.();
+              if (isContextInvalidatedError(evt.error || evt.detail)) {
+                handleContextInvalidated();
+              } else if (evt.starting) {
+                beginStartingWatch();
+              } else if (evt.hostMissing) {
+                markServerOffline("Launcher missing — run setup.ps1");
+              } else if (evt.offline) {
+                markServerOffline("Offline — Click to start");
+              }
+              settle(null);
+            }
+          });
+
+          port.onDisconnect?.addListener(() => {
+            if (settled) return;
+            const lastErr = typeof chrome !== "undefined" ? chrome?.runtime?.lastError : null;
+            if (lastErr && isContextInvalidatedError(lastErr.message || lastErr)) {
+              handleContextInvalidated();
+            }
+            session?.destroy?.();
+            settle(null);
+          });
+
+          try {
+            port.postMessage({
+              type: "START",
+              imageUrl,
+              imageBase64,
+              refererUrl: win.location?.href || "",
+              lang: langMode,
+              chapterId,
+              priority,
+              glossary,
+              requestId,
+            });
+          } catch (err) {
+            if (isContextInvalidatedError(err)) {
+              handleContextInvalidated();
+            }
+            settle(null);
+          }
+        });
+      };
+
       try {
+        const portPromise = translateViaPort();
+        if (portPromise) {
+          return await portPromise;
+        }
+
         const result = await sendMessage({
           type: "TRANSLATE_IMAGE",
           imageUrl,
@@ -551,25 +933,25 @@
         });
 
         // Stale-response guard: discard if disabled, invalidated, generation changed, or src mutated.
-        if (contextInvalidated) return null;
-        if (!enabled && !force) return null;
-        if ((generations.get(el) || 1) !== gen) return null;
-        if (getElementSourceKey(el) !== srcKey) return null;
+        if (isStale()) return null;
 
         if (!result || result.ok === false || !result.data) {
           if (result && !result.aborted) {
             if (isContextInvalidatedError(result.error)) {
               handleContextInvalidated();
+            } else if (result.starting) {
+              beginStartingWatch();
+            } else if (result.hostMissing) {
+              markServerOffline("Launcher missing — run setup.ps1");
             } else {
-              updatePillStatus("offline", "Server Offline");
+              markServerOffline("Offline — Click to start");
             }
           }
           return null;
         }
 
         const data = result.data;
-        completedByEl.set(el, { gen, srcKey, response: data });
-        setCachedResponse(cacheKey, data);
+        finishSuccess(data);
         overlayApi?.renderOverlay(el, data, { document: doc, window: win });
         return data;
       } catch (err) {
@@ -577,7 +959,7 @@
           handleContextInvalidated();
           return null;
         }
-        updatePillStatus("offline", "Server Offline");
+        markServerOffline("Offline — Click to start");
         return null;
       } finally {
         const cur = inFlightByEl.get(el);
@@ -586,14 +968,14 @@
         }
         if (!contextInvalidated) {
           refreshStatusIndicator();
+          if (preloadWholeChapter && enabled && serverState === "ok") {
+            scheduleBackgroundPreload();
+          }
         }
       }
     }
 
-    function refreshVisibleAndLookahead() {
-      if (!enabled || contextInvalidated) return;
-
-      // Sort candidates in DOM order if compareDocumentPosition is available.
+    function sortCandidatesInDomOrder() {
       if (candidates.length > 1 && typeof candidates[0]?.compareDocumentPosition === "function") {
         candidates.sort((a, b) => {
           if (a === b) return 0;
@@ -601,6 +983,52 @@
           return pos & 4 ? -1 : 1;
         });
       }
+    }
+
+    function hasPriorityZeroInFlight() {
+      for (const active of inFlightByEl.values()) {
+        if (active.priority === 0) return true;
+      }
+      return false;
+    }
+
+    function hasBackgroundInFlight() {
+      for (const active of inFlightByEl.values()) {
+        if (active.priority > 0) return true;
+      }
+      return false;
+    }
+
+    function runBackgroundPreloadStep() {
+      if (!preloadWholeChapter || !enabled || contextInvalidated || serverState !== "ok") {
+        return;
+      }
+      if (hasPriorityZeroInFlight() || hasBackgroundInFlight()) {
+        return;
+      }
+      sortCandidatesInDomOrder();
+      for (const el of candidates) {
+        if (isElementCompleted(el) || inFlightByEl.has(el)) continue;
+        void translateElement(el, 1);
+        return;
+      }
+    }
+
+    function scheduleBackgroundPreload() {
+      if (!preloadWholeChapter || !enabled || contextInvalidated || serverState !== "ok") {
+        return;
+      }
+      if (preloadTimer !== null) return;
+      preloadTimer = setTimeoutImpl(() => {
+        preloadTimer = null;
+        runBackgroundPreloadStep();
+      }, 0);
+    }
+
+    function refreshVisibleAndLookahead() {
+      if (!enabled || contextInvalidated) return;
+
+      sortCandidatesInDomOrder();
 
       const { immediate, lookahead } = computeLookaheadTargets(
         candidates,
@@ -609,9 +1037,17 @@
       );
       const activeTargets = new Set([...immediate, ...lookahead]);
 
-      // Cancel off-screen requests scrolled far away.
-      for (const [el] of inFlightByEl.entries()) {
-        if (!activeTargets.has(el)) {
+      // Promote any background pre-translation that the user just scrolled into view.
+      for (const el of immediate) {
+        const active = inFlightByEl.get(el);
+        if (active && active.priority > 0) {
+          active.priority = 0;
+        }
+      }
+
+      // Cancel off-screen lookahead requests scrolled far away, keeping active chapter preload (priority 1) if still a candidate.
+      for (const [el, active] of inFlightByEl.entries()) {
+        if (!activeTargets.has(el) && !(preloadWholeChapter && active.priority === 1 && candidateSet.has(el))) {
           cancelElementInFlight(el);
         }
       }
@@ -622,6 +1058,9 @@
       }
       for (const el of lookahead) {
         promises.push(translateElement(el, 1));
+      }
+      if (preloadWholeChapter && immediate.length === 0 && lookahead.length === 0) {
+        scheduleBackgroundPreload();
       }
       return Promise.all(promises);
     }
@@ -733,12 +1172,11 @@
 
     function disable() {
       enabled = false;
+      cancelAllActive();
+      serverState = "ok";
       stopObservers();
       for (const el of [...candidates]) {
         removeCandidate(el);
-      }
-      for (const [el] of [...inFlightByEl.entries()]) {
-        cancelElementInFlight(el);
       }
       visibleSet.clear();
       unmountPill();
@@ -791,10 +1229,19 @@
       return null;
     }
 
+    if (typeof win?.addEventListener === "function") {
+      const onUnload = () => {
+        cancelAllActive();
+      };
+      win.addEventListener("pagehide", onUnload);
+      win.addEventListener("beforeunload", onUnload);
+    }
+
     return {
       init,
       enable,
       disable,
+      cancelAllActive,
       isEnabled: () => enabled,
       isContextInvalidated: () => contextInvalidated,
       handleContextInvalidated,
@@ -830,6 +1277,15 @@
           throw new Error("Extension context invalidated");
         }
         return await chrome.runtime.sendMessage(msg);
+      },
+      connectPort: (name) => {
+        if (!chrome?.runtime?.id) {
+          throw new Error("Extension context invalidated");
+        }
+        if (typeof chrome.runtime.connect === "function") {
+          return chrome.runtime.connect({ name });
+        }
+        return null;
       },
       overlayApi: root.MangaOverlay,
     });

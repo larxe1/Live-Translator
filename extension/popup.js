@@ -16,6 +16,7 @@ const glossaryList = document.getElementById("glossaryList");
 const clearMemoryBtn = document.getElementById("clearMemoryBtn");
 const openTestBtn = document.getElementById("openTestBtn");
 const shutdownBtn = document.getElementById("shutdownBtn");
+const startEngineBtn = document.getElementById("startEngineBtn");
 const autoUpdateToggle = document.getElementById("autoUpdateToggle");
 const updateStatusText = document.getElementById("updateStatusText");
 const checkUpdatesBtn = document.getElementById("checkUpdatesBtn");
@@ -30,11 +31,30 @@ let currentServerUrl = DEFAULT_SERVER_URL;
 let currentGlossary = {};
 let lastKnownUpdateStatus = null;
 
+const HEALTH_POLL_INTERVAL_MS = 1500;
+const HEALTH_POLL_MAX_MS = 180000;
+const OFFLINE_TEXT = "Offline — click Start Engine";
+const STAGE_LABELS = {
+  initializing: "Initializing...",
+  starting_llm: "Loading LLM...",
+  restarting_llm: "Reloading LLM...",
+  loading_detector: "Loading detector...",
+  loading_ocr: "Loading OCR...",
+  initializing_pipeline: "Preparing pipeline...",
+  idle_unloaded: "LLM unloaded (idle)",
+  unloaded: "Models not loaded",
+};
+
+let engineStarting = false;
+let healthPollTimer = null;
+let healthPollActive = false;
+let healthPollStartedAt = 0;
+
 function getLocalVersion() {
   try {
-    return chrome.runtime?.getManifest?.()?.version || "1.1.0";
+    return chrome.runtime?.getManifest?.()?.version || "1.2.0";
   } catch (_err) {
-    return "1.1.0";
+    return "1.2.0";
   }
 }
 
@@ -102,29 +122,162 @@ function renderUpdateUI(statusData, autoEnabled, localVersion = getLocalVersion(
       : "Auto-update active (local live-reload)";
 }
 
+function formatLoadingStage(stage) {
+  const raw = String(stage || "").trim();
+  if (!raw) return "Loading models...";
+  if (STAGE_LABELS[raw]) return STAGE_LABELS[raw];
+  if (raw.startsWith("error")) return `Engine error: ${raw.replace(/^error:\s*/, "")}`;
+  return `Loading models... (${raw})`;
+}
+
+/**
+ * state: "offline" | "starting" | "loading" | "online"
+ */
+function setEngineControls(state) {
+  const showStart = state === "offline" || state === "starting";
+  if (startEngineBtn) {
+    startEngineBtn.hidden = !showStart;
+    startEngineBtn.disabled = state === "starting";
+    startEngineBtn.textContent = state === "starting" ? "Starting Engine..." : "Start Local Engine";
+  }
+  if (shutdownBtn) {
+    shutdownBtn.hidden = showStart;
+  }
+}
+
+function renderOffline(message = OFFLINE_TEXT) {
+  statusDot.className = "status-dot";
+  statusText.textContent = message;
+  statusVram.textContent = "";
+  setEngineControls("offline");
+}
+
+function renderStarting(message = "Starting local engine...") {
+  statusDot.className = "status-dot loading";
+  statusText.textContent = message;
+  statusVram.textContent = "";
+  setEngineControls("starting");
+}
+
+/**
+ * Renders current server health and returns { online, ready, starting }.
+ * Never schedules polling itself; callers decide.
+ */
 async function refreshHealth() {
   const res = await sendBgMessage({ type: "GET_HEALTH" });
   if (!res || !res.ok || !res.data) {
-    statusDot.className = "status-dot";
-    statusText.textContent = "Offline — open Start Manga Translator";
-    statusVram.textContent = "";
-    return;
+    const starting = engineStarting || Boolean(res?.starting);
+    if (starting) {
+      renderStarting();
+    } else {
+      renderOffline();
+    }
+    return { online: false, ready: false, starting };
   }
   const h = res.data;
   if (h.extension_build_id) {
     renderVersionBadge(h.extension_build_id, h.extension_version || getLocalVersion());
   }
   if (h.ready) {
+    engineStarting = false;
     statusDot.className = "status-dot ready";
     statusText.textContent = `Ready — ${h.gpu_name || "Local GPU"}`;
     statusVram.textContent =
       h.vram_total_mb > 0 ? `${h.vram_used_mb}/${h.vram_total_mb} MB` : "";
-  } else {
-    statusDot.className = "status-dot loading";
-    const stage = h.loading_stage ? ` (${h.loading_stage})` : "";
-    statusText.textContent = `Loading models...${stage}`;
-    statusVram.textContent = "";
+    setEngineControls("online");
+    return { online: true, ready: true, starting: false };
   }
+  statusDot.className = "status-dot loading";
+  statusText.textContent = formatLoadingStage(h.loading_stage);
+  statusVram.textContent = "";
+  setEngineControls("loading");
+  const failed = String(h.loading_stage || "").startsWith("error");
+  return { online: true, ready: false, starting: !failed, failed };
+}
+
+function stopHealthPolling() {
+  healthPollActive = false;
+  healthPollStartedAt = 0;
+  if (healthPollTimer !== null) {
+    clearTimeout(healthPollTimer);
+    healthPollTimer = null;
+  }
+}
+
+function scheduleHealthPoll() {
+  if (healthPollTimer !== null) clearTimeout(healthPollTimer);
+  healthPollTimer = setTimeout(() => {
+    healthPollTimer = null;
+    void pollHealthTick();
+  }, HEALTH_POLL_INTERVAL_MS);
+}
+
+function startHealthPolling() {
+  if (healthPollActive) return;
+  healthPollActive = true;
+  healthPollStartedAt = Date.now();
+  scheduleHealthPoll();
+}
+
+async function pollHealthTick() {
+  if (!healthPollActive) return;
+  const state = await refreshHealth();
+  if (!healthPollActive) return;
+
+  if (state.ready) {
+    stopHealthPolling();
+    showFeedback("Local engine ready");
+    void refreshUpdateStatus();
+    return;
+  }
+  if (state.failed) {
+    engineStarting = false;
+    stopHealthPolling();
+    return;
+  }
+  if (Date.now() - healthPollStartedAt > HEALTH_POLL_MAX_MS) {
+    engineStarting = false;
+    stopHealthPolling();
+    renderOffline("Engine did not start — check cache/server.log");
+    return;
+  }
+  if (!state.online && !state.starting) {
+    stopHealthPolling();
+    return;
+  }
+  scheduleHealthPoll();
+}
+
+async function startEngine() {
+  if (engineStarting) return false;
+  engineStarting = true;
+  renderStarting();
+
+  const res = await sendBgMessage({ type: "START_SERVER" });
+  if (!res || !res.ok) {
+    engineStarting = false;
+    stopHealthPolling();
+    if (res?.hostMissing) {
+      renderOffline("Launcher not installed — re-run setup.ps1");
+      showFeedback("Native launcher missing. Run setup.ps1, then reload the extension.");
+    } else {
+      renderOffline(OFFLINE_TEXT);
+      showFeedback(res?.error ? `Start failed: ${res.error}` : "Start failed");
+    }
+    return false;
+  }
+
+  showFeedback(res.already_running ? "Local engine already running" : "Starting local engine...");
+  startHealthPolling();
+  return true;
+}
+
+async function refreshHealthAndPoll() {
+  const state = await refreshHealth();
+  if (!state.ready && (state.starting || (state.online && !state.failed))) {
+    startHealthPolling();
+  }
+  return state;
 }
 
 async function refreshUpdateStatus() {
@@ -241,7 +394,7 @@ async function initPopup() {
     autoUpdateToggle.checked = stored.autoUpdateEnabled !== false;
   }
 
-  await Promise.all([refreshHealth(), refreshUpdateStatus()]);
+  await Promise.all([refreshHealthAndPoll(), refreshUpdateStatus()]);
 }
 
 siteToggle.addEventListener("change", async () => {
@@ -254,7 +407,22 @@ siteToggle.addEventListener("change", async () => {
       ? `Enabled on ${currentHostname}`
       : `Disabled on ${currentHostname}`
   );
+  if (!siteToggle.checked) return;
+
+  const state = await refreshHealth();
+  if (state.ready) return;
+  if (!state.online && !state.starting) {
+    await startEngine();
+  } else if (!state.failed) {
+    startHealthPolling();
+  }
 });
+
+if (startEngineBtn) {
+  startEngineBtn.addEventListener("click", async () => {
+    await startEngine();
+  });
+}
 
 for (const btn of langButtons) {
   btn.addEventListener("click", async () => {
@@ -288,14 +456,15 @@ openTestBtn.addEventListener("click", () => {
 });
 
 shutdownBtn.addEventListener("click", async () => {
+  stopHealthPolling();
+  engineStarting = false;
   const res = await sendBgMessage({ type: "SHUTDOWN_SERVER" });
   if (res?.ok) {
-    statusDot.className = "status-dot";
-    statusText.textContent = "Offline — VRAM Freed";
-    statusVram.textContent = "";
+    renderOffline("Offline — VRAM Freed");
     if (updateStatusText) updateStatusText.textContent = "Server offline";
     showFeedback("Local GPU engine stopped");
   } else {
+    renderOffline();
     showFeedback("Server already offline");
   }
 });
@@ -382,8 +551,10 @@ saveServerUrlBtn.addEventListener("click", async () => {
     // Ignore storage failures.
   }
   showFeedback("Server URL saved");
-  await Promise.all([refreshHealth(), refreshUpdateStatus()]);
+  await Promise.all([refreshHealthAndPoll(), refreshUpdateStatus()]);
 });
+
+window.addEventListener("pagehide", stopHealthPolling);
 
 void (async () => {
   try {

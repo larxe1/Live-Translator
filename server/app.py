@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import gc
 import json
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 import uvicorn
@@ -96,6 +97,88 @@ def _decode_base64_image(raw_b64: str, max_image_bytes: int) -> bytes:
             f"Decoded image ({len(decoded)} bytes) exceeds max_image_bytes ({max_image_bytes})"
         )
     return decoded
+
+
+async def _parse_translate_request(
+    request: Request,
+    max_image_bytes: int,
+) -> tuple[bytes, Literal["auto", "ja", "ko"], str, int, dict[str, str], str | None]:
+    """Parse multipart or JSON translation request and enforce payload limits."""
+    content_length_hdr = request.headers.get("content-length")
+    if content_length_hdr:
+        try:
+            # Allow generous envelope overhead for JSON base64 / multipart headers.
+            if int(content_length_hdr) > int(max_image_bytes * 1.5) + 65536:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Payload exceeds max_image_bytes ({max_image_bytes})",
+                )
+        except ValueError:
+            pass
+
+    content_type = request.headers.get("content-type", "").lower()
+    lang: Literal["auto", "ja", "ko"] = "auto"
+    chapter_id = "default"
+    priority = 0
+    glossary: dict[str, str] = {}
+    request_id: str | None = None
+    image_bytes: bytes = b""
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise HTTPException(status_code=400, detail="Missing 'file' upload in multipart form")
+        image_bytes = await upload.read()
+        if len(image_bytes) > max_image_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Uploaded image ({len(image_bytes)} bytes) exceeds limit ({max_image_bytes})",
+            )
+        lang_raw = str(form.get("lang") or "auto")
+        if lang_raw not in ("auto", "ja", "ko"):
+            raise HTTPException(status_code=422, detail="lang must be 'auto', 'ja', or 'ko'")
+        lang = lang_raw  # type: ignore[assignment]
+        chapter_id = str(form.get("chapter_id") or "default")
+        try:
+            priority = int(form.get("priority") or 0)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="priority must be an integer") from exc
+        req_id_raw = form.get("request_id")
+        request_id = str(req_id_raw) if req_id_raw else None
+        glossary_raw = form.get("glossary")
+        if glossary_raw:
+            try:
+                parsed = json.loads(str(glossary_raw))
+                if not isinstance(parsed, dict):
+                    raise ValueError("glossary must be a JSON object")
+                glossary = {str(k): str(v) for k, v in parsed.items()}
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid glossary JSON: {exc}") from exc
+    else:
+        try:
+            body = await request.json()
+            req = TranslateRequest.model_validate(body)
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid translation request: {exc}") from exc
+
+        try:
+            image_bytes = _decode_base64_image(req.image_base64, max_image_bytes=max_image_bytes)
+        except PayloadTooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {exc}") from exc
+
+        lang = req.lang
+        chapter_id = req.chapter_id
+        priority = req.priority
+        glossary = req.glossary
+        request_id = req.request_id
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty image payload")
+
+    return image_bytes, lang, chapter_id, priority, glossary, request_id
 
 
 def _detect_torch_device() -> str:
@@ -264,7 +347,7 @@ def create_app(
         )
 
     max_image_bytes = int(getattr(resolved_cfg, "max_image_bytes", 25_000_000))
-    idle_unload_minutes = int(getattr(resolved_cfg, "idle_unload_minutes", 20))
+    idle_unload_minutes = int(getattr(resolved_cfg, "idle_unload_minutes", 3))
     extension_dir = resolved_cfg.project_root / "extension"
 
     @asynccontextmanager
@@ -416,80 +499,9 @@ def create_app(
                 detail=f"Models are not ready yet ({app.state.loading_stage})",
             )
 
-        content_length_hdr = request.headers.get("content-length")
-        if content_length_hdr:
-            try:
-                # Allow generous envelope overhead for JSON base64 / multipart headers.
-                if int(content_length_hdr) > int(max_image_bytes * 1.5) + 65536:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Payload exceeds max_image_bytes ({max_image_bytes})",
-                    )
-            except ValueError:
-                pass
-
-        content_type = request.headers.get("content-type", "").lower()
-        lang: Literal["auto", "ja", "ko"] = "auto"
-        chapter_id = "default"
-        priority = 0
-        glossary: dict[str, str] = {}
-        request_id: str | None = None
-        image_bytes: bytes = b""
-
-        if "multipart/form-data" in content_type:
-            form = await request.form()
-            upload = form.get("file")
-            if upload is None or not hasattr(upload, "read"):
-                raise HTTPException(status_code=400, detail="Missing 'file' upload in multipart form")
-            image_bytes = await upload.read()
-            if len(image_bytes) > max_image_bytes:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Uploaded image ({len(image_bytes)} bytes) exceeds limit ({max_image_bytes})",
-                )
-            lang_raw = str(form.get("lang") or "auto")
-            if lang_raw not in ("auto", "ja", "ko"):
-                raise HTTPException(status_code=422, detail="lang must be 'auto', 'ja', or 'ko'")
-            lang = lang_raw  # type: ignore[assignment]
-            chapter_id = str(form.get("chapter_id") or "default")
-            try:
-                priority = int(form.get("priority") or 0)
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(status_code=422, detail="priority must be an integer") from exc
-            req_id_raw = form.get("request_id")
-            request_id = str(req_id_raw) if req_id_raw else None
-            glossary_raw = form.get("glossary")
-            if glossary_raw:
-                try:
-                    parsed = json.loads(str(glossary_raw))
-                    if not isinstance(parsed, dict):
-                        raise ValueError("glossary must be a JSON object")
-                    glossary = {str(k): str(v) for k, v in parsed.items()}
-                except Exception as exc:
-                    raise HTTPException(status_code=422, detail=f"Invalid glossary JSON: {exc}") from exc
-        else:
-            try:
-                body = await request.json()
-                req = TranslateRequest.model_validate(body)
-            except (ValidationError, ValueError, TypeError) as exc:
-                raise HTTPException(status_code=422, detail=f"Invalid translation request: {exc}") from exc
-
-            try:
-                image_bytes = _decode_base64_image(req.image_base64, max_image_bytes=max_image_bytes)
-            except PayloadTooLargeError as exc:
-                raise HTTPException(status_code=413, detail=str(exc)) from exc
-            except (binascii.Error, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid base64 image: {exc}") from exc
-
-            lang = req.lang
-            chapter_id = req.chapter_id
-            priority = req.priority
-            glossary = req.glossary
-            request_id = req.request_id
-
-        if not image_bytes:
-            raise HTTPException(status_code=400, detail="Empty image payload")
-
+        image_bytes, lang, chapter_id, priority, glossary, request_id = await _parse_translate_request(
+            request, max_image_bytes=max_image_bytes
+        )
         app.state.last_activity = time.monotonic()
 
         try:
@@ -505,6 +517,60 @@ def create_app(
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except asyncio.CancelledError as exc:
             raise HTTPException(status_code=499, detail="Translation request cancelled") from exc
+
+    @app.post("/translate/stream")
+    async def translate_stream(request: Request) -> StreamingResponse:
+        active_pipeline: TranslationPipeline | None = app.state.pipeline
+        if active_pipeline is None or not app.state.ready:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Models are not ready yet ({app.state.loading_stage})",
+            )
+
+        image_bytes, lang, chapter_id, priority, glossary, request_id = await _parse_translate_request(
+            request, max_image_bytes=max_image_bytes
+        )
+        if len(image_bytes) > active_pipeline.max_image_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Image payload ({len(image_bytes)} bytes) exceeds limit "
+                    f"({active_pipeline.max_image_bytes} bytes)"
+                ),
+            )
+        app.state.last_activity = time.monotonic()
+
+        async def _event_stream() -> AsyncIterator[bytes]:
+            stream_iter = active_pipeline.translate_image_stream(
+                image_bytes=image_bytes,
+                lang=lang,
+                chapter_id=chapter_id,
+                priority=priority,
+                glossary=glossary,
+                request_id=request_id,
+            )
+            try:
+                async for event in stream_iter:
+                    if await request.is_disconnected():
+                        if request_id:
+                            active_pipeline.cancel(request_id)
+                        break
+                    app.state.last_activity = time.monotonic()
+                    yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+            except PayloadTooLargeError as exc:
+                yield (json.dumps({"type": "error", "detail": str(exc)}, ensure_ascii=False) + "\n").encode("utf-8")
+            except asyncio.CancelledError:
+                if request_id:
+                    active_pipeline.cancel(request_id)
+                raise
+            finally:
+                await stream_iter.aclose()
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/translate/cancel")
     async def translate_cancel(req: CancelRequest) -> dict[str, str]:

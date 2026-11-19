@@ -25,11 +25,15 @@ Local Japanese manga and Korean manhwa translator for Microsoft Edge. It detects
    - Enable **Developer mode**
    - Click **Load unpacked** and select `extension\` (for example, `D:\Code\manga-live-translator\extension`)
 
-3. Run `Start Manga Translator.bat` (or the Desktop shortcut).
-   - Starts the local backend on `http://127.0.0.1:8765` and opens Edge to the status page.
+3. Start translating. You do not need to launch any `.bat` file.
+   - `setup.ps1` registers a Native Messaging host (`native_host\host.cmd`) for the current Windows user (HKCU registry, no admin rights). This lets the extension start and stop the local server on its own.
+   - Click the extension toolbar icon and press **Start Local Engine**, or just turn on translation for a site. If the server is offline, the extension starts it automatically in a hidden background process with no console window. Output goes to `cache\server.log`.
    - Click the extension toolbar icon on any manga site to enable translation for that domain. Hold `Alt` to peek at the original page.
+   - If you load the extension after running `setup.ps1`, or its ID changes, re-run `.venv\Scripts\python.exe native_host\register_host.py` (add `--extension-id <id>` if the ID is not detected automatically).
 
-4. Run `Stop Manga Translator.bat` (or use the Stop button in the popup/dashboard) to shut down the Python server and `llama-server.exe` and free GPU VRAM.
+4. Stop the server with the Stop button in the extension popup. This shuts down the Python server and `llama-server.exe` and frees GPU VRAM.
+
+5. Optional fallback: `Start Manga Translator.bat` (or the Desktop shortcut) and `Stop Manga Translator.bat` still work if you prefer a visible console or Native Messaging is unavailable.
 
 ## Auto-Update Behavior
 
@@ -40,6 +44,7 @@ Local Japanese manga and Korean manhwa translator for Microsoft Edge. It detects
 
 - **Virtual environment missing:** Run `.\setup.ps1` before launching `Start Manga Translator.bat`.
 - **Tab shows `Updated — Click to refresh`:** Click the pill or refresh the tab after the extension reloads.
+- **Extension says the native host is missing:** Re-run `.venv\Scripts\python.exe native_host\register_host.py`, then reload the extension. Check `cache\native-host.log` and `cache\server.log`.
 - **Server offline or stuck process on port 8765:** Run `Stop Manga Translator.bat`, check `cache\llama-server.log`, and run `Start Manga Translator.bat` again.
 - **GPU VRAM limits:** Adjust `llm_gpu_layers` (default `23`), `llm_ctx_size` (default `4096`), or `idle_unload_minutes` (default `20`) in `config.json`.
 - **Remote update skipped:** Automatic pulls only run fast-forward merges when `git status --porcelain` is empty.
@@ -48,7 +53,8 @@ Local Japanese manga and Korean manhwa translator for Microsoft Edge. It detects
 
 - `server/` - FastAPI service (`app.py`), pipeline, vision detector, OCR, `llama.cpp` manager, SQLite cache, and updater
 - `extension/` - Microsoft Edge MV3 extension (`manifest.json`, `background.js`, `content.js`, `overlay.js`, `popup.html`, `popup.js`)
-- `setup.ps1` - Windows environment, model, and binary installer
+- `native_host/` - Native Messaging host (`host.py`, `host.cmd`), silent server supervisor (`supervisor.py`), and registry installer (`register_host.py`)
+- `setup.ps1` - Windows environment, model, binary, and native host installer
 - `Start Manga Translator.bat` / `Stop Manga Translator.bat` - Start and stop scripts
 - `config.json` - Local server, port, model, and GPU configuration
 - `tests/` - Python and Node tests

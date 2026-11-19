@@ -10,7 +10,7 @@ from io import BytesIO
 import itertools
 import logging
 import time
-from typing import Any, Awaitable, Callable, Literal, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, TypeVar
 
 import numpy as np
 from PIL import Image
@@ -240,6 +240,31 @@ def _scale_box(box: Box, inv_scale: float, max_w: int, max_h: int) -> Box:
     return Box(x1=x1, y1=y1, x2=x2, y2=y2)
 
 
+def _box_to_list(box: Box) -> list[int]:
+    return [box.x1, box.y1, box.x2, box.y2]
+
+
+def _response_to_meta_event(resp: TranslateResponse) -> dict[str, Any]:
+    return {
+        "type": "meta",
+        "lang": resp.lang,
+        "width": resp.width,
+        "height": resp.height,
+        "bubbles": [
+            {
+                "id": b.id,
+                "bbox": _box_to_list(b.bbox),
+                "safe_box": _box_to_list(b.safe_box),
+                "bg_color": b.bg_color,
+                "text_color": b.text_color,
+                "is_dark": b.is_dark,
+                "original": b.original,
+            }
+            for b in resp.bubbles
+        ],
+    }
+
+
 def _cleanup_gpu_memory() -> None:
     gc.collect()
     try:
@@ -289,6 +314,305 @@ class TranslationPipeline:
         """Cancel a pending queued translation request by request_id."""
         self.queue.cancel(request_id)
 
+    def _prepare_request_context(
+        self,
+        image_bytes: bytes,
+        lang: Literal["auto", "ja", "ko"],
+        chapter_id: str,
+        glossary: dict[str, str] | None,
+    ) -> tuple[dict[str, str], str]:
+        if len(image_bytes) > self.max_image_bytes:
+            raise PayloadTooLargeError(
+                f"Image payload ({len(image_bytes)} bytes) exceeds limit ({self.max_image_bytes} bytes)"
+            )
+        chapter_glossary = self.memory.get_glossary(chapter_id)
+        merged_glossary = {**chapter_glossary, **(glossary or {})}
+        cache_key = self.cache.make_key(image_bytes, lang, merged_glossary)
+        return merged_glossary, cache_key
+
+    async def _run_gpu_job(
+        self,
+        image_bytes: bytes,
+        lang: Literal["auto", "ja", "ko"],
+        chapter_id: str,
+        glossary: dict[str, str] | None,
+        merged_glossary: dict[str, str],
+        cache_key: str,
+        emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> TranslateResponse:
+        # Re-check cache in case an identical image finished while we waited in queue.
+        cached_inner = self.cache.get(cache_key)
+        if cached_inner is not None:
+            if emit is not None:
+                await emit(_response_to_meta_event(cached_inner))
+                for b in cached_inner.bubbles:
+                    await emit(
+                        {
+                            "type": "bubble",
+                            "id": b.id,
+                            "translated": b.translated,
+                            "final": True,
+                        }
+                    )
+                await emit({"type": "done", "response": cached_inner.model_dump()})
+            return cached_inner
+
+        if self.ensure_llm_ready is not None:
+            await self.ensure_llm_ready()
+
+        t0 = time.perf_counter()
+        detector_ms = 0
+        ocr_ms = 0
+        first_bubble_ms: int | None = None
+        pil_img: Image.Image | None = None
+        infer_img: Image.Image | None = None
+        img_rgb: np.ndarray | None = None
+        try:
+            with Image.open(BytesIO(image_bytes)) as opened:
+                pil_img = opened.convert("RGB")
+            orig_w, orig_h = pil_img.size
+
+            if orig_w > self.max_image_width:
+                scale = self.max_image_width / float(orig_w)
+                infer_w = self.max_image_width
+                infer_h = max(1, int(round(orig_h * scale)))
+                infer_img = pil_img.resize((infer_w, infer_h), Image.Resampling.LANCZOS)
+                inv_scale = orig_w / float(infer_w)
+            else:
+                infer_img = pil_img
+                infer_w, infer_h = orig_w, orig_h
+                inv_scale = 1.0
+
+            img_rgb = np.asarray(infer_img)
+
+            t_det0 = time.perf_counter()
+            detections: list[RawDetection] = await _call_maybe_async(self.detector.detect, infer_img)
+            detector_ms = int((time.perf_counter() - t_det0) * 1000)
+            if not detections:
+                resolved_empty = _fallback_lang(lang, orig_w, orig_h)
+                total_ms = int((time.perf_counter() - t0) * 1000)
+                empty_resp = TranslateResponse(
+                    lang=resolved_empty,
+                    width=orig_w,
+                    height=orig_h,
+                    elapsed_ms=total_ms,
+                    cached=False,
+                    bubbles=[],
+                )
+                logger.info(
+                    "Pipeline stage timings: lang=%s bubbles=0 detector_ms=%d ocr_ms=0 first_bubble_ms=None total_ms=%d",
+                    resolved_empty,
+                    detector_ms,
+                    total_ms,
+                )
+                if emit is not None:
+                    await emit(_response_to_meta_event(empty_resp))
+                self._store_cache(image_bytes, lang, resolved_empty, merged_glossary, cache_key, empty_resp)
+                if emit is not None:
+                    await emit({"type": "done", "response": empty_resp.model_dump()})
+                return empty_resp
+
+            det_styles: list[tuple[RawDetection, BubbleStyle]] = []
+            crops_with_dark: list[tuple[Image.Image, bool]] = []
+            for det in detections:
+                style = analyze_bubble_appearance(img_rgb, det.box)
+                tight_box = getattr(det, "ocr_box", None)
+                if tight_box is not None:
+                    pad = 3
+                    x1 = max(0, min(infer_w - 1, tight_box.x1 - pad))
+                    y1 = max(0, min(infer_h - 1, tight_box.y1 - pad))
+                    x2 = max(x1 + 1, min(infer_w, tight_box.x2 + pad))
+                    y2 = max(y1 + 1, min(infer_h, tight_box.y2 + pad))
+                elif det.label.strip().lower() in ("bubble", "balloon"):
+                    sb = style.safe_box
+                    x1 = max(0, min(infer_w - 1, sb.x1))
+                    y1 = max(0, min(infer_h - 1, sb.y1))
+                    x2 = max(x1 + 1, min(infer_w, sb.x2))
+                    y2 = max(y1 + 1, min(infer_h, sb.y2))
+                else:
+                    x1 = max(0, min(infer_w - 1, det.box.x1))
+                    y1 = max(0, min(infer_h - 1, det.box.y1))
+                    x2 = max(x1 + 1, min(infer_w, det.box.x2))
+                    y2 = max(y1 + 1, min(infer_h, det.box.y2))
+                crop = infer_img.crop((x1, y1, x2, y2))
+                det_styles.append((det, style))
+                crops_with_dark.append((crop, style.is_dark))
+
+            t_ocr0 = time.perf_counter()
+            resolved_lang, ocr_texts = await _call_maybe_async(
+                self.ocr.read_page_bubbles,
+                crops_with_dark,
+                lang_hint=lang,
+                aspect_ratio=infer_h / max(infer_w, 1),
+            )
+            ocr_ms = int((time.perf_counter() - t_ocr0) * 1000)
+
+            meaningful: list[tuple[RawDetection, BubbleStyle, str]] = []
+            for (det, style), text in zip(det_styles, ocr_texts):
+                cleaned = (text or "").strip()
+                if is_meaningful_dialogue(cleaned):
+                    meaningful.append((det, style, cleaned))
+
+            if not meaningful:
+                total_ms = int((time.perf_counter() - t0) * 1000)
+                empty_resp = TranslateResponse(
+                    lang=resolved_lang,
+                    width=orig_w,
+                    height=orig_h,
+                    elapsed_ms=total_ms,
+                    cached=False,
+                    bubbles=[],
+                )
+                logger.info(
+                    "Pipeline stage timings: lang=%s bubbles=0 detector_ms=%d ocr_ms=%d first_bubble_ms=None total_ms=%d",
+                    resolved_lang,
+                    detector_ms,
+                    ocr_ms,
+                    total_ms,
+                )
+                if emit is not None:
+                    await emit(_response_to_meta_event(empty_resp))
+                self._store_cache(image_bytes, lang, resolved_lang, merged_glossary, cache_key, empty_resp)
+                if emit is not None:
+                    await emit({"type": "done", "response": empty_resp.model_dump()})
+                return empty_resp
+
+            sorted_dets = sort_reading_order(
+                [item[0] for item in meaningful],
+                infer_w,
+                infer_h,
+                resolved_lang,
+            )
+
+            by_obj_id = {id(det): (det, style, text) for det, style, text in meaningful}
+            by_box: dict[tuple[int, int, int, int], deque[tuple[RawDetection, BubbleStyle, str]]] = defaultdict(deque)
+            for det, style, text in meaningful:
+                by_box[(det.box.x1, det.box.y1, det.box.x2, det.box.y2)].append((det, style, text))
+
+            ordered_items: list[tuple[RawDetection, BubbleStyle, str]] = []
+            for s_det in sorted_dets:
+                item = by_obj_id.get(id(s_det))
+                if item is None:
+                    key_box = (s_det.box.x1, s_det.box.y1, s_det.box.x2, s_det.box.y2)
+                    if by_box[key_box]:
+                        item = by_box[key_box].popleft()
+                if item is not None:
+                    ordered_items.append(item)
+
+            scaled_geometries = [
+                (
+                    idx,
+                    _scale_box(det.box, inv_scale, orig_w, orig_h),
+                    _scale_box(style.safe_box, inv_scale, orig_w, orig_h),
+                    style,
+                    text,
+                )
+                for idx, (det, style, text) in enumerate(ordered_items)
+            ]
+
+            if emit is not None:
+                await emit(
+                    {
+                        "type": "meta",
+                        "lang": resolved_lang,
+                        "width": orig_w,
+                        "height": orig_h,
+                        "bubbles": [
+                            {
+                                "id": idx,
+                                "bbox": _box_to_list(bbox),
+                                "safe_box": _box_to_list(safe_box),
+                                "bg_color": style.bg_color,
+                                "text_color": style.text_color,
+                                "is_dark": style.is_dark,
+                                "original": text,
+                            }
+                            for idx, bbox, safe_box, style, text in scaled_geometries
+                        ],
+                    }
+                )
+
+            prompt_bubbles = [(idx, item[2]) for idx, item in enumerate(ordered_items)]
+            emitted_ids: set[int] = set()
+
+            async def _on_bubble(bid: int, translated_text: str, final: bool) -> None:
+                nonlocal first_bubble_ms
+                if first_bubble_ms is None:
+                    first_bubble_ms = int((time.perf_counter() - t0) * 1000)
+                emitted_ids.add(bid)
+                if emit is not None:
+                    await emit(
+                        {
+                            "type": "bubble",
+                            "id": bid,
+                            "translated": translated_text,
+                            "final": final,
+                        }
+                    )
+
+            supports_on_bubble = "on_bubble" in inspect.signature(self.translator.translate_page).parameters
+            if emit is not None and supports_on_bubble:
+                translations: dict[int, str] = await self.translator.translate_page(
+                    prompt_bubbles,
+                    lang=resolved_lang,
+                    chapter_id=chapter_id,
+                    extra_glossary=glossary,
+                    on_bubble=_on_bubble,
+                )
+            else:
+                translations = await self.translator.translate_page(
+                    prompt_bubbles,
+                    lang=resolved_lang,
+                    chapter_id=chapter_id,
+                    extra_glossary=glossary,
+                )
+
+            if emit is not None:
+                for idx, _ in prompt_bubbles:
+                    if idx not in emitted_ids:
+                        await _on_bubble(idx, translations.get(idx, ""), True)
+
+            bubbles = [
+                BubbleResult(
+                    id=idx,
+                    bbox=bbox,
+                    safe_box=safe_box,
+                    bg_color=style.bg_color,
+                    text_color=style.text_color,
+                    is_dark=style.is_dark,
+                    original=text,
+                    translated=translations.get(idx, ""),
+                )
+                for idx, bbox, safe_box, style, text in scaled_geometries
+            ]
+
+            total_ms = int((time.perf_counter() - t0) * 1000)
+            logger.info(
+                "Pipeline stage timings: lang=%s bubbles=%d detector_ms=%d ocr_ms=%d first_bubble_ms=%s total_ms=%d",
+                resolved_lang,
+                len(bubbles),
+                detector_ms,
+                ocr_ms,
+                first_bubble_ms,
+                total_ms,
+            )
+
+            response = TranslateResponse(
+                lang=resolved_lang,
+                width=orig_w,
+                height=orig_h,
+                elapsed_ms=total_ms,
+                cached=False,
+                bubbles=bubbles,
+            )
+            self._store_cache(image_bytes, lang, resolved_lang, merged_glossary, cache_key, response)
+            if emit is not None:
+                await emit({"type": "done", "response": response.model_dump()})
+            return response
+        finally:
+            del img_rgb, infer_img, pil_img
+            await asyncio.to_thread(_cleanup_gpu_memory)
+
     async def translate_image(
         self,
         image_bytes: bytes,
@@ -299,174 +623,98 @@ class TranslationPipeline:
         request_id: str | None = None,
     ) -> TranslateResponse:
         """Translate all dialogue bubbles in an image, checking cache before GPU queueing."""
-        if len(image_bytes) > self.max_image_bytes:
-            raise PayloadTooLargeError(
-                f"Image payload ({len(image_bytes)} bytes) exceeds limit ({self.max_image_bytes} bytes)"
-            )
-
-        chapter_glossary = self.memory.get_glossary(chapter_id)
-        merged_glossary = {**chapter_glossary, **(glossary or {})}
-
-        cache_key = self.cache.make_key(image_bytes, lang, merged_glossary)
+        merged_glossary, cache_key = self._prepare_request_context(
+            image_bytes, lang, chapter_id, glossary
+        )
         cached = self.cache.get(cache_key)
         if cached is not None:
             return cached
 
-        async def _run_gpu_job() -> TranslateResponse:
-            # Re-check cache in case an identical image finished while we waited in queue.
-            cached_inner = self.cache.get(cache_key)
-            if cached_inner is not None:
-                return cached_inner
+        return await self.queue.enqueue(
+            priority=priority,
+            fn=lambda: self._run_gpu_job(
+                image_bytes=image_bytes,
+                lang=lang,
+                chapter_id=chapter_id,
+                glossary=glossary,
+                merged_glossary=merged_glossary,
+                cache_key=cache_key,
+                emit=None,
+            ),
+            request_id=request_id,
+        )
 
-            if self.ensure_llm_ready is not None:
-                await self.ensure_llm_ready()
+    async def translate_image_stream(
+        self,
+        image_bytes: bytes,
+        lang: Literal["auto", "ja", "ko"] = "auto",
+        chapter_id: str = "default",
+        priority: int = 0,
+        glossary: dict[str, str] | None = None,
+        request_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream translation events (meta -> bubble* -> done | error) for an image."""
+        merged_glossary, cache_key = self._prepare_request_context(
+            image_bytes, lang, chapter_id, glossary
+        )
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            yield _response_to_meta_event(cached)
+            for b in cached.bubbles:
+                yield {
+                    "type": "bubble",
+                    "id": b.id,
+                    "translated": b.translated,
+                    "final": True,
+                }
+            yield {"type": "done", "response": cached.model_dump()}
+            return
 
-            t0 = time.perf_counter()
-            pil_img: Image.Image | None = None
-            infer_img: Image.Image | None = None
-            img_rgb: np.ndarray | None = None
+        event_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+        sentinel = object()
+
+        async def _emit(event: dict[str, Any]) -> None:
+            await event_queue.put(event)
+
+        async def _drive_queue() -> None:
             try:
-                with Image.open(BytesIO(image_bytes)) as opened:
-                    pil_img = opened.convert("RGB")
-                orig_w, orig_h = pil_img.size
-
-                if orig_w > self.max_image_width:
-                    scale = self.max_image_width / float(orig_w)
-                    infer_w = self.max_image_width
-                    infer_h = max(1, int(round(orig_h * scale)))
-                    infer_img = pil_img.resize((infer_w, infer_h), Image.Resampling.LANCZOS)
-                    inv_scale = orig_w / float(infer_w)
-                else:
-                    infer_img = pil_img
-                    infer_w, infer_h = orig_w, orig_h
-                    inv_scale = 1.0
-
-                img_rgb = np.asarray(infer_img)
-
-                detections: list[RawDetection] = await _call_maybe_async(self.detector.detect, infer_img)
-                if not detections:
-                    resolved_empty = _fallback_lang(lang, orig_w, orig_h)
-                    empty_resp = TranslateResponse(
-                        lang=resolved_empty,
-                        width=orig_w,
-                        height=orig_h,
-                        elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                        cached=False,
-                        bubbles=[],
-                    )
-                    self._store_cache(image_bytes, lang, resolved_empty, merged_glossary, cache_key, empty_resp)
-                    return empty_resp
-
-                det_styles: list[tuple[RawDetection, BubbleStyle]] = []
-                crops_with_dark: list[tuple[Image.Image, bool]] = []
-                for det in detections:
-                    style = analyze_bubble_appearance(img_rgb, det.box)
-                    tight_box = getattr(det, "ocr_box", None)
-                    if tight_box is not None:
-                        pad = 3
-                        x1 = max(0, min(infer_w - 1, tight_box.x1 - pad))
-                        y1 = max(0, min(infer_h - 1, tight_box.y1 - pad))
-                        x2 = max(x1 + 1, min(infer_w, tight_box.x2 + pad))
-                        y2 = max(y1 + 1, min(infer_h, tight_box.y2 + pad))
-                    elif det.label.strip().lower() in ("bubble", "balloon"):
-                        sb = style.safe_box
-                        x1 = max(0, min(infer_w - 1, sb.x1))
-                        y1 = max(0, min(infer_h - 1, sb.y1))
-                        x2 = max(x1 + 1, min(infer_w, sb.x2))
-                        y2 = max(y1 + 1, min(infer_h, sb.y2))
-                    else:
-                        x1 = max(0, min(infer_w - 1, det.box.x1))
-                        y1 = max(0, min(infer_h - 1, det.box.y1))
-                        x2 = max(x1 + 1, min(infer_w, det.box.x2))
-                        y2 = max(y1 + 1, min(infer_h, det.box.y2))
-                    crop = infer_img.crop((x1, y1, x2, y2))
-                    det_styles.append((det, style))
-                    crops_with_dark.append((crop, style.is_dark))
-
-                resolved_lang, ocr_texts = await _call_maybe_async(
-                    self.ocr.read_page_bubbles,
-                    crops_with_dark,
-                    lang_hint=lang,
-                    aspect_ratio=infer_h / max(infer_w, 1),
+                await self.queue.enqueue(
+                    priority=priority,
+                    fn=lambda: self._run_gpu_job(
+                        image_bytes=image_bytes,
+                        lang=lang,
+                        chapter_id=chapter_id,
+                        glossary=glossary,
+                        merged_glossary=merged_glossary,
+                        cache_key=cache_key,
+                        emit=_emit,
+                    ),
+                    request_id=request_id,
                 )
-
-                meaningful: list[tuple[RawDetection, BubbleStyle, str]] = []
-                for (det, style), text in zip(det_styles, ocr_texts):
-                    cleaned = (text or "").strip()
-                    if is_meaningful_dialogue(cleaned):
-                        meaningful.append((det, style, cleaned))
-
-                if not meaningful:
-                    empty_resp = TranslateResponse(
-                        lang=resolved_lang,
-                        width=orig_w,
-                        height=orig_h,
-                        elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                        cached=False,
-                        bubbles=[],
-                    )
-                    self._store_cache(image_bytes, lang, resolved_lang, merged_glossary, cache_key, empty_resp)
-                    return empty_resp
-
-                sorted_dets = sort_reading_order(
-                    [item[0] for item in meaningful],
-                    infer_w,
-                    infer_h,
-                    resolved_lang,
-                )
-
-                by_obj_id = {id(det): (det, style, text) for det, style, text in meaningful}
-                by_box: dict[tuple[int, int, int, int], deque[tuple[RawDetection, BubbleStyle, str]]] = defaultdict(deque)
-                for det, style, text in meaningful:
-                    by_box[(det.box.x1, det.box.y1, det.box.x2, det.box.y2)].append((det, style, text))
-
-                ordered_items: list[tuple[RawDetection, BubbleStyle, str]] = []
-                for s_det in sorted_dets:
-                    item = by_obj_id.get(id(s_det))
-                    if item is None:
-                        key_box = (s_det.box.x1, s_det.box.y1, s_det.box.x2, s_det.box.y2)
-                        if by_box[key_box]:
-                            item = by_box[key_box].popleft()
-                    if item is not None:
-                        ordered_items.append(item)
-
-                prompt_bubbles = [(idx, item[2]) for idx, item in enumerate(ordered_items)]
-                translations: dict[int, str] = await self.translator.translate_page(
-                    prompt_bubbles,
-                    lang=resolved_lang,
-                    chapter_id=chapter_id,
-                    extra_glossary=glossary,
-                )
-
-                bubbles = [
-                    BubbleResult(
-                        id=idx,
-                        bbox=_scale_box(det.box, inv_scale, orig_w, orig_h),
-                        safe_box=_scale_box(style.safe_box, inv_scale, orig_w, orig_h),
-                        bg_color=style.bg_color,
-                        text_color=style.text_color,
-                        is_dark=style.is_dark,
-                        original=text,
-                        translated=translations.get(idx, text),
-                    )
-                    for idx, (det, style, text) in enumerate(ordered_items)
-                ]
-
-                response = TranslateResponse(
-                    lang=resolved_lang,
-                    width=orig_w,
-                    height=orig_h,
-                    elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                    cached=False,
-                    bubbles=bubbles,
-                )
-                self._store_cache(image_bytes, lang, resolved_lang, merged_glossary, cache_key, response)
-                return response
+            except asyncio.CancelledError:
+                await event_queue.put({"type": "error", "detail": "Translation request cancelled"})
+            except Exception as exc:
+                logger.exception("Streaming translation job failed")
+                await event_queue.put({"type": "error", "detail": str(exc)})
             finally:
-                del img_rgb, infer_img, pil_img
-                await asyncio.to_thread(_cleanup_gpu_memory)
+                await event_queue.put(sentinel)
 
-        return await self.queue.enqueue(priority=priority, fn=_run_gpu_job, request_id=request_id)
+        driver_task = asyncio.create_task(_drive_queue())
+        try:
+            while True:
+                item = await event_queue.get()
+                if item is sentinel:
+                    break
+                yield item  # type: ignore[misc]
+        finally:
+            if request_id:
+                self.cancel(request_id)
+            if not driver_task.done():
+                driver_task.cancel()
+                try:
+                    await driver_task
+                except asyncio.CancelledError:
+                    pass
 
     submit = translate_image
 

@@ -216,8 +216,16 @@ if ($LASTEXITCODE -ne 0) { Write-Warning "Model pre-warm returned non-zero; mode
 & $VenvPython (Join-Path $ProjectRoot "scripts\make_samples.py")
 if ($LASTEXITCODE -ne 0) { throw "make_samples.py failed." }
 
-# 6. Create Desktop shortcut
-Write-Host "`n[6/6] Creating Desktop shortcut ..." -ForegroundColor Yellow
+# 6. Register the Edge native messaging host (HKCU, no admin) and create Desktop shortcut
+Write-Host "`n[6/6] Registering native messaging host and creating Desktop shortcut ..." -ForegroundColor Yellow
+$RegisterHost = Join-Path $ProjectRoot "native_host\register_host.py"
+& $VenvPython $RegisterHost
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Native host registration failed. The extension cannot auto-start the server; use Start Manga Translator.bat instead."
+} else {
+    Write-Host "Native host registered. The extension can now start and stop the local server by itself." -ForegroundColor Green
+}
+
 $DesktopDir = [Environment]::GetFolderPath("Desktop")
 $ShortcutPath = Join-Path $DesktopDir "Start Manga Translator.lnk"
 $TargetBat = Join-Path $ProjectRoot "Start Manga Translator.bat"

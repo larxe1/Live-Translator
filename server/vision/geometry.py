@@ -93,8 +93,8 @@ def _compute_safe_box(x1: int, y1: int, x2: int, y2: int) -> Box:
     """Compute an inset safe text box strictly inside the bubble stroke."""
     w = x2 - x1
     h = y2 - y1
-    inset_x = int(round(w * 0.12))
-    inset_y = int(round(h * 0.12))
+    inset_x = int(round(w * 0.06))
+    inset_y = int(round(h * 0.06))
 
     # Clamp inset so safe_box stays strictly wider/taller than 8px whenever possible
     max_inset_x = max(0, (w - 9) // 2)

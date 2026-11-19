@@ -38,14 +38,16 @@ html.mlt-peek-original .mlt-overlay {
   justify-content: center;
   text-align: center;
   box-sizing: border-box;
-  padding: 2px 4px;
+  padding: 0;
   border-radius: 10px;
   font-family: "Comic Neue", "Anime Ace", "Segoe UI", sans-serif;
   font-weight: 700;
   line-height: 1.15;
-  letter-spacing: 0.01em;
-  overflow-wrap: break-word;
+  letter-spacing: 0;
+  overflow-wrap: normal;
   word-break: normal;
+  hyphens: none;
+  text-wrap: balance;
   z-index: 2;
 }
 
@@ -53,7 +55,6 @@ html.mlt-peek-original .mlt-overlay {
   border: 1px solid rgba(0, 0, 0, 0.18);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
   border-radius: 12px;
-  padding: 3px 5px;
   z-index: 3;
 }
 
@@ -67,6 +68,10 @@ html.mlt-peek-original .mlt-overlay {
   width: 100%;
   pointer-events: none;
   user-select: none;
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: none;
+  text-wrap: balance;
 }
 
 .mlt-bubble-hit {

@@ -21,6 +21,7 @@ from server.translator.translator import (
     contains_non_english_cjk,
     is_refusal,
     is_valid_english_translation,
+    romanize_residual_kana,
 )
 
 
@@ -103,7 +104,7 @@ async def test_translator_never_returns_refusal_even_if_retry_refuses():
     tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=always_refuse)
     out = await tr.translate_page([(0, "くそったれ！")], lang="ja", chapter_id="ch1")
     assert not is_refusal(out[0])
-    assert out[0] == "くそったれ！"
+    assert out[0] == ""
 
 
 def test_llama_manager_model_resolution_and_vram_capped_command(tmp_path):
@@ -266,7 +267,7 @@ async def test_translator_never_records_cjk_if_all_fallbacks_fail():
     tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=always_chinese)
     out = await tr.translate_page([(0, "義賊団だ")], lang="ja", chapter_id="ch-fail")
 
-    assert out[0] == "義賊団だ"
+    assert out[0] == ""
     assert memory.get_context("ch-fail") == []
 
 
@@ -382,3 +383,108 @@ def test_pipeline_skips_caching_when_translation_contains_cjk(tmp_path):
     good_resp = _make_cache_response("Phantom Troupe")
     pipeline._store_cache(b"page-good", "auto", "ja", {}, good_key, good_resp)
     assert cache.get(good_key) is not None
+
+
+def test_romanize_residual_kana_handles_names_digraphs_and_sentences():
+    assert romanize_residual_kana("ナナス") == "Nanasu"
+    assert romanize_residual_kana("ヘルメス") == "Herumesu"
+    assert romanize_residual_kana("カッパ") == "Kappa"
+    assert romanize_residual_kana("パーティー") == "Paatii"
+    assert romanize_residual_kana("シャウト") == "Shauto"
+    assert (
+        romanize_residual_kana("Currently they chose ナナス (ヘルメス's alias) as leader.")
+        == "Currently they chose Nanasu (Herumesu's alias) as leader."
+    )
+
+
+@pytest.mark.asyncio
+async def test_translator_plain_text_fourth_stage_fallback_and_kana_salvage():
+    memory = ChapterMemoryStore()
+    calls: list[list[dict[str, str]]] = []
+    line = "現在は2人が勝手にナナス（ヘルメスの偽名）を団長に抜擢し"
+
+    async def fake_llm(messages):
+        calls.append(messages)
+        if len(calls) <= 3:
+            # Primary, batch retry, and single-bubble JSON retry all fail with CJK parenthetical
+            return '{"0": "Currently the two made ナナス（ヘルメスの偽名）the leader."}'
+        # 4th-stage plain-text single-bubble retry succeeds (with stray katakana name salvaged)
+        return "Currently, those two arbitrarily made ナナス (Hermes's alias) the leader."
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm)
+    out = await tr.translate_page([(0, line)], lang="ja", chapter_id="ch-plain")
+
+    assert len(calls) == 4
+    assert "Transliterate all character names" in calls[3][0]["content"]
+    assert out[0] == "Currently, those two arbitrarily made Nanasu (Hermes's alias) the leader."
+    assert not contains_non_english_cjk(out[0])
+
+
+@pytest.mark.asyncio
+async def test_translator_streaming_emits_each_bubble_before_next_chunk_arrives():
+    memory = ChapterMemoryStore()
+    events: list[tuple[str, int, str, bool]] = []
+
+    async def fake_stream(_messages):
+        yield '{"0": "Phantom Troupe", '
+        events.append(("after_chunk_0", -1, "", False))
+        yield '"1": "We steal from the rich."}'
+        events.append(("after_chunk_1", -1, "", False))
+
+    async def on_bubble(bid: int, text: str, final: bool) -> None:
+        events.append(("bubble", bid, text, final))
+
+    tr = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_stream_caller=fake_stream,
+    )
+    out = await tr.translate_page(
+        [(0, "夢幻団"), (1, "金持ちから盗む")],
+        lang="ja",
+        chapter_id="ch-stream",
+        on_bubble=on_bubble,
+    )
+
+    assert out == {0: "Phantom Troupe", 1: "We steal from the rich."}
+    assert events == [
+        ("bubble", 0, "Phantom Troupe", False),
+        ("after_chunk_0", -1, "", False),
+        ("bubble", 1, "We steal from the rich.", False),
+        ("after_chunk_1", -1, "", False),
+    ]
+    assert len(memory.get_context("ch-stream")) == 2
+
+
+@pytest.mark.asyncio
+async def test_translator_streaming_retries_failed_bubble_and_emits_final_true():
+    memory = ChapterMemoryStore()
+    emitted: list[tuple[int, str, bool]] = []
+
+    async def fake_stream(_messages):
+        yield '{"0": "Phantom Troupe", "1": "我们偷来的"}'
+
+    async def fake_retry(_messages):
+        return '{"1": "What we stole"}'
+
+    async def on_bubble(bid: int, text: str, final: bool) -> None:
+        emitted.append((bid, text, final))
+
+    tr = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_caller=fake_retry,
+        llm_stream_caller=fake_stream,
+    )
+    out = await tr.translate_page(
+        [(0, "夢幻団"), (1, "盗んだもの")],
+        lang="ja",
+        chapter_id="ch-stream-retry",
+        on_bubble=on_bubble,
+    )
+
+    assert out == {0: "Phantom Troupe", 1: "What we stole"}
+    assert emitted == [
+        (0, "Phantom Troupe", False),
+        (1, "What we stole", True),
+    ]

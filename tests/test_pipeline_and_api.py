@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from io import BytesIO
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from server.config import AppConfig
 from server.pipeline import PayloadTooLargeError, PriorityGpuQueue, TranslationPipeline
 from server.schemas import Box
 from server.translator.memory import ChapterMemoryStore
+from server.translator.translator import DialogueTranslator
 from server.vision.slicer import RawDetection
 
 
@@ -365,3 +367,122 @@ def test_api_health_translate_glossary_memory_and_static_pages(tmp_path: Path) -
         assert r_test.status_code == 200
         assert "/ext/overlay.js" in r_test.text
         assert "jp_centipede.jpg" in r_test.text
+
+
+def test_api_translate_stream_ndjson_miss_and_cache_hit(tmp_path: Path) -> None:
+    cfg = AppConfig(project_root=Path(__file__).resolve().parent.parent, cache_dir=tmp_path / "cache")
+    memory = ChapterMemoryStore()
+    memory.set_glossary("ch-stream", {"藍星": "Ranshin"})
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=50)
+    detector = _FakeDetector()
+    ocr = _FakeOcr()
+
+    async def fake_stream(_messages):
+        yield '{"0": "Ranshin...?", '
+        yield '"1": "GYAAAAAH!"}'
+
+    translator = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_stream_caller=fake_stream,
+    )
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=translator,
+        memory=memory,
+        cache=cache,
+        max_image_bytes=500_000,
+    )
+    app = create_app(cfg=cfg, pipeline=pipeline, cache=cache, memory=memory, auto_load_models=False)
+    img_bytes = _make_sample_png_bytes()
+    b64_data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode("ascii")
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/translate/stream",
+            json={"image_base64": b64_data_url, "lang": "auto", "chapter_id": "ch-stream", "priority": 0},
+        ) as resp1:
+            assert resp1.status_code == 200
+            assert resp1.headers["content-type"].startswith("application/x-ndjson")
+            events1 = [json.loads(line) for line in resp1.iter_lines() if line.strip()]
+
+        assert events1[0]["type"] == "meta"
+        assert events1[0]["lang"] == "ja"
+        assert len(events1[0]["bubbles"]) == 2
+        assert isinstance(events1[0]["bubbles"][0]["bbox"], list)
+        assert len(events1[0]["bubbles"][0]["bbox"]) == 4
+        assert "translated" not in events1[0]["bubbles"][0]
+
+        bubble_events1 = [e for e in events1 if e["type"] == "bubble"]
+        assert [(e["id"], e["translated"], e["final"]) for e in bubble_events1] == [
+            (0, "Ranshin...?", False),
+            (1, "GYAAAAAH!", False),
+        ]
+
+        assert events1[-1]["type"] == "done"
+        assert events1[-1]["response"]["cached"] is False
+        assert events1[-1]["response"]["bubbles"][0]["translated"] == "Ranshin...?"
+        assert events1[-1]["response"]["bubbles"][1]["translated"] == "GYAAAAAH!"
+        assert detector.calls == 1
+        assert ocr.calls == 1
+
+        # Second call hits cache and streams meta -> bubble (final=True) -> done immediately
+        with client.stream(
+            "POST",
+            "/translate/stream",
+            json={"image_base64": b64_data_url, "lang": "auto", "chapter_id": "ch-stream", "priority": 0},
+        ) as resp2:
+            assert resp2.status_code == 200
+            events2 = [json.loads(line) for line in resp2.iter_lines() if line.strip()]
+
+        assert events2[0]["type"] == "meta"
+        assert [(e["id"], e["translated"], e["final"]) for e in events2 if e["type"] == "bubble"] == [
+            (0, "Ranshin...?", True),
+            (1, "GYAAAAAH!", True),
+        ]
+        assert events2[-1]["type"] == "done"
+        assert events2[-1]["response"]["cached"] is True
+        assert detector.calls == 1
+        assert ocr.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pipeline_empty_string_fallback_never_returns_raw_japanese(tmp_path: Path) -> None:
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=20)
+    detector = _FakeDetector(
+        detections=[RawDetection(Box(x1=40, y1=60, x2=200, y2=240), "bubble", 0.95)]
+    )
+    ocr = _FakeOcr(texts=["現在は2人が勝手にナナス"])
+
+    class _MissingTranslator:
+        async def translate_page(self, bubbles, lang, chapter_id, extra_glossary=None):
+            return {}
+
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=_MissingTranslator(),
+        memory=memory,
+        cache=cache,
+    )
+    await pipeline.start()
+    resp = await pipeline.translate_image(_make_sample_png_bytes(), lang="ja")
+    await pipeline.stop()
+
+    assert len(resp.bubbles) == 1
+    assert resp.bubbles[0].original == "現在は2人が勝手にナナス"
+    assert resp.bubbles[0].translated == ""
+
+
+def test_api_translate_stream_returns_503_when_not_ready(tmp_path: Path) -> None:
+    cfg = AppConfig(project_root=Path(__file__).resolve().parent.parent, cache_dir=tmp_path / "cache")
+    app = create_app(cfg=cfg, pipeline=None, auto_load_models=False)
+    img_bytes = _make_sample_png_bytes()
+    b64_data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode("ascii")
+
+    with TestClient(app) as client:
+        resp = client.post("/translate/stream", json={"image_base64": b64_data_url})
+        assert resp.status_code == 503

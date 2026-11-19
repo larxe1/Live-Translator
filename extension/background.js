@@ -5,8 +5,15 @@ const UPDATE_CHECK_ALARM_NAME = "mlt-update-check";
 const RELOAD_COOLDOWN_MS = 15000;
 const POST_TRANSLATE_HEALTH_THROTTLE_MS = 10000;
 const RELOAD_DELAY_MS = 150;
+const NATIVE_HOST_NAME = "com.mangalivetranslator.host";
+const AUTO_START_COOLDOWN_MS = 12000;
+const SERVER_STARTING_WINDOW_MS = 90000;
+const NATIVE_COMMAND_TIMEOUT_MS = 20000;
+const STARTING_ENGINE_MESSAGE = "Starting local translator engine...";
+const STREAM_PORT_NAME = "mlt-translate-stream";
 
 const inflightControllers = new Map();
+let nativeStartInFlight = null;
 let ruleIdCounter = 10000;
 
 function nextRuleId() {
@@ -183,7 +190,7 @@ function getLocalManifestVersion(deps = {}) {
   } catch (_err) {
     // Ignore manifest lookup failures.
   }
-  return "1.1.0";
+  return "1.2.0";
 }
 
 async function safeStorageGet(storage, keys) {
@@ -385,6 +392,236 @@ async function maybeCheckHealthAfterTranslate(serverBase, fetchImpl, deps = {}) 
   }
 }
 
+function getNowMs(deps = {}) {
+  return typeof deps.now === "function" ? deps.now() : Date.now();
+}
+
+function isLoopbackServer(serverBase) {
+  try {
+    const host = new URL(serverBase).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch (_err) {
+    return false;
+  }
+}
+
+/**
+ * True when the error says the server could not be reached at all
+ * (connection refused / DNS / offline), not an HTTP error status.
+ */
+function isServerUnreachableError(err) {
+  if (!err) return false;
+  if (err.name === "TypeError") return true;
+  const msg = String(err.message || err);
+  return /failed to fetch|fetch failed|networkerror|network error|load failed|econnrefused|err_connection/i.test(
+    msg
+  );
+}
+
+function isNativeHostMissingMessage(message) {
+  const msg = String(message || "");
+  return /native messaging host not found|host not found|forbidden|invalid native messaging host name|native messaging unavailable|nativemessaging/i.test(
+    msg
+  );
+}
+
+/**
+ * Calls runtime.sendNativeMessage exactly once and supports both the
+ * Promise form and the callback + runtime.lastError form.
+ */
+function invokeNativeMessaging(sendNative, runtime, payload, deps = {}) {
+  const scheduleTimeout = deps.setTimeout || setTimeout;
+  const cancelTimeout = deps.clearTimeout || clearTimeout;
+  const timeoutMs = deps.nativeTimeoutMs ?? NATIVE_COMMAND_TIMEOUT_MS;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) cancelTimeout(timer);
+      fn(value);
+    };
+
+    timer = scheduleTimeout(() => {
+      settle(reject, new Error("Native host did not respond in time"));
+    }, timeoutMs);
+
+    const callback = (response) => {
+      const lastErr = runtime?.lastError;
+      if (lastErr) {
+        settle(reject, new Error(lastErr.message || String(lastErr)));
+      } else {
+        settle(resolve, response);
+      }
+    };
+
+    let returned;
+    try {
+      returned = sendNative(NATIVE_HOST_NAME, payload, callback);
+    } catch (err) {
+      settle(reject, err);
+      return;
+    }
+
+    if (returned && typeof returned.then === "function") {
+      void (async () => {
+        try {
+          settle(resolve, await returned);
+        } catch (err) {
+          settle(reject, err);
+        }
+      })();
+    }
+  });
+}
+
+/**
+ * Sends one command to the native launcher host.
+ * Resolves to { ok: true, response } or { ok: false, error, hostMissing }.
+ */
+async function sendNativeCommand(payload, deps = {}) {
+  const runtime = getRuntime(deps);
+  const sendNative =
+    typeof deps.sendNativeMessage === "function"
+      ? deps.sendNativeMessage
+      : runtime && typeof runtime.sendNativeMessage === "function"
+        ? runtime.sendNativeMessage.bind(runtime)
+        : null;
+
+  if (!sendNative) {
+    return {
+      ok: false,
+      hostMissing: true,
+      error: "Native messaging unavailable. Reload the extension and re-run setup.ps1.",
+    };
+  }
+
+  try {
+    const response = await invokeNativeMessaging(sendNative, runtime, payload, deps);
+    if (!response || typeof response !== "object") {
+      return { ok: false, hostMissing: false, error: "Empty response from native host" };
+    }
+    if (response.ok === false) {
+      return {
+        ok: false,
+        hostMissing: false,
+        error: String(response.error || "Native host reported an error"),
+        response,
+      };
+    }
+    return { ok: true, response };
+  } catch (err) {
+    const raw = err?.message || String(err);
+    const hostMissing = isNativeHostMissingMessage(raw);
+    return {
+      ok: false,
+      hostMissing,
+      error: hostMissing
+        ? `Local engine launcher is not installed (${raw}). Re-run setup.ps1.`
+        : raw,
+    };
+  }
+}
+
+async function getServerStartingAt(deps = {}) {
+  const stored = await safeStorageGet(getStorageLocal(deps), ["serverStartingAt"]);
+  return Number(stored?.serverStartingAt || 0);
+}
+
+async function clearServerStartingAt(deps = {}) {
+  const storage = getStorageLocal(deps);
+  if (!storage) return false;
+  const current = await getServerStartingAt(deps);
+  if (!current) return false;
+  if (typeof storage.remove === "function") {
+    try {
+      await storage.remove("serverStartingAt");
+      return true;
+    } catch (_err) {
+      // Fall back to overwrite below.
+    }
+  }
+  return await safeStorageSet(storage, { serverStartingAt: 0 });
+}
+
+async function runNativeStart(auto, deps) {
+  const storage = getStorageLocal(deps);
+  const now = getNowMs(deps);
+  const startingAt = await getServerStartingAt(deps);
+
+  if (auto && startingAt && now - startingAt < AUTO_START_COOLDOWN_MS) {
+    return { ok: true, started: false, already_running: false, throttled: true, pid: null };
+  }
+
+  const res = await sendNativeCommand({ action: "start_server" }, deps);
+  if (!res.ok) {
+    return { ok: false, error: res.error, hostMissing: Boolean(res.hostMissing) };
+  }
+
+  const data = res.response || {};
+  const started = Boolean(data.started);
+  const alreadyRunning = Boolean(data.already_running);
+  const startingRecent = startingAt && now - startingAt < SERVER_STARTING_WINDOW_MS;
+  if (started || !startingRecent) {
+    await safeStorageSet(storage, { serverStartingAt: getNowMs(deps) });
+  }
+  return {
+    ok: true,
+    started,
+    already_running: alreadyRunning,
+    pid: Number.isFinite(Number(data.pid)) && data.pid !== null ? Number(data.pid) : null,
+  };
+}
+
+/**
+ * Single-flight launcher. Concurrent callers share one native request;
+ * automatic callers are additionally throttled by AUTO_START_COOLDOWN_MS.
+ */
+async function startServerViaNativeHost(options = {}, deps = {}) {
+  const auto = Boolean(options?.auto);
+  if (nativeStartInFlight) {
+    return await nativeStartInFlight;
+  }
+  const run = runNativeStart(auto, deps);
+  nativeStartInFlight = run;
+  try {
+    return await run;
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err), hostMissing: false };
+  } finally {
+    if (nativeStartInFlight === run) {
+      nativeStartInFlight = null;
+    }
+  }
+}
+
+async function cancelServerTranslate(serverBase, requestId, fetchImpl = fetch) {
+  if (!requestId) return;
+  try {
+    await fetchImpl(`${serverBase}/translate/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId }),
+    });
+  } catch (_err) {
+    // Best-effort server-side cancellation.
+  }
+}
+
+async function resolveTranslateImageBase64(message, referer, signal, fetchImpl, deps) {
+  let imageBase64 = message?.imageBase64 || "";
+  if (!imageBase64 && message?.imageUrl) {
+    imageBase64 = await fetchImageAsBase64(message.imageUrl, referer, {
+      ...deps,
+      fetch: fetchImpl,
+      signal,
+    });
+  }
+  return imageBase64;
+}
+
 async function handleMessage(message, sender = {}, deps = {}) {
   const fetchImpl = deps.fetch || fetch;
   const serverBase = await getServerBaseUrl(deps);
@@ -394,11 +631,22 @@ async function handleMessage(message, sender = {}, deps = {}) {
     case "GET_HEALTH": {
       try {
         const data = await fetchJson(`${serverBase}/health`, { method: "GET" }, fetchImpl);
+        if (data?.ready === true) {
+          await clearServerStartingAt(deps);
+        }
         await maybeAutoReloadForBuild(data?.extension_build_id, {}, deps);
         return { ok: true, data };
       } catch (err) {
-        return { ok: false, offline: true, error: err.message };
+        const startingAt = await getServerStartingAt(deps);
+        const starting = Boolean(
+          startingAt && getNowMs(deps) - startingAt < SERVER_STARTING_WINDOW_MS
+        );
+        return { ok: false, offline: true, starting, error: err.message };
       }
+    }
+
+    case "START_SERVER": {
+      return await startServerViaNativeHost({ auto: false }, deps);
     }
 
     case "GET_UPDATE_STATUS": {
@@ -526,12 +774,28 @@ async function handleMessage(message, sender = {}, deps = {}) {
     }
 
     case "SHUTDOWN_SERVER": {
+      let httpError = "";
       try {
         const data = await fetchJson(`${serverBase}/shutdown`, { method: "POST" }, fetchImpl);
+        await clearServerStartingAt(deps);
         return { ok: true, data };
       } catch (err) {
-        return { ok: false, error: err.message };
+        httpError = err?.message || String(err);
       }
+      await clearServerStartingAt(deps);
+      if (!isLoopbackServer(serverBase)) {
+        return { ok: false, error: httpError };
+      }
+      const nativeRes = await sendNativeCommand({ action: "stop_server" }, deps);
+      if (nativeRes.ok) {
+        return { ok: true, data: nativeRes.response, via: "native" };
+      }
+      return {
+        ok: false,
+        error: httpError || nativeRes.error,
+        nativeError: nativeRes.error,
+        hostMissing: Boolean(nativeRes.hostMissing),
+      };
     }
 
     case "CANCEL_TRANSLATE": {
@@ -540,17 +804,7 @@ async function handleMessage(message, sender = {}, deps = {}) {
         inflightControllers.get(requestId).abort();
         inflightControllers.delete(requestId);
       }
-      if (requestId) {
-        try {
-          await fetchImpl(`${serverBase}/translate/cancel`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ request_id: requestId }),
-          });
-        } catch (_err) {
-          // Best-effort server-side cancellation.
-        }
-      }
+      await cancelServerTranslate(serverBase, requestId, fetchImpl);
       return { ok: true };
     }
 
@@ -561,15 +815,14 @@ async function handleMessage(message, sender = {}, deps = {}) {
       let completedOk = false;
 
       try {
-        let imageBase64 = message.imageBase64 || "";
-        if (!imageBase64 && message.imageUrl) {
-          const referer = message.refererUrl || sender?.tab?.url || "";
-          imageBase64 = await fetchImageAsBase64(message.imageUrl, referer, {
-            ...deps,
-            fetch: fetchImpl,
-            signal: controller.signal,
-          });
-        }
+        const referer = message.refererUrl || sender?.tab?.url || "";
+        const imageBase64 = await resolveTranslateImageBase64(
+          message,
+          referer,
+          controller.signal,
+          fetchImpl,
+          deps
+        );
         if (controller.signal.aborted) {
           return { ok: false, aborted: true };
         }
@@ -577,23 +830,49 @@ async function handleMessage(message, sender = {}, deps = {}) {
           return { ok: false, error: "No image data provided" };
         }
 
-        const data = await fetchJson(
-          `${serverBase}/translate`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            signal: controller.signal,
-            body: JSON.stringify({
-              image_base64: imageBase64,
-              lang: message.lang || "auto",
-              chapter_id: message.chapterId || "default",
-              priority: message.priority ?? 0,
-              glossary: message.glossary || {},
-              request_id: requestId,
-            }),
-          },
-          fetchImpl
-        );
+        let data;
+        try {
+          data = await fetchJson(
+            `${serverBase}/translate`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              signal: controller.signal,
+              body: JSON.stringify({
+                image_base64: imageBase64,
+                lang: message.lang || "auto",
+                chapter_id: message.chapterId || "default",
+                priority: message.priority ?? 0,
+                glossary: message.glossary || {},
+                request_id: requestId,
+              }),
+            },
+            fetchImpl
+          );
+        } catch (serverErr) {
+          if (serverErr?.name === "AbortError" || controller.signal.aborted) {
+            throw serverErr;
+          }
+          if (isServerUnreachableError(serverErr) && isLoopbackServer(serverBase)) {
+            const startRes = await startServerViaNativeHost({ auto: true }, deps);
+            if (startRes.ok) {
+              return {
+                ok: false,
+                offline: true,
+                starting: true,
+                error: STARTING_ENGINE_MESSAGE,
+              };
+            }
+            return {
+              ok: false,
+              offline: true,
+              starting: false,
+              hostMissing: Boolean(startRes.hostMissing),
+              error: serverErr?.message || String(serverErr),
+            };
+          }
+          throw serverErr;
+        }
         completedOk = true;
         return { ok: true, data };
       } catch (err) {
@@ -614,8 +893,198 @@ async function handleMessage(message, sender = {}, deps = {}) {
   }
 }
 
+function handlePortConnect(port, deps = {}) {
+  if (!port || port.name !== STREAM_PORT_NAME) return;
+
+  let disconnected = false;
+  let activeController = null;
+  let activeRequestId = null;
+  let activeServerBase = "";
+
+  const safePost = (event) => {
+    if (disconnected) return;
+    try {
+      port.postMessage(event);
+    } catch (_err) {
+      disconnected = true;
+    }
+  };
+
+  if (port.onDisconnect?.addListener) {
+    port.onDisconnect.addListener(() => {
+      disconnected = true;
+      if (activeController) {
+        activeController.abort();
+      }
+      if (activeRequestId) {
+        const reqId = activeRequestId;
+        const base = activeServerBase;
+        inflightControllers.delete(reqId);
+        activeController = null;
+        activeRequestId = null;
+        const fetchImpl = deps.fetch || fetch;
+        void (async () => {
+          const resolvedBase = base || (await getServerBaseUrl(deps));
+          await cancelServerTranslate(resolvedBase, reqId, fetchImpl);
+        })();
+      }
+    });
+  }
+
+  if (port.onMessage?.addListener) {
+    port.onMessage.addListener((msg) => {
+      if (msg?.type !== "START" || disconnected) return;
+      void runStreamRequest(msg);
+    });
+  }
+
+  async function runStreamRequest(msg) {
+    const fetchImpl = deps.fetch || fetch;
+    const serverBase = await getServerBaseUrl(deps);
+    const requestId =
+      msg.requestId || `bg-stream-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const controller = new AbortController();
+    activeController = controller;
+    activeRequestId = requestId;
+    activeServerBase = serverBase;
+    inflightControllers.set(requestId, controller);
+
+    let completedOk = false;
+    try {
+      const referer = msg.refererUrl || port?.sender?.tab?.url || "";
+      const imageBase64 = await resolveTranslateImageBase64(
+        msg,
+        referer,
+        controller.signal,
+        fetchImpl,
+        deps
+      );
+      if (disconnected || controller.signal.aborted) return;
+      if (!imageBase64) {
+        safePost({ type: "error", detail: "No image data provided" });
+        return;
+      }
+
+      let response;
+      try {
+        response = await fetchImpl(`${serverBase}/translate/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            image_base64: imageBase64,
+            lang: msg.lang || "auto",
+            chapter_id: msg.chapterId || "default",
+            priority: msg.priority ?? 0,
+            glossary: msg.glossary || {},
+            request_id: requestId,
+          }),
+        });
+      } catch (serverErr) {
+        if (disconnected || serverErr?.name === "AbortError" || controller.signal.aborted) {
+          return;
+        }
+        if (isServerUnreachableError(serverErr) && isLoopbackServer(serverBase)) {
+          const startRes = await startServerViaNativeHost({ auto: true }, deps);
+          if (startRes.ok) {
+            safePost({
+              type: "error",
+              offline: true,
+              starting: true,
+              error: STARTING_ENGINE_MESSAGE,
+            });
+          } else {
+            safePost({
+              type: "error",
+              offline: true,
+              starting: false,
+              hostMissing: Boolean(startRes.hostMissing),
+              error: serverErr?.message || String(serverErr),
+            });
+          }
+          return;
+        }
+        safePost({ type: "error", detail: serverErr?.message || String(serverErr) });
+        return;
+      }
+
+      if (!response.ok) {
+        const errText = await response.text();
+        let detail = `HTTP ${response.status}`;
+        if (errText) {
+          try {
+            const parsed = JSON.parse(errText);
+            detail = parsed?.detail || errText;
+          } catch (_err) {
+            detail = errText;
+          }
+        }
+        safePost({ type: "error", detail: String(detail) });
+        return;
+      }
+
+      const emitLine = (rawLine) => {
+        const trimmed = rawLine.trim();
+        if (!trimmed || disconnected) return;
+        try {
+          const evt = JSON.parse(trimmed);
+          if (evt?.type === "done") completedOk = true;
+          safePost(evt);
+        } catch (_err) {
+          // Ignore malformed NDJSON line.
+        }
+      };
+
+      const reader = response.body?.getReader?.();
+      if (!reader) {
+        const text = await response.text();
+        for (const line of text.split("\n")) {
+          emitLine(line);
+        }
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!disconnected && !controller.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          emitLine(line);
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        emitLine(buffer);
+      }
+    } catch (err) {
+      if (!disconnected && err?.name !== "AbortError" && !controller.signal.aborted) {
+        safePost({ type: "error", detail: err?.message || String(err) });
+      }
+    } finally {
+      inflightControllers.delete(requestId);
+      if (activeRequestId === requestId) {
+        activeController = null;
+        activeRequestId = null;
+      }
+      if (completedOk && !disconnected) {
+        await maybeCheckHealthAfterTranslate(serverBase, fetchImpl, deps);
+      }
+    }
+  }
+}
+
 function registerExtensionListeners() {
   if (typeof chrome === "undefined" || !chrome.runtime) return;
+
+  if (chrome.runtime.onConnect?.addListener) {
+    chrome.runtime.onConnect.addListener((port) => {
+      handlePortConnect(port);
+    });
+  }
 
   if (chrome.runtime.onMessage?.addListener) {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -696,6 +1165,10 @@ if (typeof module !== "undefined" && module.exports) {
     UPDATE_CHECK_ALARM_NAME,
     RELOAD_COOLDOWN_MS,
     POST_TRANSLATE_HEALTH_THROTTLE_MS,
+    NATIVE_HOST_NAME,
+    STREAM_PORT_NAME,
+    AUTO_START_COOLDOWN_MS,
+    SERVER_STARTING_WINDOW_MS,
     arrayBufferToBase64,
     fetchImageAsBase64,
     getInflightCount,
@@ -703,7 +1176,10 @@ if (typeof module !== "undefined" && module.exports) {
     maybeAutoReloadForBuild,
     ensureUpdateAlarm,
     runScheduledUpdateCheck,
+    sendNativeCommand,
+    startServerViaNativeHost,
     handleMessage,
+    handlePortConnect,
     registerExtensionListeners,
   };
 }

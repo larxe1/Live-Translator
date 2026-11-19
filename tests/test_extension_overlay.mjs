@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const overlay = require("../extension/overlay.js");
 const content = require("../extension/content.js");
@@ -643,4 +647,195 @@ test("8. background Referer session rule is added before fetch and removed in fi
   assert.equal(events[0].kind, "add");
   assert.equal(events[1].kind, "remove");
   assert.equal(activeRuleId, null);
+});
+
+test("9. whole-word fitting prevents mid-word chopping for narrow vertical bubbles down to MIN_FONT_PX", () => {
+  const cases = [
+    { text: "Phantom Troupe", box: { x1: 120, y1: 60, x2: 175, y2: 320 } }, // 55 x 260
+    { text: "That's for sure!!", box: { x1: 120, y1: 60, x2: 175, y2: 320 } }, // 55 x 260
+    {
+      text: "because of the mistakes that were made, but still mostly unchanged",
+      box: { x1: 120, y1: 60, x2: 175, y2: 320 }, // 55 x 260
+    },
+    {
+      text: "because of the mistakes that were made, but still mostly unchanged",
+      box: { x1: 100, y1: 80, x2: 170, y2: 280 }, // 70 x 200
+    },
+    // Super-narrow box that MUST drop below 11px down to 7..10px so "unchanged" fits whole
+    {
+      text: "unchanged mistakes",
+      box: { x1: 100, y1: 80, x2: 142, y2: 280 }, // 42 x 200
+    },
+  ];
+
+  for (const { text, box } of cases) {
+    const fit = overlay.computeFittedBox(text, box, { w: 900, h: 1300 });
+    const boxW = fit.box.x2 - fit.box.x1;
+    const boxH = fit.box.y2 - fit.box.y1;
+    const { innerW } = overlay.computeInnerDimensions(boxW, boxH, fit.expanded);
+    const words = text.trim().split(/\s+/);
+    const maxWordW = Math.max(...words.map((w) => overlay.measureWordWidth(w, fit.fontSizePx, null)));
+    assert.ok(
+      maxWordW <= innerW,
+      `Longest word in "${text}" (${maxWordW.toFixed(2)}px at ${fit.fontSizePx}px) exceeded innerW=${innerW}`
+    );
+    assert.ok(fit.fontSizePx >= overlay.MIN_FONT_PX);
+  }
+
+  // Verify super-narrow case actually shrunk below the old 11px floor
+  const narrowFit = overlay.computeFittedBox(
+    "unchanged mistakes",
+    { x1: 100, y1: 80, x2: 142, y2: 280 },
+    { w: 900, h: 1300 }
+  );
+  assert.ok(narrowFit.fontSizePx < 11, `Expected < 11px, got ${narrowFit.fontSizePx}`);
+  assert.ok(narrowFit.fontSizePx >= 7, `Expected >= 7px, got ${narrowFit.fontSizePx}`);
+});
+
+test("10. bbox geometry utilization reclaims wasted horizontal space in tall narrow bubbles", () => {
+  const safeBox = { x1: 130, y1: 70, x2: 185, y2: 330 }; // 55 x 260
+  const fullBbox = { x1: 105, y1: 55, x2: 210, y2: 345 }; // 105 x 290
+  const fit = overlay.computeFittedBox(
+    "because of the mistakes that were made, but still mostly unchanged",
+    safeBox,
+    { w: 900, h: 1300 },
+    { bbox: fullBbox }
+  );
+
+  const fittedW = fit.box.x2 - fit.box.x1;
+  assert.ok(fittedW >= (fullBbox.x2 - fullBbox.x1) * 0.85, `Expected box width >= 85% of bbox, got ${fittedW}`);
+  assert.ok(fit.fontSizePx >= 11, `Expected roomy font inside bbox, got ${fit.fontSizePx}`);
+});
+
+test("11. styles.css disables mid-word breaking on .mlt-bubble and removes conflicting px padding", () => {
+  const cssPath = path.resolve(__dirname, "../extension/styles.css");
+  const css = fs.readFileSync(cssPath, "utf8");
+  const bubbleMatch = css.match(/\.mlt-bubble\s*\{([^}]*)\}/);
+  assert.ok(bubbleMatch, ".mlt-bubble rule must exist in styles.css");
+  const bubbleRule = bubbleMatch[1];
+
+  assert.equal(/overflow-wrap\s*:\s*break-word/i.test(bubbleRule), false);
+  assert.equal(/word-break\s*:\s*break-all/i.test(bubbleRule), false);
+  assert.match(bubbleRule, /overflow-wrap\s*:\s*normal/i);
+  assert.match(bubbleRule, /word-break\s*:\s*normal/i);
+  assert.match(bubbleRule, /hyphens\s*:\s*none/i);
+  assert.match(bubbleRule, /text-wrap\s*:\s*balance/i);
+
+  const expandedMatch = css.match(/\.mlt-bubble-expanded\s*\{([^}]*)\}/);
+  assert.ok(expandedMatch);
+  assert.equal(/padding\s*:/i.test(expandedMatch[1]), false);
+});
+
+test("12. createOverlaySession mounts incrementally, skips empty text, updates duplicate IDs, and rescales", () => {
+  const doc = createMockDocument();
+  const win = createMockWindow(doc);
+  const img = doc.createElement("img");
+  img.width = 900;
+  img.height = 1300;
+  img.naturalWidth = 900;
+  img.naturalHeight = 1300;
+  doc.body.appendChild(img);
+
+  const session = overlay.createOverlaySession(
+    img,
+    {
+      lang: "ja",
+      width: 900,
+      height: 1300,
+      bubbles: [
+        {
+          id: 0,
+          bbox: [100, 80, 220, 260],
+          safe_box: [108, 90, 212, 250],
+          bg_color: "#FFFFFF",
+          text_color: "#111111",
+          is_dark: false,
+          original: "ファントム旅団",
+        },
+        {
+          id: 1,
+          bbox: [300, 100, 460, 220],
+          safe_box: [310, 110, 450, 210],
+          bg_color: "#FFFFFF",
+          text_color: "#111111",
+          is_dark: false,
+          original: "！？",
+        },
+        {
+          id: 2,
+          bbox: [500, 150, 680, 320],
+          safe_box: [510, 160, 670, 310],
+          bg_color: "#111111",
+          text_color: "#FFFFFF",
+          is_dark: true,
+          original: "やめろ",
+        },
+      ],
+    },
+    { document: doc, window: win }
+  );
+
+  // Upfront on meta: zero masks or bubbles painted yet.
+  assert.ok(session.overlayEl);
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-mask").length, 0);
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-bubble").length, 0);
+
+  // Stream bubble 0.
+  session.addBubble({ id: 0, translated: "Phantom Troupe!", final: true });
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-mask").length, 1);
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-bubble").length, 1);
+  assert.equal(session.overlayEl.querySelector(".mlt-bubble-text").textContent, "Phantom Troupe!");
+
+  // Empty / whitespace translation skips painting mask & bubble so original art stays clean.
+  session.addBubble({ id: 1, translated: "   ", final: true });
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-mask").length, 1);
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-bubble").length, 1);
+
+  // Stream bubble 2, then send a late retry update for duplicate id=2.
+  session.addBubble({ id: 2, translated: "Stop!", final: false });
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-bubble").length, 2);
+
+  session.addBubble({ id: 2, translated: "Stop right there!!", final: true });
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-mask").length, 2);
+  assert.equal(session.overlayEl.querySelectorAll(".mlt-bubble").length, 2);
+  const b2 = session.overlayEl
+    .querySelectorAll(".mlt-bubble")
+    .find((el) => el.dataset.bubbleId === "2");
+  assert.equal(b2.querySelector(".mlt-bubble-text").textContent, "Stop right there!!");
+  assert.equal(b2.querySelector(".mlt-tooltip-en").textContent, "Stop right there!!");
+
+  // Proportional resize scaling (0.5x display width) scales fontSize down to floor 6px and padding proportionally.
+  img.width = 450;
+  img.height = 650;
+  session.finish();
+  for (const bEl of session.overlayEl.querySelectorAll(".mlt-bubble")) {
+    const baseFont = Number(bEl.dataset.baseFontPx);
+    const expectedFont = Math.max(6, baseFont * 0.5).toFixed(2);
+    assert.equal(bEl.style.fontSize, `${expectedFont}px`);
+    assert.match(bEl.style.padding, /^\d+(\.\d+)?px \d+(\.\d+)?px$/);
+  }
+
+  session.destroy();
+  assert.equal(doc.querySelector(".mlt-overlay"), null);
+});
+
+test("13. fitMountedBubbleElement shrinks font down to 6px when DOM scrollWidth/scrollHeight overflows", () => {
+  const bubbleEl = {
+    style: { fontSize: "12.00px" },
+    clientWidth: 44,
+    clientHeight: 120,
+    get scrollWidth() {
+      const fs = parseFloat(this.style.fontSize);
+      return fs > 8.5 ? 54 : 42;
+    },
+    get scrollHeight() {
+      return 60;
+    },
+    querySelector() {
+      return null;
+    },
+  };
+
+  overlay.fitMountedBubbleElement(bubbleEl);
+  assert.equal(parseFloat(bubbleEl.style.fontSize), 8.5);
 });

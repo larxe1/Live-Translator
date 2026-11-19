@@ -28,7 +28,7 @@ class AppConfig:
     max_image_bytes: int = 25_000_000
     max_image_width: int = 2400
     max_queue_size: int = 12
-    idle_unload_minutes: int = 20
+    idle_unload_minutes: int = 3
     auto_update_enabled: bool = True
     auto_update_check_interval_sec: int = 1800
     cache_dir: Path | None = None
@@ -102,7 +102,7 @@ def load_config(
         max_image_bytes=int(raw.get("max_image_bytes", 25_000_000)),
         max_image_width=int(raw.get("max_image_width", 2400)),
         max_queue_size=int(raw.get("max_queue_size", 12)),
-        idle_unload_minutes=int(raw.get("idle_unload_minutes", 20)),
+        idle_unload_minutes=int(raw.get("idle_unload_minutes", 3)),
         auto_update_enabled=bool(raw.get("auto_update_enabled", True)),
         auto_update_check_interval_sec=int(raw.get("auto_update_check_interval_sec", 1800)),
         cache_dir=raw.get("cache_dir"),

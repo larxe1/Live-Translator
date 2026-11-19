@@ -13,5 +13,5 @@
   "max_image_bytes": 25000000,
   "max_image_width": 2400,
   "max_queue_size": 12,
-  "idle_unload_minutes": 20
+  "idle_unload_minutes": 3
 }
