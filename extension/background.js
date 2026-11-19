@@ -1009,6 +1009,54 @@ function handlePortConnect(port, deps = {}) {
       }
 
       if (!response.ok) {
+        if (response.status === 404) {
+          // Graceful fallback when talking to an older server without /translate/stream.
+          const fallbackData = await fetchJson(
+            `${serverBase}/translate`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              signal: controller.signal,
+              body: JSON.stringify({
+                image_base64: imageBase64,
+                lang: msg.lang || "auto",
+                chapter_id: msg.chapterId || "default",
+                priority: msg.priority ?? 0,
+                glossary: msg.glossary || {},
+                request_id: requestId,
+              }),
+            },
+            fetchImpl
+          );
+          if (disconnected || controller.signal.aborted) return;
+          safePost({
+            type: "meta",
+            lang: fallbackData.lang,
+            width: fallbackData.width,
+            height: fallbackData.height,
+            bubbles: (fallbackData.bubbles || []).map((b) => ({
+              id: b.id,
+              bbox: b.bbox,
+              safe_box: b.safe_box,
+              bg_color: b.bg_color,
+              text_color: b.text_color,
+              is_dark: b.is_dark,
+              original: b.original,
+            })),
+          });
+          for (const b of fallbackData.bubbles || []) {
+            safePost({
+              type: "bubble",
+              id: b.id,
+              translated: b.translated ?? "",
+              final: true,
+            });
+          }
+          completedOk = true;
+          safePost({ type: "done", response: fallbackData });
+          return;
+        }
+
         const errText = await response.text();
         let detail = `HTTP ${response.status}`;
         if (errText) {
@@ -1019,7 +1067,22 @@ function handlePortConnect(port, deps = {}) {
             detail = errText;
           }
         }
-        safePost({ type: "error", detail: String(detail) });
+        if (response.status === 503) {
+          safePost({
+            type: "error",
+            starting: true,
+            status: 503,
+            detail: String(detail),
+            error: String(detail),
+          });
+          return;
+        }
+        safePost({
+          type: "error",
+          status: response.status,
+          detail: String(detail),
+          error: String(detail),
+        });
         return;
       }
 

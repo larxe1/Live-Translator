@@ -177,6 +177,7 @@
       deps.clearTimeout ||
       (typeof win?.clearTimeout === "function" ? win.clearTimeout.bind(win) : clearTimeout);
     const offlineFailedEls = new Set();
+    let lastErrorLabel = "";
 
     const candidates = [];
     const candidateSet = new Set();
@@ -185,8 +186,95 @@
     const lastSourceByEl = new WeakMap();
     const inFlightByEl = new Map();
     const completedByEl = new WeakMap();
+    const failedByEl = new Map();
+    const pageLoadingBadges = new Map();
     const loadListeners = new WeakMap();
     const pageCache = new Map();
+
+    function positionLoadingBadge(el, badgeEl) {
+      if (!el || !badgeEl || !badgeEl.style) return;
+      const rect = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      const vh = Number(win?.innerHeight || 0);
+      const vw = Number(win?.innerWidth || 0);
+      if (!rect || rect.width <= 0 || rect.height <= 0 || vh <= 0 || vw <= 0) {
+        badgeEl.style.top = "16px";
+        badgeEl.style.right = "16px";
+        badgeEl.style.left = "";
+        return;
+      }
+      if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) {
+        badgeEl.style.display = "none";
+        return;
+      }
+      badgeEl.style.display = "inline-flex";
+      const top = Math.max(12, Math.min(vh - 44, rect.top + 12));
+      const right = Math.max(12, Math.min(vw - 140, vw - rect.right + 12));
+      badgeEl.style.top = `${Math.round(top)}px`;
+      badgeEl.style.right = `${Math.round(right)}px`;
+      badgeEl.style.left = "";
+    }
+
+    function showPageLoadingBadge(el, label = "Translating...") {
+      if (!el || !doc || typeof doc.createElement !== "function") return;
+      const host = doc.body || doc.documentElement;
+      if (!host || typeof host.appendChild !== "function") return;
+      let rec = pageLoadingBadges.get(el);
+      if (!rec) {
+        const badge = doc.createElement("div");
+        badge.className = "mlt-page-loading";
+        if (badge.dataset) badge.dataset.mltLoading = "true";
+        const spinner = doc.createElement("span");
+        spinner.className = "mlt-page-spinner";
+        const textSpan = doc.createElement("span");
+        textSpan.textContent = label;
+        badge.appendChild(spinner);
+        badge.appendChild(textSpan);
+        host.appendChild(badge);
+        rec = { badge, textSpan };
+        pageLoadingBadges.set(el, rec);
+      } else {
+        rec.textSpan.textContent = label;
+      }
+      positionLoadingBadge(el, rec.badge);
+    }
+
+    function removePageLoadingBadge(el) {
+      const rec = pageLoadingBadges.get(el);
+      if (!rec) return;
+      pageLoadingBadges.delete(el);
+      if (rec.badge && rec.badge.parentNode) {
+        rec.badge.parentNode.removeChild(rec.badge);
+      }
+    }
+
+    function clearAllPageLoadingBadges() {
+      for (const el of [...pageLoadingBadges.keys()]) {
+        removePageLoadingBadge(el);
+      }
+    }
+
+    function repositionAllLoadingBadges() {
+      for (const [el, rec] of pageLoadingBadges.entries()) {
+        positionLoadingBadge(el, rec.badge);
+      }
+    }
+
+    function isElementFailed(el) {
+      const fail = failedByEl.get(el);
+      if (!fail) return false;
+      const gen = generations.get(el) || 1;
+      return fail.gen === gen && fail.srcKey === getElementSourceKey(el);
+    }
+
+    function isElementInViewport(el) {
+      if (!el || typeof el.getBoundingClientRect !== "function") return false;
+      const vh = Number(win?.innerHeight || 0);
+      const vw = Number(win?.innerWidth || 0);
+      if (vh <= 0 || vw <= 0) return false;
+      const rect = el.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      return rect.bottom > -250 && rect.top < vh + 250 && rect.right > 0 && rect.left < vw;
+    }
 
     function getCacheKey(srcKey) {
       if (!srcKey || srcKey.startsWith("data:") || srcKey.startsWith("canvas:")) {
@@ -234,6 +322,7 @@
       stopHealthPoll();
       stopObservers();
       inFlightByEl.clear();
+      clearAllPageLoadingBadges();
       mountPill();
       setOfflineClickable(false);
       applyUpdatedPillUI();
@@ -275,6 +364,9 @@
       } else if (serverState === "offline") {
         updatePillStatus("offline", offlineLabel);
         setOfflineClickable(true);
+      } else if (lastErrorLabel && doneCount < total) {
+        setOfflineClickable(false);
+        updatePillStatus("error", lastErrorLabel);
       } else {
         setOfflineClickable(false);
         const label = total > 0 && doneCount >= total ? `Translated ${doneCount}/${total}` : "Ready";
@@ -331,7 +423,9 @@
     function handleEngineReady() {
       stopHealthPoll();
       serverState = "ok";
+      lastErrorLabel = "";
       offlineFailedEls.clear();
+      failedByEl.clear();
       refreshStatusIndicator();
       if (enabled && !contextInvalidated) {
         void refreshVisibleAndLookahead();
@@ -590,6 +684,7 @@
 
     function cancelElementInFlight(el) {
       const active = inFlightByEl.get(el);
+      removePageLoadingBadge(el);
       if (!active) return;
       inFlightByEl.delete(el);
       if (active.port) {
@@ -627,18 +722,28 @@
       const tag = String(el.tagName).toUpperCase();
       if (tag !== "IMG" && tag !== "CANVAS") return;
 
-      if (tag === "IMG" && el.complete === false && !loadListeners.has(el)) {
+      if (tag === "IMG" && !loadListeners.has(el) && typeof el.addEventListener === "function") {
+        // Persistent load listener: handles both initial async loads AND lazy-loaders
+        // that swap src onto an already-complete 1x1 placeholder <img>.
         const onLoad = () => {
-          if (!enabled) return;
+          if (!enabled || contextInvalidated) return;
+          const nextSrc = getElementSourceKey(el);
+          const prevSrc = lastSourceByEl.get(el);
+          if (prevSrc && nextSrc && nextSrc !== prevSrc) {
+            lastSourceByEl.set(el, nextSrc);
+            bumpGeneration(el);
+            overlayApi?.clearOverlay(el);
+            completedByEl.delete(el);
+            failedByEl.delete(el);
+            cancelElementInFlight(el);
+          }
           if (isCandidateMangaElement(el)) {
             addCandidate(el);
             refreshVisibleAndLookahead();
           }
         };
         loadListeners.set(el, onLoad);
-        if (typeof el.addEventListener === "function") {
-          el.addEventListener("load", onLoad, { once: true });
-        }
+        el.addEventListener("load", onLoad);
       }
 
       if (isCandidateMangaElement(el)) {
@@ -654,6 +759,9 @@
         generations.set(el, 1);
       }
       lastSourceByEl.set(el, getElementSourceKey(el));
+      if (isElementInViewport(el)) {
+        visibleSet.add(el);
+      }
       if (intersectionObserver && typeof intersectionObserver.observe === "function") {
         intersectionObserver.observe(el);
       }
@@ -665,6 +773,7 @@
       overlayApi?.clearOverlay(el);
       visibleSet.delete(el);
       completedByEl.delete(el);
+      failedByEl.delete(el);
       if (candidateSet.has(el)) {
         candidateSet.delete(el);
         const idx = candidates.indexOf(el);
@@ -693,8 +802,10 @@
       bumpGeneration(el);
       overlayApi?.clearOverlay(el);
       completedByEl.delete(el);
+      failedByEl.delete(el);
       cancelElementInFlight(el);
 
+      registerElement(el);
       if (isCandidateMangaElement(el)) {
         addCandidate(el);
         refreshVisibleAndLookahead();
@@ -764,6 +875,8 @@
       const requestId = `mlt-${++reqCounter}-${Date.now()}`;
       const entry = { gen, srcKey, requestId, priority, port: null, session: null };
       inFlightByEl.set(el, entry);
+      failedByEl.delete(el);
+      showPageLoadingBadge(el, "Translating...");
       refreshStatusIndicator();
 
       const isStale = () =>
@@ -791,8 +904,16 @@
           stopHealthPoll();
           serverState = "ok";
         }
+        lastErrorLabel = "";
+        failedByEl.delete(el);
         completedByEl.set(el, { gen, srcKey, response: data });
         setCachedResponse(cacheKey, data);
+      };
+
+      const recordElementError = (detail) => {
+        const msg = String(detail || "Translation failed").trim();
+        failedByEl.set(el, { gen, srcKey, detail: msg });
+        lastErrorLabel = msg.length > 34 ? `Error: ${msg.slice(0, 31)}...` : `Error: ${msg}`;
       };
 
       const translateViaPort = () => {
@@ -803,7 +924,7 @@
         } catch (err) {
           if (isContextInvalidatedError(err)) {
             handleContextInvalidated();
-            return Promise.resolve(null);
+            return Promise.resolve({ handled: true, value: null });
           }
           return null;
         }
@@ -816,7 +937,7 @@
           let session = null;
           const bubblesById = new Map();
 
-          const settle = (value) => {
+          const settle = (value, fallbackToMessage = false) => {
             if (settled) return;
             settled = true;
             try {
@@ -824,7 +945,7 @@
             } catch (_err) {
               // Ignore already disconnected port.
             }
-            resolve(value);
+            resolve({ handled: !fallbackToMessage, value });
           };
 
           port.onMessage?.addListener((evt) => {
@@ -838,6 +959,11 @@
 
             if (evt.type === "meta") {
               meta = evt;
+              const count = Array.isArray(evt.bubbles) ? evt.bubbles.length : 0;
+              showPageLoadingBadge(
+                el,
+                count > 0 ? `Translating 0/${count}...` : "Translating..."
+              );
               if (typeof overlayApi?.createOverlaySession === "function") {
                 session = overlayApi.createOverlaySession(el, evt, { document: doc, window: win });
                 entry.session = session;
@@ -847,6 +973,10 @@
 
             if (evt.type === "bubble") {
               bubblesById.set(evt.id, evt);
+              const totalB = Array.isArray(meta?.bubbles) ? meta.bubbles.length : 0;
+              if (totalB > 0) {
+                showPageLoadingBadge(el, `Translating ${bubblesById.size}/${totalB}...`);
+              }
               if (session) {
                 const base = (meta?.bubbles || []).find((b) => b.id === evt.id) || {};
                 session.addBubble({ ...base, ...evt });
@@ -856,6 +986,7 @@
 
             if (evt.type === "done") {
               const finalResp = evt.response || buildFallbackResponse(meta, bubblesById);
+              removePageLoadingBadge(el);
               if (session) {
                 session.finish?.();
               } else if (finalResp) {
@@ -869,8 +1000,10 @@
             }
 
             if (evt.type === "error") {
+              removePageLoadingBadge(el);
               session?.destroy?.();
-              if (isContextInvalidatedError(evt.error || evt.detail)) {
+              const errMsg = evt.error || evt.detail || "";
+              if (isContextInvalidatedError(errMsg)) {
                 handleContextInvalidated();
               } else if (evt.starting) {
                 beginStartingWatch();
@@ -878,6 +1011,8 @@
                 markServerOffline("Launcher missing — run setup.ps1");
               } else if (evt.offline) {
                 markServerOffline("Offline — Click to start");
+              } else {
+                recordElementError(errMsg);
               }
               settle(null);
             }
@@ -888,9 +1023,16 @@
             const lastErr = typeof chrome !== "undefined" ? chrome?.runtime?.lastError : null;
             if (lastErr && isContextInvalidatedError(lastErr.message || lastErr)) {
               handleContextInvalidated();
+              session?.destroy?.();
+              settle(null);
+              return;
             }
             session?.destroy?.();
-            settle(null);
+            // If disconnected unexpectedly before any events arrived (and not cancelled/stale),
+            // fall back once to TRANSLATE_IMAGE so the page does not silently vanish.
+            const stillMine = inFlightByEl.get(el) === entry;
+            const canFallback = stillMine && !isStale() && !meta && typeof sendMessage === "function";
+            settle(null, canFallback);
           });
 
           try {
@@ -908,8 +1050,10 @@
           } catch (err) {
             if (isContextInvalidatedError(err)) {
               handleContextInvalidated();
+              settle(null);
+            } else {
+              settle(null, typeof sendMessage === "function");
             }
-            settle(null);
           }
         });
       };
@@ -917,8 +1061,13 @@
       try {
         const portPromise = translateViaPort();
         if (portPromise) {
-          return await portPromise;
+          const portOutcome = await portPromise;
+          if (portOutcome && portOutcome.handled) {
+            return portOutcome.value;
+          }
         }
+
+        if (isStale() || typeof sendMessage !== "function") return null;
 
         const result = await sendMessage({
           type: "TRANSLATE_IMAGE",
@@ -943,8 +1092,10 @@
               beginStartingWatch();
             } else if (result.hostMissing) {
               markServerOffline("Launcher missing — run setup.ps1");
-            } else {
+            } else if (result.offline) {
               markServerOffline("Offline — Click to start");
+            } else {
+              recordElementError(result.error);
             }
           }
           return null;
@@ -962,6 +1113,7 @@
         markServerOffline("Offline — Click to start");
         return null;
       } finally {
+        removePageLoadingBadge(el);
         const cur = inFlightByEl.get(el);
         if (cur && cur.requestId === requestId) {
           inFlightByEl.delete(el);
@@ -1008,7 +1160,7 @@
       }
       sortCandidatesInDomOrder();
       for (const el of candidates) {
-        if (isElementCompleted(el) || inFlightByEl.has(el)) continue;
+        if (isElementCompleted(el) || isElementFailed(el) || inFlightByEl.has(el)) continue;
         void translateElement(el, 1);
         return;
       }
@@ -1067,6 +1219,8 @@
 
     function retranslateAllActive() {
       if (!enabled || contextInvalidated) return;
+      lastErrorLabel = "";
+      failedByEl.clear();
       for (const el of candidates) {
         bumpGeneration(el);
         completedByEl.delete(el);
@@ -1094,7 +1248,8 @@
             }
             refreshVisibleAndLookahead();
           },
-          { threshold: 0.05 }
+          // threshold: 0 ensures very tall webtoon strips (>20x viewport) always trigger intersection.
+          { threshold: 0, rootMargin: "250px 0px" }
         );
         for (const el of candidates) {
           intersectionObserver.observe(el);
@@ -1173,6 +1328,9 @@
     function disable() {
       enabled = false;
       cancelAllActive();
+      clearAllPageLoadingBadges();
+      failedByEl.clear();
+      lastErrorLabel = "";
       serverState = "ok";
       stopObservers();
       for (const el of [...candidates]) {
@@ -1233,8 +1391,15 @@
       const onUnload = () => {
         cancelAllActive();
       };
+      const onViewportMove = () => {
+        if (pageLoadingBadges.size > 0) {
+          repositionAllLoadingBadges();
+        }
+      };
       win.addEventListener("pagehide", onUnload);
       win.addEventListener("beforeunload", onUnload);
+      win.addEventListener("scroll", onViewportMove, { passive: true });
+      win.addEventListener("resize", onViewportMove, { passive: true });
     }
 
     return {

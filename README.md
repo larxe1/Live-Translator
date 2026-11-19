@@ -46,7 +46,7 @@ Local Japanese manga and Korean manhwa translator for Microsoft Edge. It detects
 - **Tab shows `Updated — Click to refresh`:** Click the pill or refresh the tab after the extension reloads.
 - **Extension says the native host is missing:** Re-run `.venv\Scripts\python.exe native_host\register_host.py`, then reload the extension. Check `cache\native-host.log` and `cache\server.log`.
 - **Server offline or stuck process on port 8765:** Run `Stop Manga Translator.bat`, check `cache\llama-server.log`, and run `Start Manga Translator.bat` again.
-- **GPU VRAM limits:** Adjust `llm_gpu_layers` (default `23`), `llm_ctx_size` (default `4096`), or `idle_unload_minutes` (default `20`) in `config.json`.
+- **GPU VRAM limits:** Adjust `llm_gpu_layers` (default `23`), `llm_ctx_size` (default `4096`), or `idle_unload_minutes` (default `3`) in `config.json`.
 - **Remote update skipped:** Automatic pulls only run fast-forward merges when `git status --porcelain` is empty.
 
 ## Project Layout

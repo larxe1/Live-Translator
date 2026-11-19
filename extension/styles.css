@@ -185,12 +185,60 @@ html.mlt-peek-original .mlt-overlay {
   flex-shrink: 0;
 }
 
-.mlt-pill-dot[data-state="busy"] {
-  background: #f59e0b;
+@keyframes mlt-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(1.25); }
 }
 
-.mlt-pill-dot[data-state="offline"] {
+@keyframes mlt-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.mlt-pill-dot[data-state="busy"] {
+  background: #f59e0b;
+  animation: mlt-pulse 1.1s ease-in-out infinite;
+}
+
+.mlt-pill-dot[data-state="starting"] {
+  background: #6366f1;
+  animation: mlt-pulse 1.1s ease-in-out infinite;
+}
+
+.mlt-pill-dot[data-state="offline"],
+.mlt-pill-dot[data-state="error"] {
   background: #ef4444;
+}
+
+/* Per-page floating loading badge anchored to the active manga image */
+.mlt-page-loading {
+  position: fixed;
+  z-index: 2147483644;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.9);
+  color: #f8fafc;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  pointer-events: none;
+  user-select: none;
+}
+
+.mlt-page-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 2px solid rgba(248, 250, 252, 0.28);
+  border-top-color: #f59e0b;
+  animation: mlt-spin 0.75s linear infinite;
+  flex-shrink: 0;
 }
 
 .mlt-pill-controls {

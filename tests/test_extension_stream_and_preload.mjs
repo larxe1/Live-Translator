@@ -535,3 +535,243 @@ test("4. Whole-chapter pre-translation queues offscreen loaded images at priorit
   assert.ok(cancelledIds.includes(p5ReqId));
   if (holdP5Resolve) holdP5Resolve();
 });
+
+test("5. HTTP 503 on /translate/stream emits starting:true and HTTP 404 falls back to POST /translate", async () => {
+  // Part A: 503 while models are loading
+  const sb503 = loadBackgroundSandbox({
+    fetchImpl: async (url) => {
+      if (url.endsWith("/translate/stream")) {
+        return {
+          ok: false,
+          status: 503,
+          async text() {
+            return JSON.stringify({ detail: "Models are not ready yet (loading_detector)" });
+          },
+        };
+      }
+      return { ok: false, status: 404, async text() { return "{}"; } };
+    },
+  });
+  const p503 = sb503.connectPort("mlt-translate-stream");
+  const errEvt = await new Promise((resolve) => {
+    p503.clientPort.onMessage.addListener((evt) => resolve(evt));
+    p503.clientPort.postMessage({ type: "START", imageBase64: "AAAA", requestId: "req-503" });
+  });
+  assert.equal(errEvt.type, "error");
+  assert.equal(errEvt.starting, true);
+  assert.equal(errEvt.status, 503);
+
+  // Part B: 404 falls back to POST /translate and emits meta -> bubble -> done
+  const sb404 = loadBackgroundSandbox({
+    fetchImpl: async (url) => {
+      if (url.endsWith("/translate/stream")) {
+        return { ok: false, status: 404, async text() { return "Not Found"; } };
+      }
+      if (url.endsWith("/translate")) {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              lang: "ja",
+              width: 800,
+              height: 1200,
+              bubbles: [{ id: 0, bbox: [0, 0, 100, 100], safe_box: [5, 5, 95, 95], translated: "Fallback OK", original: "テスト" }],
+            });
+          },
+        };
+      }
+      if (url.endsWith("/health")) {
+        return { ok: true, status: 200, async text() { return JSON.stringify({ ready: true }); } };
+      }
+      return { ok: false, status: 404, async text() { return "{}"; } };
+    },
+  });
+  const p404 = sb404.connectPort("mlt-translate-stream");
+  const fallbackEvents = [];
+  await new Promise((resolve) => {
+    p404.clientPort.onMessage.addListener((evt) => {
+      fallbackEvents.push(evt);
+      if (evt.type === "done") resolve();
+    });
+    p404.clientPort.postMessage({ type: "START", imageBase64: "AAAA", requestId: "req-404" });
+  });
+  assert.deepEqual(fallbackEvents.map((e) => e.type), ["meta", "bubble", "done"]);
+  assert.equal(fallbackEvents[1].translated, "Fallback OK");
+});
+
+test("6. Lazy-loaded placeholder img swapping src + load event triggers translation and shows/clears on-page loading badge", async () => {
+  const { doc, win } = createMinimalDom();
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+
+  // Placeholder <img> starts complete=true with 1x1 dimensions (common lazy-load pattern)
+  const lazyImg = doc.createElement("img");
+  lazyImg.src = "https://cdn.example.org/placeholder.gif";
+  lazyImg.width = 1;
+  lazyImg.height = 1;
+  lazyImg.naturalWidth = 1;
+  lazyImg.naturalHeight = 1;
+  lazyImg.complete = true;
+  lazyImg.getBoundingClientRect = () => ({
+    left: 100,
+    top: 20,
+    width: lazyImg.width,
+    height: lazyImg.height,
+    right: 100 + lazyImg.width,
+    bottom: 20 + lazyImg.height,
+  });
+  const loadHandlers = [];
+  lazyImg.addEventListener = (type, fn) => {
+    if (type === "load") loadHandlers.push(fn);
+  };
+  doc.body.appendChild(lazyImg);
+
+  let observedIoOpts = null;
+  class FakeIO {
+    constructor(_cb, opts) {
+      observedIoOpts = opts;
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+
+  let badgeSeenWhileTranslating = "";
+  let badgeSeenAfterBubble = "";
+  const startedUrls = [];
+  let finishStream = null;
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          startedUrls.push(msg.imageUrl);
+          const findBadges = () =>
+            doc.body.children.filter((c) => c.className === "mlt-page-loading");
+          const badges = findBadges();
+          badgeSeenWhileTranslating = badges.length > 0 ? badges[0].children[1].textContent : "";
+          finishStream = () => {
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 15000, bubbles: [{ id: 0, bbox: [0, 0, 100, 100] }] });
+              fn({ type: "bubble", id: 0, translated: "Hello!", final: true });
+            }
+            const badgesMid = findBadges();
+            badgeSeenAfterBubble = badgesMid.length > 0 ? badgesMid[0].children[1].textContent : "";
+            for (const fn of listeners) {
+              fn({
+                type: "done",
+                response: {
+                  lang: "ja",
+                  width: 800,
+                  height: 15000,
+                  bubbles: [{ id: 0, bbox: [0, 0, 100, 100], translated: "Hello!" }],
+                },
+              });
+            }
+          };
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: FakeIO,
+  });
+
+  await controller.init();
+  assert.equal(observedIoOpts.threshold, 0);
+  assert.equal(startedUrls.length, 0);
+
+  // Lazy-loader swaps src onto placeholder -> complete becomes false while downloading
+  lazyImg.src = "https://cdn.example.org/long-strip-page1.jpg";
+  lazyImg.complete = false;
+  controller.handleSourceMutation(lazyImg);
+  assert.equal(startedUrls.length, 0);
+
+  // Real tall webtoon image finishes loading -> fires load event
+  lazyImg.complete = true;
+  lazyImg.width = 800;
+  lazyImg.height = 15000;
+  lazyImg.naturalWidth = 800;
+  lazyImg.naturalHeight = 15000;
+  for (const fn of loadHandlers) fn();
+
+  assert.equal(startedUrls.length, 1);
+  assert.equal(startedUrls[0], "https://cdn.example.org/long-strip-page1.jpg");
+  assert.equal(badgeSeenWhileTranslating, "Translating...");
+
+  finishStream();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(badgeSeenAfterBubble, "Translating 1/1...");
+  assert.equal(doc.body.children.filter((c) => c.className === "mlt-page-loading").length, 0);
+});
+
+test("7. Failed image in preload records failure once and advances to next page instead of spinning", async () => {
+  const { doc, win } = createMinimalDom();
+  const badImg = doc.createElement("img");
+  badImg.src = "https://cdn.example.org/bad.jpg";
+  doc.body.appendChild(badImg);
+
+  const goodImg = doc.createElement("img");
+  goodImg.src = "https://cdn.example.org/good.jpg";
+  doc.body.appendChild(goodImg);
+
+  const calls = [];
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          const file = msg.imageUrl.split("/").pop();
+          calls.push(file);
+          setTimeout(() => {
+            if (file === "bad.jpg") {
+              for (const fn of listeners) fn({ type: "error", detail: "HTTP 413 Image too large" });
+            } else {
+              for (const fn of listeners) {
+                fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [] });
+                fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+              }
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(calls.filter((c) => c === "bad.jpg").length, 1);
+  assert.equal(calls.filter((c) => c === "good.jpg").length, 1);
+});
