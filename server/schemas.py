@@ -7,6 +7,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+RegionType = Literal["bubble", "narration", "floating"]
+
+
 class Box(BaseModel):
     """Axis-aligned pixel bounding box in natural image coordinates."""
 
@@ -27,6 +30,7 @@ class BubbleResult(BaseModel):
     is_dark: bool
     original: str
     translated: str
+    region_type: RegionType = "bubble"
 
 
 class TranslateRequest(BaseModel):
@@ -38,6 +42,8 @@ class TranslateRequest(BaseModel):
     priority: int = 0
     glossary: dict[str, str] = Field(default_factory=dict)
     request_id: str | None = None
+    include_floating: bool = True
+    series_id: str | None = None
 
 
 class TranslateResponse(BaseModel):
@@ -110,10 +116,30 @@ class GlossaryUpdateRequest(BaseModel):
     """Request payload to update pinned character/term glossary entries."""
 
     chapter_id: str = "default"
+    series_id: str | None = None
     entries: dict[str, str]
+
+
+class GlossaryLookupRequest(BaseModel):
+    """Request payload to look up character names from AniList, Wikipedia, or Fandom."""
+
+    query: str
+    source: Literal["auto", "anilist", "wikipedia", "fandom"] = "auto"
+
+
+class GlossaryLookupResponse(BaseModel):
+    """Response payload containing imported character glossary entries."""
+
+    title: str
+    source: str
+    url: str
+    entries: dict[str, str] = Field(default_factory=dict)
+    count: int
+    warnings: list[str] = Field(default_factory=list)
 
 
 class MemoryClearRequest(BaseModel):
     """Request payload to clear rolling chapter translation context."""
 
     chapter_id: str = "default"
+    series_id: str | None = None

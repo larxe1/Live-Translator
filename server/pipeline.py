@@ -244,6 +244,17 @@ def _box_to_list(box: Box) -> list[int]:
     return [box.x1, box.y1, box.x2, box.y2]
 
 
+def _accepts_kwarg(fn: Callable[..., Any], kwarg_name: str) -> bool:
+    """Return True if callable accepts keyword argument kwarg_name (directly or via **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg_name in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 def _response_to_meta_event(resp: TranslateResponse) -> dict[str, Any]:
     return {
         "type": "meta",
@@ -259,6 +270,7 @@ def _response_to_meta_event(resp: TranslateResponse) -> dict[str, Any]:
                 "text_color": b.text_color,
                 "is_dark": b.is_dark,
                 "original": b.original,
+                "region_type": b.region_type,
             }
             for b in resp.bubbles
         ],
@@ -314,20 +326,48 @@ class TranslationPipeline:
         """Cancel a pending queued translation request by request_id."""
         self.queue.cancel(request_id)
 
+    def _record_cached_context(
+        self,
+        chapter_id: str,
+        cached: TranslateResponse,
+        series_id: str | None = None,
+    ) -> None:
+        pairs = [(b.original, b.translated) for b in cached.bubbles if b.original and b.translated]
+        if not pairs:
+            return
+        if _accepts_kwarg(self.memory.record_page, "series_id"):
+            self.memory.record_page(chapter_id, pairs, series_id=series_id)
+        else:
+            self.memory.record_page(chapter_id, pairs)
+
     def _prepare_request_context(
         self,
         image_bytes: bytes,
         lang: Literal["auto", "ja", "ko"],
         chapter_id: str,
         glossary: dict[str, str] | None,
+        *,
+        include_floating: bool = True,
+        series_id: str | None = None,
     ) -> tuple[dict[str, str], str]:
         if len(image_bytes) > self.max_image_bytes:
             raise PayloadTooLargeError(
                 f"Image payload ({len(image_bytes)} bytes) exceeds limit ({self.max_image_bytes} bytes)"
             )
-        chapter_glossary = self.memory.get_glossary(chapter_id)
+        if _accepts_kwarg(self.memory.get_glossary, "series_id"):
+            chapter_glossary = self.memory.get_glossary(chapter_id, series_id=series_id)
+        else:
+            chapter_glossary = self.memory.get_glossary(chapter_id)
         merged_glossary = {**chapter_glossary, **(glossary or {})}
-        cache_key = self.cache.make_key(image_bytes, lang, merged_glossary)
+        if _accepts_kwarg(self.cache.make_key, "include_floating"):
+            cache_key = self.cache.make_key(
+                image_bytes,
+                lang,
+                merged_glossary,
+                include_floating=include_floating,
+            )
+        else:
+            cache_key = self.cache.make_key(image_bytes, lang, merged_glossary)
         return merged_glossary, cache_key
 
     async def _run_gpu_job(
@@ -339,10 +379,14 @@ class TranslationPipeline:
         merged_glossary: dict[str, str],
         cache_key: str,
         emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        *,
+        include_floating: bool = True,
+        series_id: str | None = None,
     ) -> TranslateResponse:
         # Re-check cache in case an identical image finished while we waited in queue.
         cached_inner = self.cache.get(cache_key)
         if cached_inner is not None:
+            self._record_cached_context(chapter_id, cached_inner, series_id=series_id)
             if emit is not None:
                 await emit(_response_to_meta_event(cached_inner))
                 for b in cached_inner.bubbles:
@@ -386,7 +430,14 @@ class TranslationPipeline:
             img_rgb = np.asarray(infer_img)
 
             t_det0 = time.perf_counter()
-            detections: list[RawDetection] = await _call_maybe_async(self.detector.detect, infer_img)
+            if _accepts_kwarg(self.detector.detect, "include_floating"):
+                detections: list[RawDetection] = await _call_maybe_async(
+                    self.detector.detect,
+                    infer_img,
+                    include_floating=include_floating,
+                )
+            else:
+                detections = await _call_maybe_async(self.detector.detect, infer_img)
             detector_ms = int((time.perf_counter() - t_det0) * 1000)
             if not detections:
                 resolved_empty = _fallback_lang(lang, orig_w, orig_h)
@@ -407,7 +458,15 @@ class TranslationPipeline:
                 )
                 if emit is not None:
                     await emit(_response_to_meta_event(empty_resp))
-                self._store_cache(image_bytes, lang, resolved_empty, merged_glossary, cache_key, empty_resp)
+                self._store_cache(
+                    image_bytes,
+                    lang,
+                    resolved_empty,
+                    merged_glossary,
+                    cache_key,
+                    empty_resp,
+                    include_floating=include_floating,
+                )
                 if emit is not None:
                     await emit({"type": "done", "response": empty_resp.model_dump()})
                 return empty_resp
@@ -416,8 +475,15 @@ class TranslationPipeline:
             crops_with_dark: list[tuple[Image.Image, bool]] = []
             for det in detections:
                 style = analyze_bubble_appearance(img_rgb, det.box)
+                region_type = getattr(det, "region_type", "bubble")
                 tight_box = getattr(det, "ocr_box", None)
-                if tight_box is not None:
+                if region_type == "floating":
+                    pad = 2
+                    x1 = max(0, min(infer_w - 1, det.box.x1 - pad))
+                    y1 = max(0, min(infer_h - 1, det.box.y1 - pad))
+                    x2 = max(x1 + 1, min(infer_w, det.box.x2 + pad))
+                    y2 = max(y1 + 1, min(infer_h, det.box.y2 + pad))
+                elif tight_box is not None:
                     pad = 3
                     x1 = max(0, min(infer_w - 1, tight_box.x1 - pad))
                     y1 = max(0, min(infer_h - 1, tight_box.y1 - pad))
@@ -472,7 +538,15 @@ class TranslationPipeline:
                 )
                 if emit is not None:
                     await emit(_response_to_meta_event(empty_resp))
-                self._store_cache(image_bytes, lang, resolved_lang, merged_glossary, cache_key, empty_resp)
+                self._store_cache(
+                    image_bytes,
+                    lang,
+                    resolved_lang,
+                    merged_glossary,
+                    cache_key,
+                    empty_resp,
+                    include_floating=include_floating,
+                )
                 if emit is not None:
                     await emit({"type": "done", "response": empty_resp.model_dump()})
                 return empty_resp
@@ -506,6 +580,7 @@ class TranslationPipeline:
                     _scale_box(style.safe_box, inv_scale, orig_w, orig_h),
                     style,
                     text,
+                    getattr(det, "region_type", "bubble"),
                 )
                 for idx, (det, style, text) in enumerate(ordered_items)
             ]
@@ -526,13 +601,18 @@ class TranslationPipeline:
                                 "text_color": style.text_color,
                                 "is_dark": style.is_dark,
                                 "original": text,
+                                "region_type": region_type,
                             }
-                            for idx, bbox, safe_box, style, text in scaled_geometries
+                            for idx, bbox, safe_box, style, text, region_type in scaled_geometries
                         ],
                     }
                 )
 
             prompt_bubbles = [(idx, item[2]) for idx, item in enumerate(ordered_items)]
+            bubble_types = {
+                idx: region_type
+                for idx, _bbox, _safe_box, _style, _text, region_type in scaled_geometries
+            }
             emitted_ids: set[int] = set()
 
             async def _on_bubble(bid: int, translated_text: str, final: bool) -> None:
@@ -550,22 +630,22 @@ class TranslationPipeline:
                         }
                     )
 
-            supports_on_bubble = "on_bubble" in inspect.signature(self.translator.translate_page).parameters
-            if emit is not None and supports_on_bubble:
-                translations: dict[int, str] = await self.translator.translate_page(
-                    prompt_bubbles,
-                    lang=resolved_lang,
-                    chapter_id=chapter_id,
-                    extra_glossary=glossary,
-                    on_bubble=_on_bubble,
-                )
-            else:
-                translations = await self.translator.translate_page(
-                    prompt_bubbles,
-                    lang=resolved_lang,
-                    chapter_id=chapter_id,
-                    extra_glossary=glossary,
-                )
+            tr_kwargs: dict[str, Any] = {
+                "lang": resolved_lang,
+                "chapter_id": chapter_id,
+                "extra_glossary": glossary,
+            }
+            if emit is not None and _accepts_kwarg(self.translator.translate_page, "on_bubble"):
+                tr_kwargs["on_bubble"] = _on_bubble
+            if _accepts_kwarg(self.translator.translate_page, "series_id"):
+                tr_kwargs["series_id"] = series_id
+            if _accepts_kwarg(self.translator.translate_page, "bubble_types"):
+                tr_kwargs["bubble_types"] = bubble_types
+
+            translations: dict[int, str] = await self.translator.translate_page(
+                prompt_bubbles,
+                **tr_kwargs,
+            )
 
             if emit is not None:
                 for idx, _ in prompt_bubbles:
@@ -582,8 +662,9 @@ class TranslationPipeline:
                     is_dark=style.is_dark,
                     original=text,
                     translated=translations.get(idx, ""),
+                    region_type=region_type,
                 )
-                for idx, bbox, safe_box, style, text in scaled_geometries
+                for idx, bbox, safe_box, style, text, region_type in scaled_geometries
             ]
 
             total_ms = int((time.perf_counter() - t0) * 1000)
@@ -605,7 +686,15 @@ class TranslationPipeline:
                 cached=False,
                 bubbles=bubbles,
             )
-            self._store_cache(image_bytes, lang, resolved_lang, merged_glossary, cache_key, response)
+            self._store_cache(
+                image_bytes,
+                lang,
+                resolved_lang,
+                merged_glossary,
+                cache_key,
+                response,
+                include_floating=include_floating,
+            )
             if emit is not None:
                 await emit({"type": "done", "response": response.model_dump()})
             return response
@@ -621,13 +710,21 @@ class TranslationPipeline:
         priority: int = 0,
         glossary: dict[str, str] | None = None,
         request_id: str | None = None,
+        include_floating: bool = True,
+        series_id: str | None = None,
     ) -> TranslateResponse:
         """Translate all dialogue bubbles in an image, checking cache before GPU queueing."""
         merged_glossary, cache_key = self._prepare_request_context(
-            image_bytes, lang, chapter_id, glossary
+            image_bytes,
+            lang,
+            chapter_id,
+            glossary,
+            include_floating=include_floating,
+            series_id=series_id,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
+            self._record_cached_context(chapter_id, cached, series_id=series_id)
             return cached
 
         return await self.queue.enqueue(
@@ -640,6 +737,8 @@ class TranslationPipeline:
                 merged_glossary=merged_glossary,
                 cache_key=cache_key,
                 emit=None,
+                include_floating=include_floating,
+                series_id=series_id,
             ),
             request_id=request_id,
         )
@@ -652,13 +751,21 @@ class TranslationPipeline:
         priority: int = 0,
         glossary: dict[str, str] | None = None,
         request_id: str | None = None,
+        include_floating: bool = True,
+        series_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream translation events (meta -> bubble* -> done | error) for an image."""
         merged_glossary, cache_key = self._prepare_request_context(
-            image_bytes, lang, chapter_id, glossary
+            image_bytes,
+            lang,
+            chapter_id,
+            glossary,
+            include_floating=include_floating,
+            series_id=series_id,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
+            self._record_cached_context(chapter_id, cached, series_id=series_id)
             yield _response_to_meta_event(cached)
             for b in cached.bubbles:
                 yield {
@@ -688,6 +795,8 @@ class TranslationPipeline:
                         merged_glossary=merged_glossary,
                         cache_key=cache_key,
                         emit=_emit,
+                        include_floating=include_floating,
+                        series_id=series_id,
                     ),
                     request_id=request_id,
                 )
@@ -726,6 +835,7 @@ class TranslationPipeline:
         merged_glossary: dict[str, str],
         primary_key: str,
         response: TranslateResponse,
+        include_floating: bool = True,
     ) -> None:
         bad_bubbles = [b.id for b in response.bubbles if contains_non_english_cjk(b.translated)]
         if bad_bubbles:
@@ -737,5 +847,13 @@ class TranslationPipeline:
 
         self.cache.put(primary_key, response)
         if requested_lang != resolved_lang:
-            resolved_key = self.cache.make_key(image_bytes, resolved_lang, merged_glossary)
+            if _accepts_kwarg(self.cache.make_key, "include_floating"):
+                resolved_key = self.cache.make_key(
+                    image_bytes,
+                    resolved_lang,
+                    merged_glossary,
+                    include_floating=include_floating,
+                )
+            else:
+                resolved_key = self.cache.make_key(image_bytes, resolved_lang, merged_glossary)
             self.cache.put(resolved_key, response)

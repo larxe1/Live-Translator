@@ -27,14 +27,20 @@ _MIN_BOX_SIDE = 20
 def filter_dialogue_regions(
     image_rgb: np.ndarray,
     detections: list[RawDetection],
+    *,
+    include_floating: bool = True,
 ) -> list[RawDetection]:
-    """Filter raw comic detections to dialogue bubbles and clean narration boxes.
+    """Filter raw comic detections to dialogue bubbles, narration boxes, and optional floating text/SFX.
 
     - Drops tiny noise detections (width < 20 or height < 20).
-    - Keeps ``bubble`` and ``text_bubble`` detections, merging inner ``text_bubble``
-      into its enclosing ``bubble`` so each speech bubble yields a single clean region.
-    - Strictly drops ``text_free`` (floating artwork SFX) unless
-      ``is_clean_narration_box`` confirms a clean enclosed narration box.
+    - Keeps ``bubble`` and ``text_bubble`` detections (tagged ``region_type="bubble"``), merging
+      inner ``text_bubble`` into its enclosing ``bubble`` so each speech bubble yields one region.
+    - Deduplicates ``text_free`` against already-kept bubbles (``iou >= 0.30`` or
+      ``containment >= 0.55``) and against other kept ``text_free`` regions (``iou >= 0.45`` or
+      ``containment >= 0.80``).
+    - Tags clean uniform ``text_free`` regions as ``region_type="narration"``, and when
+      ``include_floating=True``, keeps remaining non-overlapping ``text_free`` regions tagged
+      ``region_type="floating"`` (borderless dialogue / onomatopoeia SFX).
     """
     valid: list[RawDetection] = []
     for det in detections:
@@ -58,7 +64,16 @@ def filter_dialogue_regions(
             free_texts.append(det)
 
     # Deduplicate overlapping outer bubbles first (keeping highest score)
-    kept_bubbles = merge_slice_detections(bubbles, iou_threshold=0.50, containment_threshold=0.85)
+    kept_bubbles = [
+        RawDetection(
+            box=b.box,
+            label=b.label,
+            score=b.score,
+            ocr_box=b.ocr_box,
+            region_type="bubble",
+        )
+        for b in merge_slice_detections(bubbles, iou_threshold=0.50, containment_threshold=0.85)
+    ]
     kept: list[RawDetection] = list(kept_bubbles)
 
     # Associate inner text_bubble regions with enclosing bubbles; keep standalone ones
@@ -96,6 +111,7 @@ def filter_dialogue_regions(
                 label=existing.label,
                 score=max(existing.score, tb.score),
                 ocr_box=merged_ocr_box,
+                region_type="bubble",
             )
         else:
             # Standalone text_bubble (e.g., borderless speech bubble)
@@ -104,18 +120,52 @@ def filter_dialogue_regions(
                 for k in kept
             )
             if not duplicate:
-                kept.append(tb)
+                kept.append(
+                    RawDetection(
+                        box=tb.box,
+                        label=tb.label,
+                        score=tb.score,
+                        ocr_box=tb.ocr_box,
+                        region_type="bubble",
+                    )
+                )
 
-    # Strictly drop text_free SFX unless it is a clean uniform narration box
+    kept_bubble_regions = list(kept)
+    kept_free: list[RawDetection] = []
     for tf in sorted(free_texts, key=lambda d: d.score, reverse=True):
-        overlaps_existing = any(
+        overlaps_bubble = any(
             compute_iou(tf.box, k.box) >= 0.30 or compute_containment(tf.box, k.box) >= 0.55
-            for k in kept
+            for k in kept_bubble_regions
         )
-        if overlaps_existing:
+        if overlaps_bubble:
             continue
+        overlaps_free = any(
+            compute_iou(tf.box, f.box) >= 0.45 or compute_containment(tf.box, f.box) >= 0.80
+            for f in kept_free
+        )
+        if overlaps_free:
+            continue
+
         if is_clean_narration_box(image_rgb, tf.box):
-            kept.append(tf)
+            tagged = RawDetection(
+                box=tf.box,
+                label=tf.label,
+                score=tf.score,
+                ocr_box=tf.ocr_box,
+                region_type="narration",
+            )
+            kept_free.append(tagged)
+            kept.append(tagged)
+        elif include_floating:
+            tagged = RawDetection(
+                box=tf.box,
+                label=tf.label,
+                score=tf.score,
+                ocr_box=tf.ocr_box,
+                region_type="floating",
+            )
+            kept_free.append(tagged)
+            kept.append(tagged)
 
     return kept
 
@@ -303,8 +353,13 @@ class BubbleDetector:
             self._use_fp16 = False
             return _run_and_postprocess()
 
-    def detect(self, image: Image.Image) -> list[RawDetection]:
-        """Detect dialogue bubbles on an image (auto-slicing tall strips and dropping SFX)."""
+    def detect(
+        self,
+        image: Image.Image,
+        *,
+        include_floating: bool = True,
+    ) -> list[RawDetection]:
+        """Detect dialogue bubbles on an image (auto-slicing tall strips and filtering regions)."""
         if self._model is None or self._processor is None:
             self.load()
 
@@ -345,4 +400,4 @@ class BubbleDetector:
 
         merged = merge_slice_detections(all_raw)
         img_rgb = np.asarray(rgb_image)
-        return filter_dialogue_regions(img_rgb, merged)
+        return filter_dialogue_regions(img_rgb, merged, include_floating=include_floating)

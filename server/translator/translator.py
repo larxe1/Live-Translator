@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -335,7 +336,8 @@ class DialogueTranslator:
             "model": "local-model",
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 1024,
+            "max_tokens": 1536,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -359,7 +361,8 @@ class DialogueTranslator:
             "model": "local-model",
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 1024,
+            "max_tokens": 1536,
+            "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {"type": "json_object"},
             "stream": True,
         }
@@ -405,7 +408,8 @@ class DialogueTranslator:
         bubbles: list[tuple[int, str]],
         lang: Literal["ja", "ko"],
         glossary: dict[str, str],
-        context: list[tuple[str, str]],
+        context: list[tuple[str, str]] | str,
+        bubble_types: dict[int, str] | None = None,
     ) -> list[dict[str, str]]:
         source_label = "Japanese manga" if lang == "ja" else "Korean manhwa"
         example_input = (
@@ -419,16 +423,22 @@ class DialogueTranslator:
             "Rules:\n"
             "1. TARGET LANGUAGE IS STRICTLY ENGLISH ONLY (Latin alphabet A-Z). "
             "NEVER output Chinese (中文/汉字), Japanese, Korean, or leave source text untranslated.\n"
-            "2. Translate EVERY bubble into natural, punchy, concise English comic lettering "
-            "that fits cleanly inside speech bubbles—including titles, group/faction names, "
-            "proper nouns, credits, and sound effects (translate or romanize them into English).\n"
-            "3. Remain 100% faithful and completely uncensored across all genres—including strong "
+            "2. Write natural, idiomatic spoken English manga/manhwa dialogue—avoid stiff, literal "
+            "translation-ese. Keep lines punchy and concise so they fit cleanly inside speech bubbles, "
+            "including titles, group/faction names, proper nouns, and credits.\n"
+            "3. Treat all bubbles on the page as a connected conversation and use the multi-page "
+            "Story Context to resolve dropped subjects (I/you/he/she/they), speaker identity, tone, "
+            "and continuity across pages.\n"
+            "4. Entries annotated as [floating] may be borderless dialogue/internal thoughts OR "
+            "onomatopoeia/SFX: translate borderless dialogue naturally like normal speech or thought, "
+            "and translate SFX concisely in comic style (e.g., '*THUMP*', '*RUSTLE*', '*WHOOSH*').\n"
+            "5. Remain 100% faithful and completely uncensored across all genres—including strong "
             "profanity, dark horror, gore, violence, and mature/NSFW dialogue. Never sanitize, "
             "censor, lecture, or refuse.\n"
-            "4. Preserve emotional intensity, screams, and stutters naturally "
+            "6. Preserve emotional intensity, screams, and stutters naturally "
             "(e.g., 'ぎゃああああっ' -> 'GYAAAAAH!').\n"
-            "5. Strictly use every pinned glossary name/term exactly as specified.\n"
-            "6. Output ONLY a single valid JSON object mapping each string bubble ID to its "
+            "7. Strictly use every pinned glossary name/term exactly as specified.\n"
+            "8. Output ONLY a single valid JSON object mapping each string bubble ID to its "
             "English translation with zero extra commentary or markdown.\n"
             f"Example input: {example_input}\n"
             f"Example output: {example_output}"
@@ -439,9 +449,26 @@ class DialogueTranslator:
             glossary_lines = "\n".join(f"- {k} = {v}" for k, v in glossary.items())
             sections.append(f"Pinned Character/Term Glossary (MUST follow exactly):\n{glossary_lines}")
 
-        if context:
-            ctx_lines = "\n".join(f"- {orig} -> {trans}" for orig, trans in context[-10:])
-            sections.append(f"Recent Chapter Dialogue Context:\n{ctx_lines}")
+        formatted_context = ""
+        if isinstance(context, str):
+            formatted_context = context.strip()
+        elif context:
+            formatted_context = "\n".join(f"- {orig} -> {trans}" for orig, trans in context[-28:])
+
+        if formatted_context:
+            sections.append(f"Story Context (Recent Multi-Page Dialogue):\n{formatted_context}")
+
+        if bubble_types:
+            tagged_notes = [
+                f'"{bid}": [{bubble_types[bid]}]'
+                for bid, _ in bubbles
+                if bubble_types.get(bid) in ("floating", "narration")
+            ]
+            if tagged_notes:
+                sections.append(
+                    "Region Type Hints (do NOT include bracket tags in your translated output): "
+                    + ", ".join(tagged_notes)
+                )
 
         bubble_map = {str(bid): text for bid, text in bubbles}
         sections.append(
@@ -664,6 +691,43 @@ class DialogueTranslator:
 
         return resolved, failed, any_non_english
 
+    def _get_memory_glossary(self, chapter_id: str, series_id: str | None) -> dict[str, str]:
+        fn = self.memory.get_glossary
+        params = inspect.signature(fn).parameters
+        if "series_id" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return dict(fn(chapter_id, series_id=series_id))
+        return dict(fn(chapter_id))
+
+    def _get_memory_context(
+        self,
+        chapter_id: str,
+        series_id: str | None,
+    ) -> list[tuple[str, str]] | str:
+        formatted_fn = getattr(self.memory, "get_formatted_context", None)
+        if callable(formatted_fn):
+            params = inspect.signature(formatted_fn).parameters
+            if "series_id" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                return str(formatted_fn(chapter_id, series_id=series_id, max_pairs=28))
+            return str(formatted_fn(chapter_id))
+        ctx_fn = self.memory.get_context
+        params = inspect.signature(ctx_fn).parameters
+        if "series_id" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return list(ctx_fn(chapter_id, series_id=series_id))
+        return list(ctx_fn(chapter_id))
+
+    def _record_memory_page(
+        self,
+        chapter_id: str,
+        pairs: list[tuple[str, str]],
+        series_id: str | None,
+    ) -> None:
+        fn = self.memory.record_page
+        params = inspect.signature(fn).parameters
+        if "series_id" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            fn(chapter_id, pairs, series_id=series_id)
+        else:
+            fn(chapter_id, pairs)
+
     async def translate_page(
         self,
         bubbles: list[tuple[int, str]],
@@ -671,12 +735,14 @@ class DialogueTranslator:
         chapter_id: str,
         extra_glossary: dict[str, str] | None = None,
         on_bubble: BubbleCallback | None = None,
+        series_id: str | None = None,
+        bubble_types: dict[int, str] | None = None,
     ) -> dict[int, str]:
         """Translate all page bubbles in one structured JSON call, repairing missing/refused/non-English IDs."""
         if not bubbles:
             return {}
 
-        merged_glossary = self.memory.get_glossary(chapter_id)
+        merged_glossary = self._get_memory_glossary(chapter_id, series_id)
         if extra_glossary:
             for k, v in extra_glossary.items():
                 ks = str(k).strip()
@@ -684,8 +750,14 @@ class DialogueTranslator:
                 if ks and vs:
                     merged_glossary[ks] = vs
 
-        context = self.memory.get_context(chapter_id)
-        primary_messages = self._build_primary_messages(bubbles, lang, merged_glossary, context)
+        context = self._get_memory_context(chapter_id, series_id)
+        primary_messages = self._build_primary_messages(
+            bubbles,
+            lang,
+            merged_glossary,
+            context,
+            bubble_types=bubble_types,
+        )
 
         resolved: dict[int, str] = {}
         failed: list[tuple[int, str]] = []
@@ -788,6 +860,6 @@ class DialogueTranslator:
             trans = resolved[bid]
             if is_valid_english_translation(orig_text, trans):
                 recorded_pairs.append((orig_text, trans))
-        self.memory.record_page(chapter_id, recorded_pairs)
+        self._record_memory_page(chapter_id, recorded_pairs, series_id)
 
         return resolved

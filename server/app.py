@@ -26,6 +26,8 @@ from server.cache import TranslationCache
 from server.config import AppConfig, enforce_d_drive_env, load_config
 from server.pipeline import PayloadTooLargeError, TranslationPipeline
 from server.schemas import (
+    GlossaryLookupRequest,
+    GlossaryLookupResponse,
     GlossaryUpdateRequest,
     HealthResponse,
     MemoryClearRequest,
@@ -36,6 +38,11 @@ from server.schemas import (
     UpdateStatusResponse,
 )
 from server.translator.memory import ChapterMemoryStore
+from server.translator.wiki_glossary import (
+    GlossaryLookupError,
+    InvalidLookupQueryError,
+    lookup_character_glossary,
+)
 from server.updater import UpdateManager
 
 if TYPE_CHECKING:
@@ -99,10 +106,25 @@ def _decode_base64_image(raw_b64: str, max_image_bytes: int) -> bytes:
     return decoded
 
 
+def _parse_bool_form(raw: Any, default: bool = True) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if not s:
+        return default
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    raise HTTPException(status_code=422, detail=f"Invalid boolean value: {raw!r}")
+
+
 async def _parse_translate_request(
     request: Request,
     max_image_bytes: int,
-) -> tuple[bytes, Literal["auto", "ja", "ko"], str, int, dict[str, str], str | None]:
+) -> tuple[bytes, Literal["auto", "ja", "ko"], str, int, dict[str, str], str | None, bool, str | None]:
     """Parse multipart or JSON translation request and enforce payload limits."""
     content_length_hdr = request.headers.get("content-length")
     if content_length_hdr:
@@ -122,6 +144,8 @@ async def _parse_translate_request(
     priority = 0
     glossary: dict[str, str] = {}
     request_id: str | None = None
+    include_floating = True
+    series_id: str | None = None
     image_bytes: bytes = b""
 
     if "multipart/form-data" in content_type:
@@ -146,6 +170,9 @@ async def _parse_translate_request(
             raise HTTPException(status_code=422, detail="priority must be an integer") from exc
         req_id_raw = form.get("request_id")
         request_id = str(req_id_raw) if req_id_raw else None
+        include_floating = _parse_bool_form(form.get("include_floating"), default=True)
+        series_raw = form.get("series_id")
+        series_id = str(series_raw).strip() or None if series_raw is not None else None
         glossary_raw = form.get("glossary")
         if glossary_raw:
             try:
@@ -174,11 +201,13 @@ async def _parse_translate_request(
         priority = req.priority
         glossary = req.glossary
         request_id = req.request_id
+        include_floating = req.include_floating
+        series_id = req.series_id.strip() or None if req.series_id is not None else None
 
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image payload")
 
-    return image_bytes, lang, chapter_id, priority, glossary, request_id
+    return image_bytes, lang, chapter_id, priority, glossary, request_id, include_floating, series_id
 
 
 def _detect_torch_device() -> str:
@@ -499,7 +528,16 @@ def create_app(
                 detail=f"Models are not ready yet ({app.state.loading_stage})",
             )
 
-        image_bytes, lang, chapter_id, priority, glossary, request_id = await _parse_translate_request(
+        (
+            image_bytes,
+            lang,
+            chapter_id,
+            priority,
+            glossary,
+            request_id,
+            include_floating,
+            series_id,
+        ) = await _parse_translate_request(
             request, max_image_bytes=max_image_bytes
         )
         app.state.last_activity = time.monotonic()
@@ -512,6 +550,8 @@ def create_app(
                 priority=priority,
                 glossary=glossary,
                 request_id=request_id,
+                include_floating=include_floating,
+                series_id=series_id,
             )
         except PayloadTooLargeError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
@@ -527,7 +567,16 @@ def create_app(
                 detail=f"Models are not ready yet ({app.state.loading_stage})",
             )
 
-        image_bytes, lang, chapter_id, priority, glossary, request_id = await _parse_translate_request(
+        (
+            image_bytes,
+            lang,
+            chapter_id,
+            priority,
+            glossary,
+            request_id,
+            include_floating,
+            series_id,
+        ) = await _parse_translate_request(
             request, max_image_bytes=max_image_bytes
         )
         if len(image_bytes) > active_pipeline.max_image_bytes:
@@ -548,6 +597,8 @@ def create_app(
                 priority=priority,
                 glossary=glossary,
                 request_id=request_id,
+                include_floating=include_floating,
+                series_id=series_id,
             )
             try:
                 async for event in stream_iter:
@@ -580,25 +631,46 @@ def create_app(
         return {"status": "cancelled", "request_id": req.request_id}
 
     @app.get("/glossary")
-    async def get_glossary(chapter_id: str = Query(default="default")) -> dict[str, Any]:
+    async def get_glossary(
+        chapter_id: str = Query(default="default"),
+        series_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
         return {
             "chapter_id": chapter_id,
-            "entries": app.state.memory.get_glossary(chapter_id),
+            "series_id": series_id,
+            "entries": app.state.memory.get_glossary(chapter_id, series_id=series_id),
         }
 
     @app.post("/glossary")
     async def update_glossary(req: GlossaryUpdateRequest) -> dict[str, Any]:
-        app.state.memory.set_glossary(req.chapter_id, req.entries)
+        app.state.memory.set_glossary(req.chapter_id, req.entries, series_id=req.series_id)
         return {
             "status": "ok",
             "chapter_id": req.chapter_id,
-            "entries": app.state.memory.get_glossary(req.chapter_id),
+            "series_id": req.series_id,
+            "entries": app.state.memory.get_glossary(req.chapter_id, series_id=req.series_id),
         }
 
+    @app.post("/glossary/lookup", response_model=GlossaryLookupResponse)
+    async def lookup_glossary(req: GlossaryLookupRequest) -> GlossaryLookupResponse:
+        query = req.query.strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="Lookup query must not be empty")
+        try:
+            result = await lookup_character_glossary(query=query, source=req.source)
+        except (InvalidLookupQueryError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except GlossaryLookupError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Unexpected glossary lookup error")
+            raise HTTPException(status_code=502, detail=f"Glossary lookup failed: {exc}") from exc
+        return GlossaryLookupResponse.model_validate(result)
+
     @app.post("/memory/clear")
-    async def clear_memory(req: MemoryClearRequest) -> dict[str, str]:
-        app.state.memory.clear(req.chapter_id)
-        return {"status": "ok", "chapter_id": req.chapter_id}
+    async def clear_memory(req: MemoryClearRequest) -> dict[str, Any]:
+        app.state.memory.clear(req.chapter_id, series_id=req.series_id)
+        return {"status": "ok", "chapter_id": req.chapter_id, "series_id": req.series_id}
 
     @app.post("/cache/clear")
     async def clear_cache() -> dict[str, str]:

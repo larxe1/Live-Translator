@@ -218,6 +218,18 @@
       color: #ffffff;
     }
 
+    .glossary-lookup-form {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 5px;
+      margin-bottom: 6px;
+    }
+
+    .glossary-lookup-form .btn {
+      padding: 6px 8px;
+      white-space: nowrap;
+    }
+
     .glossary-form {
       display: grid;
       grid-template-columns: 1fr 1fr auto;
@@ -444,7 +456,29 @@
   </div>
 
   <div class="card">
+    <div class="site-toggle-row">
+      <div class="site-label">
+        <span class="site-label-main">Translate floating dialogue &amp; SFX</span>
+        <span class="site-host">Borderless text and sound effects</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="floatingToggle" checked />
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="section-title">Character Name Glossary</div>
+    <form class="glossary-lookup-form" id="glossaryLookupForm">
+      <input
+        type="text"
+        id="glossaryLookupInput"
+        placeholder="Title or Wikipedia / Fandom / AniList URL"
+      />
+      <button type="submit" class="btn btn-primary" id="glossaryLookupBtn">Import</button>
+      <button type="button" class="btn" id="glossaryClearBtn" title="Clear glossary for this series">Clear</button>
+    </form>
     <form class="glossary-form" id="glossaryForm">
       <input type="text" id="glossaryOrig" placeholder="Original (e.g. 藍星)" />
       <input type="text" id="glossaryEng" placeholder="English (e.g. Ranshin)" />

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from PIL import Image
 
-from server.schemas import Box
+from server.schemas import Box, RegionType
 
 
 @dataclass
@@ -19,12 +19,13 @@ class ImageSlice:
 
 @dataclass
 class RawDetection:
-    """Raw object detection box with class label, confidence score, and optional tight OCR box."""
+    """Raw object detection box with class label, confidence score, OCR box, and region type."""
 
     box: Box
     label: str
     score: float
     ocr_box: Box | None = None
+    region_type: RegionType = "bubble"
 
 
 def box_area(box: Box) -> int:

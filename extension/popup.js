@@ -8,7 +8,12 @@ const statusVram = document.getElementById("statusVram");
 const versionBadge = document.getElementById("versionBadge");
 const siteHostEl = document.getElementById("siteHost");
 const siteToggle = document.getElementById("siteToggle");
+const floatingToggle = document.getElementById("floatingToggle");
 const langButtons = Array.from(document.querySelectorAll(".lang-btn"));
+const glossaryLookupForm = document.getElementById("glossaryLookupForm");
+const glossaryLookupInput = document.getElementById("glossaryLookupInput");
+const glossaryLookupBtn = document.getElementById("glossaryLookupBtn");
+const glossaryClearBtn = document.getElementById("glossaryClearBtn");
 const glossaryForm = document.getElementById("glossaryForm");
 const glossaryOrigInput = document.getElementById("glossaryOrig");
 const glossaryEngInput = document.getElementById("glossaryEng");
@@ -27,9 +32,11 @@ const feedbackEl = document.getElementById("feedback");
 
 let currentHostname = "";
 let currentChapterId = "default";
+let currentSeriesId = "default";
 let currentServerUrl = DEFAULT_SERVER_URL;
 let currentGlossary = {};
 let lastKnownUpdateStatus = null;
+let feedbackTimer = null;
 
 const HEALTH_POLL_INTERVAL_MS = 1500;
 const HEALTH_POLL_MAX_MS = 180000;
@@ -68,9 +75,110 @@ async function sendBgMessage(message) {
 
 function showFeedback(msg) {
   feedbackEl.textContent = msg;
-  setTimeout(() => {
+  if (feedbackTimer) clearTimeout(feedbackTimer);
+  feedbackTimer = setTimeout(() => {
     if (feedbackEl.textContent === msg) feedbackEl.textContent = "";
-  }, 3000);
+    feedbackTimer = null;
+  }, 4000);
+}
+
+const SERIES_CONTAINER_SEGMENTS = new Set([
+  "manga",
+  "manhwa",
+  "manhua",
+  "comic",
+  "comics",
+  "webtoon",
+  "webtoons",
+  "series",
+  "title",
+  "titles",
+  "read",
+  "reader",
+  "chapter",
+  "chapters",
+  "ch",
+  "episode",
+  "episodes",
+  "ep",
+  "book",
+  "books",
+  "novel",
+  "novels",
+  "en",
+  "ja",
+  "jp",
+  "ko",
+  "kr",
+]);
+const CHAPTER_KEYWORD_SEGMENTS = new Set([
+  "chapter",
+  "chapters",
+  "chap",
+  "ch",
+  "episode",
+  "episodes",
+  "ep",
+  "page",
+  "pages",
+  "pg",
+  "p",
+  "vol",
+  "volume",
+  "part",
+  "issue",
+]);
+
+function deriveSeriesId(hostname, pathname) {
+  const host = String(hostname || "").trim().toLowerCase();
+  const rawPath = String(pathname || "/").split("?")[0].split("#")[0].trim();
+  const normalizedPath = rawPath ? (rawPath.startsWith("/") ? rawPath : `/${rawPath}`) : "/";
+  const fallback = host ? `${host}${normalizedPath}` : normalizedPath || "default";
+
+  const parts = normalizedPath.split("/").filter(Boolean);
+  if (parts.length === 0) return fallback;
+
+  let end = parts.length;
+  while (end > 0) {
+    const seg = parts[end - 1].toLowerCase();
+    if (/^(?:viewer|view|read|index\.html?)$/.test(seg)) {
+      end -= 1;
+      continue;
+    }
+    if (
+      /^(?:chapter|chapters|chap|ch|episode|episodes|ep|page|pages|pg|vol|volume|part|issue)[-_.\s]*\d+(?:[-_.][a-z0-9]+)*$/.test(
+        seg
+      ) ||
+      /^(?:c|e|p)[-_.]?\d+(?:[-_.]\d+)*$/.test(seg) ||
+      /^(?:v|s)\d+[-_.]?(?:ch|ep|c|e)[-_.]?\d+(?:[-_.][a-z0-9]+)*$/.test(seg)
+    ) {
+      end -= 1;
+      continue;
+    }
+    if (/^\d+(?:[-_.]\d+)*(?:[a-z])?$/.test(seg)) {
+      const prev = end >= 2 ? parts[end - 2].toLowerCase() : "";
+      if (CHAPTER_KEYWORD_SEGMENTS.has(prev)) {
+        end -= 2;
+        continue;
+      }
+      if (end >= 3 && !SERIES_CONTAINER_SEGMENTS.has(prev)) {
+        end -= 1;
+        continue;
+      }
+    }
+    break;
+  }
+
+  if (end === 0 || end === parts.length) {
+    return fallback;
+  }
+  const lastKept = parts[end - 1].toLowerCase();
+  if (SERIES_CONTAINER_SEGMENTS.has(lastKept)) {
+    return fallback;
+  }
+
+  const strippedPath = `/${parts.slice(0, end).join("/")}`;
+  return host ? `${host}${strippedPath}` : strippedPath;
 }
 
 function renderVersionBadge(buildId = "", version = getLocalVersion()) {
@@ -331,7 +439,13 @@ function renderGlossary() {
 
 async function syncGlossary() {
   try {
-    await chrome.storage.local.set({ glossary: currentGlossary });
+    const stored = (await chrome.storage.local.get(["glossariesBySeries"])) || {};
+    const nextBySeries = { ...(stored.glossariesBySeries || {}) };
+    nextBySeries[currentSeriesId] = { ...currentGlossary };
+    await chrome.storage.local.set({
+      glossariesBySeries: nextBySeries,
+      glossary: { ...currentGlossary },
+    });
   } catch (_err) {
     // Ignore storage write failures.
   }
@@ -339,6 +453,7 @@ async function syncGlossary() {
   await sendBgMessage({
     type: "SET_GLOSSARY",
     chapterId: currentChapterId,
+    seriesId: currentSeriesId,
     entries: currentGlossary,
   });
 }
@@ -353,6 +468,7 @@ async function initPopup() {
       if (u.protocol === "http:" || u.protocol === "https:") {
         currentHostname = u.hostname;
         currentChapterId = `${u.hostname}${u.pathname}`;
+        currentSeriesId = deriveSeriesId(u.hostname, u.pathname);
       }
     }
   } catch (_err) {
@@ -365,7 +481,9 @@ async function initPopup() {
       (await chrome.storage.local.get([
         "enabledDomains",
         "langMode",
+        "includeFloating",
         "glossary",
+        "glossariesBySeries",
         "serverUrl",
         "autoUpdateEnabled",
       ])) || {};
@@ -384,8 +502,19 @@ async function initPopup() {
     siteToggle.disabled = true;
   }
 
+  if (floatingToggle) {
+    floatingToggle.checked = stored.includeFloating !== false;
+  }
+
   renderLangButtons(stored.langMode || "auto");
-  currentGlossary = { ...(stored.glossary || {}) };
+  const bySeries = stored.glossariesBySeries;
+  if (bySeries && Object.prototype.hasOwnProperty.call(bySeries, currentSeriesId)) {
+    currentGlossary = { ...(bySeries[currentSeriesId] || {}) };
+  } else if (!bySeries) {
+    currentGlossary = { ...(stored.glossary || {}) };
+  } else {
+    currentGlossary = {};
+  }
   renderGlossary();
 
   currentServerUrl = stored.serverUrl || DEFAULT_SERVER_URL;
@@ -433,6 +562,101 @@ for (const btn of langButtons) {
   });
 }
 
+if (floatingToggle) {
+  floatingToggle.addEventListener("change", async () => {
+    const includeFloating = floatingToggle.checked;
+    try {
+      await chrome.storage.local.set({ includeFloating });
+    } catch (_err) {
+      // Ignore storage write failures.
+    }
+    showFeedback(
+      includeFloating ? "Floating dialogue & SFX enabled" : "Floating dialogue & SFX hidden"
+    );
+  });
+}
+
+function formatLookupSourceName(source) {
+  const map = {
+    anilist: "AniList",
+    wikipedia: "Wikipedia",
+    fandom: "Fandom",
+  };
+  const key = String(source || "").trim().toLowerCase();
+  return map[key] || source || "Wiki";
+}
+
+if (glossaryLookupForm) {
+  glossaryLookupForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const query = (glossaryLookupInput?.value || "").trim();
+    if (!query) {
+      showFeedback("Enter a title or Wikipedia / Fandom / AniList URL");
+      return;
+    }
+
+    if (glossaryLookupBtn) {
+      glossaryLookupBtn.disabled = true;
+      glossaryLookupBtn.textContent = "Looking up...";
+    }
+    try {
+      const res = await sendBgMessage({
+        type: "LOOKUP_GLOSSARY",
+        query,
+        source: "auto",
+      });
+      if (!res || !res.ok) {
+        showFeedback(res?.error || "Lookup failed — is the local engine running?");
+        return;
+      }
+
+      const data = res.data || {};
+      const entries =
+        data.entries && typeof data.entries === "object" ? data.entries : {};
+      const pairs = Object.entries(entries);
+      if (pairs.length === 0) {
+        showFeedback("No character names found — try pasting a Wikipedia or Fandom URL");
+        return;
+      }
+
+      let added = 0;
+      for (const [orig, eng] of pairs) {
+        if (!orig || !eng) continue;
+        if (!Object.prototype.hasOwnProperty.call(currentGlossary, orig)) {
+          currentGlossary[orig] = eng;
+          added += 1;
+        }
+      }
+      await syncGlossary();
+
+      const sourceLabel = formatLookupSourceName(data.source);
+      const titleSuffix = data.title ? ` (${data.title})` : "";
+      if (added > 0) {
+        showFeedback(
+          `Imported ${added} name${added === 1 ? "" : "s"} from ${sourceLabel}${titleSuffix}`
+        );
+      } else {
+        showFeedback(
+          `All ${pairs.length} names from ${sourceLabel}${titleSuffix} already pinned`
+        );
+      }
+    } finally {
+      if (glossaryLookupBtn) {
+        glossaryLookupBtn.disabled = false;
+        glossaryLookupBtn.textContent = "Import";
+      }
+    }
+  });
+}
+
+if (glossaryClearBtn) {
+  glossaryClearBtn.addEventListener("click", async () => {
+    currentGlossary = {};
+    await syncGlossary();
+    showFeedback("Glossary cleared");
+  });
+}
+
 glossaryForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const orig = glossaryOrigInput.value.trim();
@@ -446,7 +670,11 @@ glossaryForm.addEventListener("submit", async (e) => {
 });
 
 clearMemoryBtn.addEventListener("click", async () => {
-  const res = await sendBgMessage({ type: "CLEAR_MEMORY", chapterId: currentChapterId });
+  const res = await sendBgMessage({
+    type: "CLEAR_MEMORY",
+    chapterId: currentChapterId,
+    seriesId: currentSeriesId,
+  });
   showFeedback(res?.ok ? "Chapter memory cleared" : "Server offline");
 });
 

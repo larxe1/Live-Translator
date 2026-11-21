@@ -622,6 +622,22 @@ async function resolveTranslateImageBase64(message, referer, signal, fetchImpl, 
   return imageBase64;
 }
 
+function buildTranslatePayload(msg, imageBase64, requestId) {
+  const payload = {
+    image_base64: imageBase64,
+    lang: msg?.lang || "auto",
+    chapter_id: msg?.chapterId || "default",
+    include_floating: msg?.includeFloating !== false,
+    priority: msg?.priority ?? 0,
+    glossary: msg?.glossary || {},
+    request_id: requestId,
+  };
+  if (msg?.seriesId) {
+    payload.series_id = msg.seriesId;
+  }
+  return payload;
+}
+
 async function handleMessage(message, sender = {}, deps = {}) {
   const fetchImpl = deps.fetch || fetch;
   const serverBase = await getServerBaseUrl(deps);
@@ -725,8 +741,11 @@ async function handleMessage(message, sender = {}, deps = {}) {
     case "GET_GLOSSARY": {
       try {
         const chapterId = encodeURIComponent(message.chapterId || "default");
+        const seriesParam = message.seriesId
+          ? `&series_id=${encodeURIComponent(message.seriesId)}`
+          : "";
         const data = await fetchJson(
-          `${serverBase}/glossary?chapter_id=${chapterId}`,
+          `${serverBase}/glossary?chapter_id=${chapterId}${seriesParam}`,
           { method: "GET" },
           fetchImpl
         );
@@ -738,14 +757,38 @@ async function handleMessage(message, sender = {}, deps = {}) {
 
     case "SET_GLOSSARY": {
       try {
+        const payload = {
+          chapter_id: message.chapterId || "default",
+          entries: message.entries || {},
+        };
+        if (message.seriesId) {
+          payload.series_id = message.seriesId;
+        }
         const data = await fetchJson(
           `${serverBase}/glossary`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          },
+          fetchImpl
+        );
+        return { ok: true, data };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
+    }
+
+    case "LOOKUP_GLOSSARY": {
+      try {
+        const data = await fetchJson(
+          `${serverBase}/glossary/lookup`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              chapter_id: message.chapterId || "default",
-              entries: message.entries || {},
+              query: message.query || "",
+              source: message.source || "auto",
             }),
           },
           fetchImpl
@@ -758,12 +801,16 @@ async function handleMessage(message, sender = {}, deps = {}) {
 
     case "CLEAR_MEMORY": {
       try {
+        const payload = { chapter_id: message.chapterId || "default" };
+        if (message.seriesId) {
+          payload.series_id = message.seriesId;
+        }
         const data = await fetchJson(
           `${serverBase}/memory/clear`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chapter_id: message.chapterId || "default" }),
+            body: JSON.stringify(payload),
           },
           fetchImpl
         );
@@ -838,14 +885,7 @@ async function handleMessage(message, sender = {}, deps = {}) {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               signal: controller.signal,
-              body: JSON.stringify({
-                image_base64: imageBase64,
-                lang: message.lang || "auto",
-                chapter_id: message.chapterId || "default",
-                priority: message.priority ?? 0,
-                glossary: message.glossary || {},
-                request_id: requestId,
-              }),
+              body: JSON.stringify(buildTranslatePayload(message, imageBase64, requestId)),
             },
             fetchImpl
           );
@@ -971,14 +1011,7 @@ function handlePortConnect(port, deps = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: controller.signal,
-          body: JSON.stringify({
-            image_base64: imageBase64,
-            lang: msg.lang || "auto",
-            chapter_id: msg.chapterId || "default",
-            priority: msg.priority ?? 0,
-            glossary: msg.glossary || {},
-            request_id: requestId,
-          }),
+          body: JSON.stringify(buildTranslatePayload(msg, imageBase64, requestId)),
         });
       } catch (serverErr) {
         if (disconnected || serverErr?.name === "AbortError" || controller.signal.aborted) {
@@ -1017,14 +1050,7 @@ function handlePortConnect(port, deps = {}) {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               signal: controller.signal,
-              body: JSON.stringify({
-                image_base64: imageBase64,
-                lang: msg.lang || "auto",
-                chapter_id: msg.chapterId || "default",
-                priority: msg.priority ?? 0,
-                glossary: msg.glossary || {},
-                request_id: requestId,
-              }),
+              body: JSON.stringify(buildTranslatePayload(msg, imageBase64, requestId)),
             },
             fetchImpl
           );
@@ -1042,6 +1068,7 @@ function handlePortConnect(port, deps = {}) {
               text_color: b.text_color,
               is_dark: b.is_dark,
               original: b.original,
+              region_type: b.region_type || "bubble",
             })),
           });
           for (const b of fallbackData.bubbles || []) {
@@ -1049,6 +1076,7 @@ function handlePortConnect(port, deps = {}) {
               type: "bubble",
               id: b.id,
               translated: b.translated ?? "",
+              region_type: b.region_type || "bubble",
               final: true,
             });
           }

@@ -7,8 +7,9 @@ import os
 from pathlib import Path
 
 from server.cache import TranslationCache
-from server.config import enforce_d_drive_env, load_config
+from server.config import AppConfig, enforce_d_drive_env, load_config
 from server.schemas import Box, BubbleResult, TranslateResponse
+from server.translator.llama_manager import LlamaServerManager
 
 
 def _sample_response(text: str = "Ranshin...?") -> TranslateResponse:
@@ -56,12 +57,24 @@ def test_enforce_d_drive_env_sets_all_caches_under_project_root(tmp_path: Path, 
     assert cfg.host == "127.0.0.1"
     assert cfg.port == 8765
     assert cfg.llama_port == 8766
+    assert cfg.llm_repo_id == "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
+    assert cfg.llm_filename_pattern == "*Qwen3-8B*Q4_K_M*.gguf"
+    assert cfg.llm_gpu_layers == 30
+    assert cfg.llm_ctx_size == 4096
     assert cfg.allow_lan is False
     assert cfg.bind_host == "127.0.0.1"
     assert cfg.max_image_bytes == 25_000_000
     assert cfg.max_image_width == 2400
     assert cfg.max_queue_size == 12
     assert cfg.idle_unload_minutes == 3
+
+
+def test_repo_config_json_has_qwen3_defaults() -> None:
+    cfg = load_config()
+    assert cfg.llm_repo_id == "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
+    assert cfg.llm_filename_pattern == "*Qwen3-8B*Q4_K_M*.gguf"
+    assert cfg.llm_gpu_layers == 30
+    assert cfg.llm_ctx_size == 4096
 
 
 def test_load_config_reads_custom_json_overrides(tmp_path: Path) -> None:
@@ -134,3 +147,51 @@ def test_cache_lru_eviction_and_clear(tmp_path: Path) -> None:
     cache.clear()
     assert cache.get(k1) is None
     assert cache.get(k3) is None
+
+
+def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path) -> None:
+    exe = tmp_path / "bin" / "llama-cpp" / "llama-server.exe"
+    gguf = tmp_path / "models" / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
+
+    cfg_default = AppConfig(project_root=tmp_path)
+    cmd_default = LlamaServerManager(cfg_default).build_command(exe, gguf)
+    assert cmd_default[:2] == [str(exe), "--model"]
+    assert cmd_default[2] == str(gguf)
+    for flag, val in [
+        ("--host", "127.0.0.1"),
+        ("--port", "8766"),
+        ("-ngl", "30"),
+        ("--ctx-size", "4096"),
+        ("--batch-size", "512"),
+        ("--parallel", "1"),
+        ("--reasoning", "off"),
+        ("--flash-attn", "on"),
+    ]:
+        idx = cmd_default.index(flag)
+        assert cmd_default[idx + 1] == val
+
+    cfg_6144 = AppConfig(project_root=tmp_path, llm_ctx_size=6144)
+    cmd_6144 = LlamaServerManager(cfg_6144).build_command(exe, gguf)
+    assert cmd_6144[cmd_6144.index("--ctx-size") + 1] == "6144"
+
+    cfg_8192 = AppConfig(project_root=tmp_path, llm_ctx_size=8192)
+    cmd_8192 = LlamaServerManager(cfg_8192).build_command(exe, gguf)
+    assert cmd_8192[cmd_8192.index("--ctx-size") + 1] == "6144"
+
+
+def test_llama_manager_resolve_model_path_pattern_priority_and_fallback(tmp_path: Path) -> None:
+    models_dir = tmp_path / "models"
+    models_dir.mkdir(parents=True)
+
+    legacy = models_dir / "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    legacy.write_bytes(b"legacy")
+
+    cfg = AppConfig(project_root=tmp_path)
+    mgr = LlamaServerManager(cfg)
+    # Graceful fallback to ggufs[0] when pattern does not match yet
+    assert mgr.resolve_model_path() == legacy
+
+    qwen3 = models_dir / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
+    qwen3.write_bytes(b"qwen3")
+    # Pattern match takes priority over earlier alphabetical legacy file
+    assert mgr.resolve_model_path() == qwen3

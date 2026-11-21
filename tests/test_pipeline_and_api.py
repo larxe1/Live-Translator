@@ -486,3 +486,234 @@ def test_api_translate_stream_returns_503_when_not_ready(tmp_path: Path) -> None
     with TestClient(app) as client:
         resp = client.post("/translate/stream", json={"image_base64": b64_data_url})
         assert resp.status_code == 503
+
+
+class _FloatingAwareDetector:
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    def detect(self, image: Image.Image, *, include_floating: bool = True) -> list[RawDetection]:
+        self.calls.append(include_floating)
+        out = [
+            RawDetection(Box(x1=380, y1=60, x2=560, y2=240), "bubble", 0.95, region_type="bubble"),
+        ]
+        if include_floating:
+            out.append(
+                RawDetection(Box(x1=40, y1=260, x2=200, y2=400), "text_free", 0.85, region_type="floating")
+            )
+        return out
+
+
+@pytest.mark.asyncio
+async def test_pipeline_floating_toggle_region_type_and_cache_hit_memory_recording(tmp_path: Path) -> None:
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=50)
+    detector = _FloatingAwareDetector()
+    ocr = _FakeOcr(texts=["藍星……？", "カサカサ"])
+    seen_bubble_types: list[dict[int, str] | None] = []
+    seen_series_ids: list[str | None] = []
+
+    class _CapturingTranslator:
+        async def translate_page(
+            self,
+            bubbles,
+            lang,
+            chapter_id,
+            extra_glossary=None,
+            series_id=None,
+            bubble_types=None,
+        ):
+            seen_series_ids.append(series_id)
+            seen_bubble_types.append(bubble_types)
+            out = {bid: ("Ranshin...?" if "藍星" in txt else "*RUSTLE*") for bid, txt in bubbles}
+            memory.record_page(
+                chapter_id,
+                [(txt, out[bid]) for bid, txt in bubbles],
+                series_id=series_id,
+            )
+            return out
+
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=_CapturingTranslator(),
+        memory=memory,
+        cache=cache,
+    )
+    await pipeline.start()
+
+    img_bytes = _make_sample_png_bytes()
+    resp_with_floating = await pipeline.translate_image(
+        img_bytes,
+        lang="ja",
+        chapter_id="ch1",
+        include_floating=True,
+        series_id="my-manga",
+    )
+    assert resp_with_floating.cached is False
+    assert [b.region_type for b in resp_with_floating.bubbles] == ["bubble", "floating"]
+    assert detector.calls == [True]
+    assert seen_series_ids == ["my-manga"]
+    assert seen_bubble_types == [{0: "bubble", 1: "floating"}]
+
+    # Clear memory and hit cache on ch2 -> cached bubbles MUST still feed chapter/series context!
+    memory.clear("ch1", series_id="my-manga")
+    assert memory.get_context("ch2", series_id="my-manga") == []
+    resp_cached = await pipeline.translate_image(
+        img_bytes,
+        lang="ja",
+        chapter_id="ch2",
+        include_floating=True,
+        series_id="my-manga",
+    )
+    assert resp_cached.cached is True
+    assert memory.get_context("ch2", series_id="my-manga") == [
+        ("藍星……？", "Ranshin...?"),
+        ("カサカサ", "*RUSTLE*"),
+    ]
+
+    # Toggling include_floating=False uses a distinct cache key and omits floating region
+    resp_no_floating = await pipeline.translate_image(
+        img_bytes,
+        lang="ja",
+        chapter_id="ch2",
+        include_floating=False,
+        series_id="my-manga",
+    )
+    assert resp_no_floating.cached is False
+    assert [b.region_type for b in resp_no_floating.bubbles] == ["bubble"]
+    assert detector.calls == [True, False]
+
+    # Stream cache hit also records context and includes region_type in meta event
+    memory.clear("ch3", series_id="series-stream")
+    stream_events = [
+        ev
+        async for ev in pipeline.translate_image_stream(
+            img_bytes,
+            lang="ja",
+            chapter_id="ch3",
+            include_floating=True,
+            series_id="series-stream",
+        )
+    ]
+    assert stream_events[0]["type"] == "meta"
+    assert [b["region_type"] for b in stream_events[0]["bubbles"]] == ["bubble", "floating"]
+    assert memory.get_context("ch3", series_id="series-stream") == [
+        ("藍星……？", "Ranshin...?"),
+        ("カサカサ", "*RUSTLE*"),
+    ]
+
+    await pipeline.stop()
+
+
+def test_api_region_type_floating_toggle_series_glossary_and_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server.app as app_mod
+
+    cfg = AppConfig(project_root=Path(__file__).resolve().parent.parent, cache_dir=tmp_path / "cache")
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=50)
+    detector = _FloatingAwareDetector()
+    ocr = _FakeOcr(texts=["藍星……？", "カサカサ"])
+
+    async def fake_llm(_messages):
+        return '{"0": "Ranshin...?", "1": "*RUSTLE*"}'
+
+    async def fake_stream(_messages):
+        yield '{"0": "Ranshin...?", "1": "*RUSTLE*"}'
+
+    translator = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_caller=fake_llm,
+        llm_stream_caller=fake_stream,
+    )
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=translator,
+        memory=memory,
+        cache=cache,
+        max_image_bytes=500_000,
+    )
+    app = create_app(cfg=cfg, pipeline=pipeline, cache=cache, memory=memory, auto_load_models=False)
+    img_bytes = _make_sample_png_bytes()
+    b64_data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode("ascii")
+
+    async def fake_lookup(query: str, source: str = "auto"):
+        if query == "bad-host":
+            raise app_mod.InvalidLookupQueryError("Unsupported host")
+        if query == "upstream-down":
+            raise app_mod.GlossaryLookupError("Upstream 503")
+        return {
+            "title": "Blue Box",
+            "source": "anilist" if source == "auto" else source,
+            "url": "https://anilist.co/manga/132182",
+            "entries": {"猪股大喜": "Taiki Inomata", "鹿野千夏": "Chinatsu Kano"},
+            "count": 2,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(app_mod, "lookup_character_glossary", fake_lookup)
+
+    with TestClient(app) as client:
+        # Series-level glossary persists across chapters
+        r_set = client.post(
+            "/glossary",
+            json={"chapter_id": "ch1", "series_id": "series-1", "entries": {"藍星": "Ranshin"}},
+        )
+        assert r_set.status_code == 200
+        assert r_set.json()["series_id"] == "series-1"
+        r_get_ch2 = client.get("/glossary", params={"chapter_id": "ch2", "series_id": "series-1"})
+        assert r_get_ch2.status_code == 200
+        assert r_get_ch2.json()["entries"] == {"藍星": "Ranshin"}
+
+        # /translate/stream includes region_type in live meta and done events
+        with client.stream(
+            "POST",
+            "/translate/stream",
+            json={
+                "image_base64": b64_data_url,
+                "lang": "ja",
+                "chapter_id": "ch1",
+                "series_id": "series-1",
+                "include_floating": True,
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
+        assert [b["region_type"] for b in events[0]["bubbles"]] == ["bubble", "floating"]
+        assert [b["region_type"] for b in events[-1]["response"]["bubbles"]] == ["bubble", "floating"]
+
+        # Multipart /translate with include_floating=false omits floating regions
+        r_multi = client.post(
+            "/translate",
+            files={"file": ("page.png", img_bytes, "image/png")},
+            data={
+                "lang": "ja",
+                "chapter_id": "ch1",
+                "series_id": "series-1",
+                "include_floating": "false",
+            },
+        )
+        assert r_multi.status_code == 200
+        assert [b["region_type"] for b in r_multi.json()["bubbles"]] == ["bubble"]
+
+        # POST /glossary/lookup success + 400 + 502 error handling
+        r_ok = client.post("/glossary/lookup", json={"query": "Blue Box", "source": "auto"})
+        assert r_ok.status_code == 200
+        payload = r_ok.json()
+        assert payload["title"] == "Blue Box"
+        assert payload["count"] == 2
+        assert payload["entries"]["猪股大喜"] == "Taiki Inomata"
+
+        assert client.post("/glossary/lookup", json={"query": "   "}).status_code == 400
+        assert client.post("/glossary/lookup", json={"query": "bad-host"}).status_code == 400
+        assert client.post("/glossary/lookup", json={"query": "upstream-down"}).status_code == 502
+
+        # POST /memory/clear with series_id
+        r_clear = client.post("/memory/clear", json={"chapter_id": "ch1", "series_id": "series-1"})
+        assert r_clear.status_code == 200
+        assert r_clear.json()["series_id"] == "series-1"

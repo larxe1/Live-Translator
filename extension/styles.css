@@ -51,6 +51,11 @@ html.mlt-peek-original .mlt-overlay {
   z-index: 2;
 }
 
+.mlt-bubble:hover,
+.mlt-bubble:focus-within {
+  z-index: 100;
+}
+
 .mlt-bubble-expanded {
   border: 1px solid rgba(0, 0, 0, 0.18);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
@@ -61,6 +66,35 @@ html.mlt-peek-original .mlt-overlay {
 .mlt-bubble-dark.mlt-bubble-expanded {
   border-color: rgba(255, 255, 255, 0.25);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.48);
+}
+
+.mlt-mask-floating {
+  display: none;
+}
+
+.mlt-bubble-floating {
+  background-color: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
+  text-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.92),
+    0 -1px 0 rgba(255, 255, 255, 0.92),
+    1px 0 0 rgba(255, 255, 255, 0.92),
+    -1px 0 0 rgba(255, 255, 255, 0.92);
+}
+
+.mlt-bubble-dark.mlt-bubble-floating {
+  background-color: rgba(15, 17, 23, 0.84);
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.42);
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.9),
+    0 -1px 2px rgba(0, 0, 0, 0.9),
+    1px 0 2px rgba(0, 0, 0, 0.9),
+    -1px 0 2px rgba(0, 0, 0, 0.9);
 }
 
 .mlt-bubble-text {
@@ -89,33 +123,7 @@ html.mlt-peek-original .mlt-overlay {
 }
 
 .mlt-tooltip {
-  display: none;
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  transform: translateX(-50%);
-  min-width: 180px;
-  max-width: 300px;
-  width: max-content;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: rgba(15, 17, 23, 0.96);
-  color: #f8fafc;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.35;
-  text-align: left;
-  white-space: normal;
-  z-index: 2147483645;
-  pointer-events: none;
-}
-
-.mlt-bubble-hit:hover .mlt-tooltip,
-.mlt-bubble-hit:focus-within .mlt-tooltip {
-  display: block;
+  display: none !important;
 }
 
 .mlt-tooltip-en {
@@ -129,6 +137,45 @@ html.mlt-peek-original .mlt-overlay {
   font-size: 12px;
   border-top: 1px solid rgba(255, 255, 255, 0.12);
   padding-top: 4px;
+}
+
+.mlt-tooltip-portal {
+  position: fixed;
+  min-width: 180px;
+  max-width: min(320px, calc(100vw - 16px));
+  width: max-content;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(15, 17, 23, 0.96);
+  color: #f8fafc;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-align: left;
+  white-space: normal;
+  z-index: 2147483647;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.mlt-tooltip-portal-en {
+  color: #ffffff;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.mlt-tooltip-portal-orig {
+  color: #94a3b8;
+  font-size: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  padding-top: 4px;
+}
+
+html.mlt-peek-original .mlt-tooltip-portal {
+  display: none !important;
 }
 
 /* Floating collapsible pill (shown ONLY on enabled domains) */

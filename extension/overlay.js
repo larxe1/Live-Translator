@@ -11,8 +11,32 @@
   const EXPANDED_BORDER_PX = 1;
 
   const overlaysByTarget = new WeakMap();
+  const tooltipPortalsByDoc = new WeakMap();
   let altListenersRegistered = false;
   let sharedMeasureCtx = null;
+
+  function toTranslucentRgba(color, alpha) {
+    const raw = String(color || "").trim();
+    const a = Math.max(0, Math.min(1, Number(alpha ?? 0.86)));
+    const hex6 = raw.match(/^#([0-9a-f]{6})$/i);
+    if (hex6) {
+      const n = parseInt(hex6[1], 16);
+      return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+    }
+    const hex3 = raw.match(/^#([0-9a-f]{3})$/i);
+    if (hex3) {
+      const h = hex3[1];
+      const r = parseInt(h[0] + h[0], 16);
+      const g = parseInt(h[1] + h[1], 16);
+      const b = parseInt(h[2] + h[2], 16);
+      return `rgba(${r}, ${g}, ${b}, ${a})`;
+    }
+    const rgb = raw.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (rgb) {
+      return `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${a})`;
+    }
+    return `rgba(255, 255, 255, ${a})`;
+  }
 
   function getMeasureContext(doc) {
     if (sharedMeasureCtx) return sharedMeasureCtx;
@@ -259,6 +283,151 @@
     };
   }
 
+  function boxesOverlap(a, b, gap = 0) {
+    if (!a || !b) return false;
+    return (
+      a.x1 < b.x2 + gap &&
+      a.x2 > b.x1 - gap &&
+      a.y1 < b.y2 + gap &&
+      a.y2 > b.y1 - gap
+    );
+  }
+
+  /**
+   * Clamps `candidateBox` against `neighborBoxes` so neither expansion nor slightly
+   * overlapping original safeBoxes eat into a neighbor's text area.
+   */
+  function clampBoxAgainstNeighbors(candidateBox, baseBox, neighborBoxes, imgW, imgH, gap = 2) {
+    if (!Array.isArray(neighborBoxes) || neighborBoxes.length === 0) {
+      return {
+        x1: candidateBox.x1,
+        y1: candidateBox.y1,
+        x2: candidateBox.x2,
+        y2: candidateBox.y2,
+      };
+    }
+
+    const minGap = Math.max(2, Number(gap) || 2);
+    const halfGap = minGap / 2;
+    const minBoxDim = 8;
+
+    let x1 = candidateBox.x1;
+    let y1 = candidateBox.y1;
+    let x2 = candidateBox.x2;
+    let y2 = candidateBox.y2;
+
+    const ax1 = baseBox.x1;
+    const ay1 = baseBox.y1;
+    const ax2 = baseBox.x2;
+    const ay2 = baseBox.y2;
+    const acx = (ax1 + ax2) / 2;
+    const acy = (ay1 + ay2) / 2;
+
+    for (const rawNeighbor of neighborBoxes) {
+      if (!rawNeighbor) continue;
+      const rawBase =
+        rawNeighbor.safeBox ||
+        rawNeighbor.safe_box ||
+        (rawNeighbor.box && !("x1" in rawNeighbor) ? rawNeighbor.box : rawNeighbor);
+      const coercedBase = coerceBox(rawBase);
+      if (!coercedBase) continue;
+      const other = normalizeBox(coercedBase, imgW, imgH);
+
+      const bx1 = other.x1;
+      const by1 = other.y1;
+      const bx2 = other.x2;
+      const by2 = other.y2;
+
+      if (
+        Math.abs(bx1 - ax1) < 0.5 &&
+        Math.abs(by1 - ay1) < 0.5 &&
+        Math.abs(bx2 - ax2) < 0.5 &&
+        Math.abs(by2 - ay2) < 0.5
+      ) {
+        continue;
+      }
+
+      const rawCurrent = rawNeighbor.box ? coerceBox(rawNeighbor.box) : null;
+      const otherCurrent = rawCurrent ? normalizeBox(rawCurrent, imgW, imgH) : other;
+
+      const bcx = (bx1 + bx2) / 2;
+      const bcy = (by1 + by2) / 2;
+
+      const overlapX = Math.min(ax2, bx2) - Math.max(ax1, bx1);
+      const overlapY = Math.min(ay2, by2) - Math.max(ay1, by1);
+      const sepX = -overlapX;
+      const sepY = -overlapY;
+
+      const isLeft = acx < bcx || (acx === bcx && (ax1 < bx1 || (ax1 === bx1 && ay1 <= by1)));
+      const isTop = acy < bcy || (acy === bcy && (ay1 < by1 || (ay1 === by1 && ax1 <= bx1)));
+      const midX = isLeft ? (ax2 + bx1) / 2 : (bx2 + ax1) / 2;
+      const midY = isTop ? (ay2 + by1) / 2 : (by2 + ay1) / 2;
+
+      const clampX = () => {
+        if (isLeft) {
+          const limit = Math.max(x1 + minBoxDim, Math.floor(midX - halfGap));
+          if (x2 > limit) x2 = limit;
+        } else {
+          const limit = Math.min(x2 - minBoxDim, Math.ceil(midX + halfGap));
+          if (x1 < limit) x1 = limit;
+        }
+      };
+
+      const clampY = () => {
+        if (isTop) {
+          const limit = Math.max(y1 + minBoxDim, Math.floor(midY - halfGap));
+          if (y2 > limit) y2 = limit;
+        } else {
+          const limit = Math.min(y2 - minBoxDim, Math.ceil(midY + halfGap));
+          if (y1 < limit) y1 = limit;
+        }
+      };
+
+      // Side-by-side: safeBoxes overlap vertically and are horizontally separated (or less overlapping on X).
+      if (overlapY > 0 && (sepX >= 0 || overlapX <= overlapY)) {
+        if (y1 < Math.max(by2, otherCurrent.y2) + minGap && y2 > Math.min(by1, otherCurrent.y1) - minGap) {
+          clampX();
+        }
+        continue;
+      }
+
+      // Stacked: safeBoxes overlap horizontally and are vertically separated (or less overlapping on Y).
+      if (overlapX > 0 && (sepY >= 0 || overlapY < overlapX)) {
+        if (x1 < Math.max(bx2, otherCurrent.x2) + minGap && x2 > Math.min(bx1, otherCurrent.x1) - minGap) {
+          clampY();
+        }
+        continue;
+      }
+
+      // Diagonal separation: clamp if candidate enters neighbor's half-space on both axes
+      // or intersects neighbor's current rendered box.
+      const crossesX = isLeft ? x2 > midX - halfGap : x1 < midX + halfGap;
+      const crossesY = isTop ? y2 > midY - halfGap : y1 < midY + halfGap;
+      const overlapsCurrent = boxesOverlap({ x1, y1, x2, y2 }, otherCurrent, minGap);
+
+      if ((crossesX && crossesY) || overlapsCurrent) {
+        if (crossesX && (sepX >= sepY || !crossesY)) {
+          clampX();
+        } else if (crossesY) {
+          clampY();
+        } else if (overlapsCurrent) {
+          if (isLeft && x2 > otherCurrent.x1 - minGap) {
+            x2 = Math.max(x1 + minBoxDim, Math.floor(otherCurrent.x1 - minGap));
+          } else if (!isLeft && x1 < otherCurrent.x2 + minGap) {
+            x1 = Math.min(x2 - minBoxDim, Math.ceil(otherCurrent.x2 + minGap));
+          }
+        }
+      }
+    }
+
+    return {
+      x1: Math.max(0, Math.min(imgW - minBoxDim, x1)),
+      y1: Math.max(0, Math.min(imgH - minBoxDim, y1)),
+      x2: Math.min(imgW, Math.max(x1 + minBoxDim, x2)),
+      y2: Math.min(imgH, Math.max(y1 + minBoxDim, y2)),
+    };
+  }
+
   /**
    * Computes optimal font size and box bounds inside `safeBox` (and optional `bbox`),
    * expanding horizontally into `bbox` or controlled margins (+25% W / +18% H) before
@@ -267,25 +436,39 @@
   function computeFittedBox(text, safeBox, imgSize, measureFnOrOpts, maybeBbox) {
     let measureFn = null;
     let fullBbox = maybeBbox || null;
+    let neighborBoxes = null;
+    let collisionGap = 2;
     if (typeof measureFnOrOpts === "function") {
       measureFn = measureFnOrOpts;
     } else if (measureFnOrOpts && typeof measureFnOrOpts === "object") {
       measureFn = typeof measureFnOrOpts.measureFn === "function" ? measureFnOrOpts.measureFn : null;
       fullBbox = measureFnOrOpts.bbox || fullBbox;
+      if (Array.isArray(measureFnOrOpts.neighborBoxes)) {
+        neighborBoxes = measureFnOrOpts.neighborBoxes;
+      } else if (Array.isArray(measureFnOrOpts.neighbors)) {
+        neighborBoxes = measureFnOrOpts.neighbors;
+      }
+      if (Number.isFinite(Number(measureFnOrOpts.collisionGap))) {
+        collisionGap = Number(measureFnOrOpts.collisionGap);
+      }
     }
 
     const imgW = Math.max(16, Number(imgSize?.w ?? imgSize?.width ?? 1000));
     const imgH = Math.max(16, Number(imgSize?.h ?? imgSize?.height ?? 1000));
     const base = normalizeBox(safeBox, imgW, imgH);
+    const hasNeighbors = Boolean(neighborBoxes && neighborBoxes.length > 0);
+    const clampedBase = hasNeighbors
+      ? clampBoxAgainstNeighbors(base, base, neighborBoxes, imgW, imgH, collisionGap)
+      : base;
     const trimmed = String(text || "").trim();
 
     if (!trimmed) {
-      return { box: base, fontSizePx: 14, expanded: false };
+      return { box: clampedBase, fontSizePx: 14, expanded: false };
     }
 
     const ctx = measureFn ? null : getMeasureContext();
-    const safeW = base.x2 - base.x1;
-    const safeH = base.y2 - base.y1;
+    const safeW = clampedBase.x2 - clampedBase.x1;
+    const safeH = clampedBase.y2 - clampedBase.y1;
 
     const directComfortFont = findBestFontSize(
       trimmed,
@@ -299,7 +482,10 @@
 
     let usableBbox = null;
     if (fullBbox) {
-      usableBbox = computeUsableBbox(base, fullBbox, imgW, imgH);
+      usableBbox = computeUsableBbox(clampedBase, fullBbox, imgW, imgH);
+      if (hasNeighbors) {
+        usableBbox = clampBoxAgainstNeighbors(usableBbox, base, neighborBoxes, imgW, imgH, collisionGap);
+      }
       const usableW = usableBbox.x2 - usableBbox.x1;
       const usableH = usableBbox.y2 - usableBbox.y1;
       if (usableW > safeW + 4 && (directComfortFont === null || directComfortFont < 13)) {
@@ -319,10 +505,10 @@
     }
 
     if (directComfortFont !== null) {
-      return { box: base, fontSizePx: directComfortFont, expanded: false };
+      return { box: clampedBase, fontSizePx: directComfortFont, expanded: false };
     }
 
-    let expandedBox = computeControlledExpandedBox(base, imgW, imgH);
+    let expandedBox = computeControlledExpandedBox(clampedBase, imgW, imgH);
     if (usableBbox) {
       expandedBox = {
         x1: Math.min(expandedBox.x1, usableBbox.x1),
@@ -331,6 +517,15 @@
         y2: Math.max(expandedBox.y2, usableBbox.y2),
       };
     }
+    if (hasNeighbors) {
+      expandedBox = clampBoxAgainstNeighbors(expandedBox, base, neighborBoxes, imgW, imgH, collisionGap);
+    }
+
+    const didExpand =
+      expandedBox.x1 < clampedBase.x1 - 0.5 ||
+      expandedBox.y1 < clampedBase.y1 - 0.5 ||
+      expandedBox.x2 > clampedBase.x2 + 0.5 ||
+      expandedBox.y2 > clampedBase.y2 + 0.5;
 
     const expW = expandedBox.x2 - expandedBox.x1;
     const expH = expandedBox.y2 - expandedBox.y1;
@@ -340,14 +535,14 @@
       expH,
       measureFn,
       ctx,
-      true,
+      didExpand,
       MIN_FONT_PX
     );
 
     return {
       box: expandedBox,
       fontSizePx: expFont !== null ? expFont : MIN_FONT_PX,
-      expanded: true,
+      expanded: didExpand,
     };
   }
 
@@ -355,10 +550,154 @@
     return `${((value / Math.max(1, total)) * 100).toFixed(4)}%`;
   }
 
+  function isDescendantOf(node, ancestor) {
+    let cur = node;
+    while (cur) {
+      if (cur === ancestor) return true;
+      cur = cur.parentNode || cur.parentElement || null;
+    }
+    return false;
+  }
+
+  function getOrCreateTooltipPortal(doc, win) {
+    if (!doc || !doc.body || typeof doc.createElement !== "function") return null;
+    let state = tooltipPortalsByDoc.get(doc);
+    if (state && state.portalEl && state.portalEl.parentNode === doc.body) {
+      return state;
+    }
+
+    const portalEl = doc.createElement("div");
+    portalEl.className = "mlt-tooltip-portal";
+    if (typeof portalEl.setAttribute === "function") {
+      portalEl.setAttribute("role", "tooltip");
+    }
+    portalEl.style.display = "none";
+
+    const enEl = doc.createElement("div");
+    enEl.className = "mlt-tooltip-portal-en";
+    portalEl.appendChild(enEl);
+
+    const origEl = doc.createElement("div");
+    origEl.className = "mlt-tooltip-portal-orig";
+
+    doc.body.appendChild(portalEl);
+
+    state = {
+      portalEl,
+      enEl,
+      origEl,
+      activeHitEl: null,
+      listenersAttached: false,
+    };
+
+    const w = win || doc.defaultView || (typeof window !== "undefined" ? window : null);
+    if (w && typeof w.addEventListener === "function") {
+      const onGlobalHide = () => hideTooltipPortal(doc);
+      w.addEventListener("scroll", onGlobalHide, true);
+      w.addEventListener("blur", onGlobalHide);
+      w.addEventListener("resize", onGlobalHide);
+      state.listenersAttached = true;
+    }
+
+    tooltipPortalsByDoc.set(doc, state);
+    return state;
+  }
+
+  function positionTooltipPortal(state, hitEl, win, doc) {
+    const portalEl = state.portalEl;
+    if (!portalEl || !hitEl || typeof hitEl.getBoundingClientRect !== "function") return;
+
+    const rect = hitEl.getBoundingClientRect();
+    const rectLeft = Number(rect?.left ?? 0);
+    const rectTop = Number(rect?.top ?? 0);
+    const rectWidth = Number(
+      rect?.width ?? (rect?.right !== undefined ? rect.right - rectLeft : 0)
+    );
+    const rectHeight = Number(
+      rect?.height ?? (rect?.bottom !== undefined ? rect.bottom - rectTop : 0)
+    );
+    const rectBottom = Number(rect?.bottom ?? rectTop + rectHeight);
+
+    const vw = Number(win?.innerWidth || doc?.documentElement?.clientWidth || 1024);
+    const vh = Number(win?.innerHeight || doc?.documentElement?.clientHeight || 768);
+
+    const tipRect =
+      typeof portalEl.getBoundingClientRect === "function"
+        ? portalEl.getBoundingClientRect()
+        : null;
+    const tipW = Number(portalEl.offsetWidth || tipRect?.width || 240);
+    const tipH = Number(portalEl.offsetHeight || tipRect?.height || 56);
+
+    const gap = 8;
+    const margin = 8;
+    let top = rectTop - tipH - gap;
+    let placement = "top";
+    if (top < margin && (vh - rectBottom >= rectTop || vh - rectBottom >= tipH + gap + margin)) {
+      top = rectBottom + gap;
+      placement = "bottom";
+    }
+    top = Math.max(margin, Math.min(Math.max(margin, vh - tipH - margin), top));
+
+    const centerX = rectLeft + rectWidth / 2;
+    let left = centerX - tipW / 2;
+    left = Math.max(margin, Math.min(Math.max(margin, vw - tipW - margin), left));
+
+    portalEl.style.left = `${Math.round(left)}px`;
+    portalEl.style.top = `${Math.round(top)}px`;
+    if (portalEl.dataset) {
+      portalEl.dataset.placement = placement;
+    }
+  }
+
+  function showTooltipPortal(doc, win, hitEl, translated, original) {
+    const state = getOrCreateTooltipPortal(doc, win);
+    if (!state) return;
+
+    const enText = String(translated || "").trim();
+    const origText = String(original || "").trim();
+    if (!enText && !origText) {
+      hideTooltipPortal(doc);
+      return;
+    }
+
+    state.activeHitEl = hitEl;
+    state.enEl.textContent = enText;
+    if (origText) {
+      state.origEl.textContent = origText;
+      if (state.origEl.parentNode !== state.portalEl) {
+        state.portalEl.appendChild(state.origEl);
+      }
+    } else if (state.origEl.parentNode === state.portalEl) {
+      state.portalEl.removeChild(state.origEl);
+    }
+
+    state.portalEl.style.display = "block";
+    positionTooltipPortal(state, hitEl, win, doc);
+  }
+
+  function hideTooltipPortal(doc, onlyIfHitEl = null, onlyIfInsideOverlayEl = null) {
+    if (!doc) return;
+    const state = tooltipPortalsByDoc.get(doc);
+    if (!state || !state.portalEl) return;
+    if (onlyIfHitEl && state.activeHitEl !== onlyIfHitEl) return;
+    if (
+      onlyIfInsideOverlayEl &&
+      state.activeHitEl &&
+      !isDescendantOf(state.activeHitEl, onlyIfInsideOverlayEl)
+    ) {
+      return;
+    }
+    state.activeHitEl = null;
+    state.portalEl.style.display = "none";
+  }
+
   function setPeekOriginal(enabled, doc) {
     const d = doc || (typeof document !== "undefined" ? document : null);
     if (d && d.documentElement && d.documentElement.classList) {
       d.documentElement.classList.toggle("mlt-peek-original", Boolean(enabled));
+    }
+    if (enabled && d) {
+      hideTooltipPortal(d);
     }
   }
 
@@ -407,6 +746,9 @@
     if (!entry) return;
     overlaysByTarget.delete(targetEl);
 
+    if (entry.doc) {
+      hideTooltipPortal(entry.doc, null, entry.overlayEl);
+    }
     if (entry.resizeObserver && typeof entry.resizeObserver.disconnect === "function") {
       entry.resizeObserver.disconnect();
     }
@@ -531,26 +873,38 @@
 
   function applyBubbleEntryData(entry, bubble, imgW, imgH, options = {}) {
     const translated = String(bubble?.translated ?? "").trim();
-    const safeBox = coerceBox(bubble.safe_box) || coerceBox(bubble.bbox);
-    if (!translated || !safeBox) return false;
+    const rawSafeBox = coerceBox(bubble.safe_box) || coerceBox(bubble.bbox);
+    if (!translated || !rawSafeBox) return false;
     const fullBbox = coerceBox(bubble.bbox);
+    const safeBox = normalizeBox(rawSafeBox, imgW, imgH);
+    const neighborBoxes = Array.isArray(options.neighborBoxes) ? options.neighborBoxes : null;
+    const maskBox =
+      neighborBoxes && neighborBoxes.length > 0
+        ? clampBoxAgainstNeighbors(safeBox, safeBox, neighborBoxes, imgW, imgH)
+        : safeBox;
 
     const bgColor = bubble.bg_color || (bubble.is_dark ? "#111111" : "#FFFFFF");
     const textColor = bubble.text_color || (bubble.is_dark ? "#FFFFFF" : "#111111");
     const isDark = Boolean(bubble.is_dark);
+    const isFloating = bubble.region_type === "floating";
 
-    entry.maskEl.style.left = pct(safeBox.x1, imgW);
-    entry.maskEl.style.top = pct(safeBox.y1, imgH);
-    entry.maskEl.style.width = pct(Math.max(8, safeBox.x2 - safeBox.x1), imgW);
-    entry.maskEl.style.height = pct(Math.max(8, safeBox.y2 - safeBox.y1), imgH);
-    entry.maskEl.style.backgroundColor = bgColor;
+    entry.maskEl.classList.toggle("mlt-mask-floating", isFloating);
+    entry.maskEl.style.display = isFloating ? "none" : "";
+    entry.maskEl.style.left = pct(maskBox.x1, imgW);
+    entry.maskEl.style.top = pct(maskBox.y1, imgH);
+    entry.maskEl.style.width = pct(Math.max(8, maskBox.x2 - maskBox.x1), imgW);
+    entry.maskEl.style.height = pct(Math.max(8, maskBox.y2 - maskBox.y1), imgH);
+    entry.maskEl.style.backgroundColor = isFloating ? "transparent" : bgColor;
 
     const fit = computeFittedBox(
       translated,
       safeBox,
       { w: imgW, h: imgH },
-      options.measureFn,
-      fullBbox
+      {
+        measureFn: options.measureFn,
+        bbox: fullBbox,
+        neighborBoxes,
+      }
     );
     const boxW = Math.max(8, fit.box.x2 - fit.box.x1);
     const boxH = Math.max(8, fit.box.y2 - fit.box.y1);
@@ -558,12 +912,15 @@
 
     entry.bubbleEl.classList.toggle("mlt-bubble-dark", isDark);
     entry.bubbleEl.classList.toggle("mlt-bubble-expanded", Boolean(fit.expanded));
+    entry.bubbleEl.classList.toggle("mlt-bubble-floating", isFloating);
 
     entry.bubbleEl.style.left = pct(fit.box.x1, imgW);
     entry.bubbleEl.style.top = pct(fit.box.y1, imgH);
     entry.bubbleEl.style.width = pct(boxW, imgW);
     entry.bubbleEl.style.height = pct(boxH, imgH);
-    entry.bubbleEl.style.backgroundColor = bgColor;
+    entry.bubbleEl.style.backgroundColor = isFloating
+      ? toTranslucentRgba(bgColor, isDark ? 0.84 : 0.86)
+      : bgColor;
     entry.bubbleEl.style.color = textColor;
     entry.bubbleEl.style.fontSize = `${fit.fontSizePx}px`;
     entry.bubbleEl.style.padding = `${pad.padY}px ${pad.padX}px`;
@@ -574,6 +931,7 @@
       entry.bubbleEl.dataset.basePadX = String(pad.padX);
       entry.bubbleEl.dataset.basePadY = String(pad.padY);
       entry.bubbleEl.dataset.expanded = fit.expanded ? "true" : "false";
+      entry.bubbleEl.dataset.regionType = String(bubble.region_type || "bubble");
     }
 
     entry.textSpan.textContent = translated;
@@ -590,6 +948,19 @@
       }
     } else if (entry.origEl.parentNode === entry.tooltipEl) {
       entry.tooltipEl.removeChild(entry.origEl);
+    }
+
+    entry.bubble = bubble;
+    entry.safeBox = safeBox;
+    entry.fit = fit;
+    entry.translated = translated;
+    entry.original = original;
+
+    if (entry.doc) {
+      const portalState = tooltipPortalsByDoc.get(entry.doc);
+      if (portalState && portalState.activeHitEl === entry.hitEl) {
+        showTooltipPortal(entry.doc, entry.win, entry.hitEl, translated, original);
+      }
     }
 
     return true;
@@ -628,7 +999,14 @@
     hitEl.appendChild(tooltipEl);
     bubbleEl.appendChild(hitEl);
 
+    const win =
+      options.window ||
+      doc.defaultView ||
+      (typeof window !== "undefined" ? window : null);
+
     const entry = {
+      doc,
+      win,
       maskEl,
       bubbleEl,
       textSpan,
@@ -636,7 +1014,25 @@
       tooltipEl,
       enEl,
       origEl,
+      bubble: null,
+      safeBox: null,
+      fit: null,
+      translated: "",
+      original: "",
     };
+
+    if (typeof hitEl.addEventListener === "function") {
+      const onShow = () => {
+        showTooltipPortal(doc, win, hitEl, entry.translated, entry.original);
+      };
+      const onHide = () => {
+        hideTooltipPortal(doc, hitEl);
+      };
+      hitEl.addEventListener("mouseenter", onShow);
+      hitEl.addEventListener("focusin", onShow);
+      hitEl.addEventListener("mouseleave", onHide);
+      hitEl.addEventListener("focusout", onHide);
+    }
 
     if (!applyBubbleEntryData(entry, bubble, imgW, imgH, options)) {
       return null;
@@ -708,6 +1104,7 @@
 
     const bubbleEls = [];
     const mountedById = new Map();
+    const skippedIds = new Set();
     let anonCounter = 0;
     let destroyed = false;
 
@@ -724,6 +1121,7 @@
       if (destroyed) return;
       destroyed = true;
       mountedById.clear();
+      skippedIds.clear();
       bubbleEls.length = 0;
       clearOverlay(targetEl);
     };
@@ -740,8 +1138,42 @@
       win.addEventListener("resize", sync);
     }
 
-    overlaysByTarget.set(targetEl, { overlayEl, resizeObserver, sync, win });
+    overlaysByTarget.set(targetEl, { overlayEl, resizeObserver, sync, win, doc });
     sync();
+
+    function collectNeighborBoxes(selfIdKey, mountedOnly = false) {
+      const neighbors = [];
+      for (const [idKey, mEntry] of mountedById.entries()) {
+        if (idKey === selfIdKey || !mEntry.safeBox) continue;
+        neighbors.push({
+          safeBox: mEntry.safeBox,
+          box: mEntry.fit ? mEntry.fit.box : mEntry.safeBox,
+        });
+      }
+      if (!mountedOnly) {
+        for (const [idKey, mBubble] of metaBubblesById.entries()) {
+          if (idKey === selfIdKey || mountedById.has(idKey) || skippedIds.has(idKey)) continue;
+          const mb = coerceBox(mBubble.safe_box) || coerceBox(mBubble.bbox);
+          if (mb) neighbors.push(mb);
+        }
+      }
+      return neighbors;
+    }
+
+    function resolveOverlayCollisions(mountedOnly = false, onlyIds = null) {
+      if (mountedById.size <= 1) return;
+      for (const [idKey, mEntry] of mountedById.entries()) {
+        if (onlyIds && !onlyIds.has(idKey)) continue;
+        if (!mEntry.bubble) continue;
+        const neighborBoxes = collectNeighborBoxes(idKey, mountedOnly);
+        applyBubbleEntryData(mEntry, mEntry.bubble, imgW, imgH, {
+          ...options,
+          document: doc,
+          window: win,
+          neighborBoxes,
+        });
+      }
+    }
 
     function removeMountedEntry(idKey) {
       const existing = mountedById.get(idKey);
@@ -749,6 +1181,10 @@
       mountedById.delete(idKey);
       const idx = bubbleEls.indexOf(existing.bubbleEl);
       if (idx !== -1) bubbleEls.splice(idx, 1);
+      const portalState = tooltipPortalsByDoc.get(doc);
+      if (portalState && portalState.activeHitEl === existing.hitEl) {
+        hideTooltipPortal(doc, existing.hitEl);
+      }
       if (existing.maskEl && existing.maskEl.parentNode === overlayEl) {
         overlayEl.removeChild(existing.maskEl);
       }
@@ -767,24 +1203,47 @@
 
       const translated = String(merged.translated ?? "").trim();
       if (!translated) {
+        if (hasId) skippedIds.add(idKey);
         removeMountedEntry(idKey);
         if (!addOpts.skipSync) sync();
         return null;
       }
+      if (hasId) skippedIds.delete(idKey);
+
+      const neighborBoxes = collectNeighborBoxes(idKey, false);
+      const entryOpts = {
+        ...options,
+        document: doc,
+        window: win,
+        neighborBoxes,
+      };
 
       const existing = mountedById.get(idKey);
       if (existing) {
-        const updated = applyBubbleEntryData(existing, merged, imgW, imgH, options);
+        const updated = applyBubbleEntryData(existing, merged, imgW, imgH, entryOpts);
         if (!updated) {
           removeMountedEntry(idKey);
           if (!addOpts.skipSync) sync();
           return null;
         }
-        if (!addOpts.skipSync) sync();
+        if (!addOpts.skipSync) {
+          const colliding = new Set();
+          for (const [otherId, otherEntry] of mountedById.entries()) {
+            if (otherId === idKey) continue;
+            if (
+              boxesOverlap(otherEntry.fit?.box, existing.fit?.box, 2) ||
+              boxesOverlap(otherEntry.fit?.box, existing.safeBox, 2)
+            ) {
+              colliding.add(otherId);
+            }
+          }
+          if (colliding.size > 0) resolveOverlayCollisions(false, colliding);
+          sync();
+        }
         return existing.bubbleEl;
       }
 
-      const entry = buildBubbleElements(doc, merged, normMeta, options);
+      const entry = buildBubbleElements(doc, merged, normMeta, entryOpts);
       if (!entry) return null;
 
       overlayEl.appendChild(entry.maskEl);
@@ -792,7 +1251,21 @@
       bubbleEls.push(entry.bubbleEl);
       mountedById.set(idKey, entry);
 
-      if (!addOpts.skipSync) sync();
+      if (!addOpts.skipSync) {
+        const colliding = new Set();
+        for (const [otherId, otherEntry] of mountedById.entries()) {
+          if (otherId === idKey) continue;
+          if (
+            !metaBase ||
+            boxesOverlap(otherEntry.fit?.box, entry.fit?.box, 2) ||
+            boxesOverlap(otherEntry.fit?.box, entry.safeBox, 2)
+          ) {
+            colliding.add(otherId);
+          }
+        }
+        if (colliding.size > 0) resolveOverlayCollisions(false, colliding);
+        sync();
+      }
       return entry.bubbleEl;
     }
 
@@ -803,6 +1276,7 @@
           addBubble(b, { skipSync: true });
         }
       }
+      resolveOverlayCollisions(true);
       sync();
     }
 
@@ -856,11 +1330,13 @@
     computeInnerDimensions,
     measureWordWidth,
     fitMountedBubbleElement,
+    clampBoxAgainstNeighbors,
     computeFittedBox,
     buildBubbleElements,
     createOverlaySession,
     renderOverlay,
     clearOverlay,
+    hideTooltipPortal,
     setPeekOriginal,
     initAltPeekListeners,
   };

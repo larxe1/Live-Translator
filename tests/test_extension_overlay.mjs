@@ -839,3 +839,292 @@ test("13. fitMountedBubbleElement shrinks font down to 6px when DOM scrollWidth/
   overlay.fitMountedBubbleElement(bubbleEl);
   assert.equal(parseFloat(bubbleEl.style.fontSize), 8.5);
 });
+
+test("14. neighbor-aware collision clamping prevents side-by-side and overlapping boxes from eating neighbor text", () => {
+  const imgSize = { w: 900, h: 1300 };
+  const leftSafe = { x1: 100, y1: 100, x2: 158, y2: 340 }; // 58 x 240
+  const rightSafe = { x1: 166, y1: 100, x2: 224, y2: 340 }; // 58 x 240 (8px gap)
+  const longText = "Wait, why are you running straight toward that monster right now?!";
+
+  // Without neighbors, left bubble would expand rightward past x2=158 into rightSafe.
+  const leftFit = overlay.computeFittedBox(longText, leftSafe, imgSize, {
+    bbox: { x1: 88, y1: 90, x2: 190, y2: 350 },
+    neighborBoxes: [rightSafe],
+  });
+  const rightFit = overlay.computeFittedBox(longText, rightSafe, imgSize, {
+    bbox: { x1: 140, y1: 90, x2: 240, y2: 350 },
+    neighborBoxes: [leftSafe],
+  });
+
+  assert.ok(
+    leftFit.box.x2 <= rightFit.box.x1 - 2,
+    `Expected left.x2 (${leftFit.box.x2}) <= right.x1 - 2 (${rightFit.box.x1 - 2})`
+  );
+
+  // Verify word still fits inside the clamped box down to MIN_FONT_PX.
+  const leftInner = overlay.computeInnerDimensions(
+    leftFit.box.x2 - leftFit.box.x1,
+    leftFit.box.y2 - leftFit.box.y1,
+    leftFit.expanded
+  );
+  assert.ok(
+    overlay.measureWordWidth("monster", leftFit.fontSizePx, null) <= leftInner.innerW,
+    "Text should shrink to fit cleanly inside clamped box"
+  );
+
+  // Also test renderOverlay with two adjacent side-by-side bubbles & slightly overlapping safeBoxes.
+  const doc = createMockDocument();
+  const win = createMockWindow(doc);
+  const img = doc.createElement("img");
+  img.width = 900;
+  img.height = 1300;
+  doc.body.appendChild(img);
+
+  const handle = overlay.renderOverlay(
+    img,
+    {
+      lang: "ja",
+      width: 900,
+      height: 1300,
+      bubbles: [
+        {
+          id: 0,
+          bbox: { x1: 90, y1: 90, x2: 185, y2: 350 },
+          safe_box: { x1: 100, y1: 100, x2: 164, y2: 340 },
+          bg_color: "#FFFFFF",
+          text_color: "#111111",
+          is_dark: false,
+          original: "ちょっと待ってよ！",
+          translated: longText,
+        },
+        {
+          id: 1,
+          bbox: { x1: 145, y1: 90, x2: 235, y2: 350 },
+          safe_box: { x1: 160, y1: 100, x2: 224, y2: 340 }, // 4px overlap in original safe_box
+          bg_color: "#FFFFFF",
+          text_color: "#111111",
+          is_dark: false,
+          original: "危険すぎるだろ！",
+          translated: longText,
+        },
+      ],
+    },
+    { document: doc, window: win }
+  );
+
+  const bubbles = handle.element.querySelectorAll(".mlt-bubble");
+  assert.equal(bubbles.length, 2);
+  const b0Left = (parseFloat(bubbles[0].style.left) / 100) * 900;
+  const b0Width = (parseFloat(bubbles[0].style.width) / 100) * 900;
+  const b1Left = (parseFloat(bubbles[1].style.left) / 100) * 900;
+  assert.ok(
+    b0Left + b0Width <= b1Left + 0.01,
+    `Rendered bubbles overlapped: b0.x2=${(b0Left + b0Width).toFixed(2)} > b1.x1=${b1Left.toFixed(2)}`
+  );
+  handle.destroy();
+});
+
+test("15. body-level hover tooltip portal opens on mouseenter, flips near top edge, and closes cleanly", () => {
+  const doc = createMockDocument();
+  const win = createMockWindow(doc);
+  win.innerWidth = 1024;
+  win.innerHeight = 768;
+
+  const img = doc.createElement("img");
+  img.width = 800;
+  img.height = 1200;
+  doc.body.appendChild(img);
+
+  const handle = overlay.renderOverlay(
+    img,
+    {
+      lang: "ja",
+      width: 800,
+      height: 1200,
+      bubbles: [
+        {
+          id: 0,
+          bbox: { x1: 100, y1: 100, x2: 300, y2: 240 },
+          safe_box: { x1: 110, y1: 110, x2: 290, y2: 230 },
+          bg_color: "#FFFFFF",
+          text_color: "#111111",
+          is_dark: false,
+          original: "どうしたんだ！？",
+          translated: "What happened?!",
+        },
+      ],
+    },
+    { document: doc, window: win }
+  );
+
+  const hitEl = handle.element.querySelector(".mlt-bubble-hit");
+  let mockRect = { left: 300, top: 200, width: 120, height: 80 };
+  hitEl.getBoundingClientRect = () => mockRect;
+
+  hitEl.dispatchEvent({ type: "mouseenter" });
+  const portal = doc.body.querySelector(".mlt-tooltip-portal");
+  assert.ok(portal, "Expected .mlt-tooltip-portal mounted on doc.body");
+  assert.equal(portal.style.display, "block");
+  assert.equal(portal.querySelector(".mlt-tooltip-portal-en").textContent, "What happened?!");
+  assert.equal(portal.querySelector(".mlt-tooltip-portal-orig").textContent, "どうしたんだ！？");
+  assert.equal(portal.dataset.placement, "top");
+  assert.ok(parseFloat(portal.style.top) < mockRect.top, "Portal should sit above bubble");
+
+  // Near top edge (top < 60): portal must flip below the bubble.
+  mockRect = { left: 10, top: 24, width: 100, height: 40 };
+  hitEl.dispatchEvent({ type: "mouseenter" });
+  assert.equal(portal.dataset.placement, "bottom");
+  assert.ok(
+    parseFloat(portal.style.top) >= mockRect.top + mockRect.height,
+    `Portal should flip below bubble when top < 60 (got top=${portal.style.top})`
+  );
+  assert.ok(parseFloat(portal.style.left) >= 8, "Portal left must clamp inside [8, vw - 8]");
+
+  // Hides on mouseleave.
+  hitEl.dispatchEvent({ type: "mouseleave" });
+  assert.equal(portal.style.display, "none");
+
+  // Opens on focusin and hides on Alt peek.
+  hitEl.dispatchEvent({ type: "focusin" });
+  assert.equal(portal.style.display, "block");
+  overlay.setPeekOriginal(true, doc);
+  assert.equal(portal.style.display, "none");
+  overlay.setPeekOriginal(false, doc);
+
+  // Opens again, then hides on window scroll.
+  hitEl.dispatchEvent({ type: "mouseenter" });
+  assert.equal(portal.style.display, "block");
+  win.dispatchEvent({ type: "scroll" });
+  assert.equal(portal.style.display, "none");
+
+  // Opens again, then hides on clearOverlay.
+  hitEl.dispatchEvent({ type: "mouseenter" });
+  assert.equal(portal.style.display, "block");
+  overlay.clearOverlay(img);
+  assert.equal(portal.style.display, "none");
+});
+
+test("16. floating dialogue & SFX render borderless translucent pill without opaque white mask", () => {
+  const doc = createMockDocument();
+  const win = createMockWindow(doc);
+  const img = doc.createElement("img");
+  img.width = 800;
+  img.height = 1200;
+  doc.body.appendChild(img);
+
+  const handle = overlay.renderOverlay(
+    img,
+    {
+      lang: "ja",
+      width: 800,
+      height: 1200,
+      bubbles: [
+        {
+          id: 0,
+          region_type: "floating",
+          bbox: { x1: 80, y1: 120, x2: 260, y2: 200 },
+          safe_box: { x1: 85, y1: 125, x2: 255, y2: 195 },
+          bg_color: "#FFFFFF",
+          text_color: "#111111",
+          is_dark: false,
+          original: "ザワ…",
+          translated: "*RUSTLE*",
+        },
+        {
+          id: 1,
+          region_type: "floating",
+          bbox: { x1: 380, y1: 220, x2: 560, y2: 300 },
+          safe_box: { x1: 385, y1: 225, x2: 555, y2: 295 },
+          bg_color: "#111111",
+          text_color: "#FFFFFF",
+          is_dark: true,
+          original: "ドクン",
+          translated: "*THUMP*",
+        },
+      ],
+    },
+    { document: doc, window: win }
+  );
+
+  const masks = handle.element.querySelectorAll(".mlt-mask");
+  const bubbles = handle.element.querySelectorAll(".mlt-bubble");
+  assert.equal(masks.length, 2);
+  assert.equal(bubbles.length, 2);
+
+  for (const m of masks) {
+    assert.ok(m.classList.contains("mlt-mask-floating"));
+    assert.equal(m.style.display, "none");
+    assert.equal(m.style.backgroundColor, "transparent");
+  }
+
+  assert.ok(bubbles[0].classList.contains("mlt-bubble-floating"));
+  assert.match(bubbles[0].style.backgroundColor, /^rgba\(255, 255, 255, 0\.86\)$/);
+
+  assert.ok(bubbles[1].classList.contains("mlt-bubble-floating"));
+  assert.ok(bubbles[1].classList.contains("mlt-bubble-dark"));
+  assert.match(bubbles[1].style.backgroundColor, /^rgba\(17, 17, 17, 0\.84\)$/);
+
+  const cssPath = path.resolve(__dirname, "../extension/styles.css");
+  const css = fs.readFileSync(cssPath, "utf8");
+  assert.match(css, /\.mlt-mask-floating\s*\{[^}]*display\s*:\s*none/i);
+  assert.match(css, /\.mlt-bubble-floating\s*\{[^}]*backdrop-filter\s*:/i);
+  assert.match(css, /\.mlt-tooltip-portal\s*\{[^}]*position\s*:\s*fixed/i);
+  assert.match(css, /\.mlt-tooltip-portal\s*\{[^}]*z-index\s*:\s*2147483647/i);
+  assert.match(css, /\.mlt-bubble:hover,\s*\.mlt-bubble:focus-within\s*\{[^}]*z-index\s*:\s*100/i);
+
+  handle.destroy();
+});
+
+test("17. streaming addBubble without upfront meta re-clamps previously expanded neighbors and handles null body", () => {
+  const doc = createMockDocument();
+  const win = createMockWindow(doc);
+  const img = doc.createElement("img");
+  img.width = 900;
+  img.height = 1300;
+  doc.body.appendChild(img);
+
+  const session = overlay.createOverlaySession(
+    img,
+    { lang: "ja", width: 900, height: 1300 },
+    { document: doc, window: win }
+  );
+
+  // Bubble 0 streams first with no upfront meta and expands freely.
+  const b0 = session.addBubble({
+    id: 0,
+    bbox: [90, 90, 190, 350],
+    safe_box: [100, 100, 160, 340],
+    translated: "Wait, why are you running straight toward that monster?!",
+  });
+  const initialB0Width = (parseFloat(b0.style.width) / 100) * 900;
+  assert.ok(initialB0Width > 60);
+
+  // Bubble 1 streams immediately to the right -> b0 must be re-clamped so boxes do not overlap.
+  const b1 = session.addBubble({
+    id: 1,
+    bbox: [150, 90, 240, 350],
+    safe_box: [168, 100, 228, 340],
+    translated: "Because there is no time left to hesitate!",
+  });
+
+  const b0x1 = (parseFloat(b0.style.left) / 100) * 900;
+  const b0x2 = b0x1 + (parseFloat(b0.style.width) / 100) * 900;
+  const b1x1 = (parseFloat(b1.style.left) / 100) * 900;
+  assert.ok(
+    b0x2 <= b1x1 - 1.5,
+    `Streaming collision not resolved: b0x2=${b0x2.toFixed(2)}, b1x1=${b1x1.toFixed(2)}`
+  );
+
+  // Minimal DOM without doc.body: tooltip hover must be null-safe and never throw.
+  const minDoc = createMockDocument();
+  minDoc.body = null;
+  const hitEl = b0.querySelector(".mlt-bubble-hit");
+  assert.doesNotThrow(() => {
+    overlay.setPeekOriginal(true, minDoc);
+    overlay.hideTooltipPortal(minDoc);
+    hitEl.dispatchEvent({ type: "mouseenter" });
+    hitEl.dispatchEvent({ type: "mouseleave" });
+  });
+
+  session.destroy();
+});

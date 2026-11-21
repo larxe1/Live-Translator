@@ -132,24 +132,50 @@ if (-not (Test-Path $LlamaServerExe)) {
     Write-Host "`n[3/6] llama-server.exe already present at $LlamaServerExe." -ForegroundColor Green
 }
 
-# 4. Download uncensored abliterated Qwen2.5-7B-Instruct Q4_K_M GGUF model
-Write-Host "`n[4/6] Downloading abliterated Qwen2.5-7B-Instruct Q4_K_M GGUF into $ModelsDir ..." -ForegroundColor Yellow
+# 4. Download configured abliterated GGUF model (default: Qwen3-8B-abliterated Q4_K_M)
+Write-Host "`n[4/6] Downloading configured GGUF model into $ModelsDir ..." -ForegroundColor Yellow
 $DownloadModelPy = @"
 import fnmatch
+import json
 from pathlib import Path
 from huggingface_hub import hf_hub_download, list_repo_files
 
+default_repo = "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
+default_pattern = "*Qwen3-8B*Q4_K_M*.gguf"
+
+project_root = Path(r"$ProjectRoot")
+config_path = project_root / "config.json"
+cfg = {}
+if config_path.is_file():
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Warning: could not parse {config_path}: {exc}")
+
+repo_id_cfg = str(cfg.get("llm_repo_id") or default_repo).strip() or default_repo
+pattern_cfg = str(cfg.get("llm_filename_pattern") or default_pattern).strip() or default_pattern
+
 models_dir = Path(r"$ModelsDir")
-existing = list(models_dir.glob("*Q4_K_M*.gguf")) + list(models_dir.glob("*.gguf"))
+existing = sorted(
+    p
+    for p in models_dir.rglob("*.gguf")
+    if p.is_file() and fnmatch.fnmatch(p.name.lower(), pattern_cfg.lower())
+)
 if existing:
-    print("Model already present:", existing[0])
+    print(f"Configured model matching {pattern_cfg!r} already present:", existing[0])
     raise SystemExit(0)
 
-repos = [
+fallback_repos = [
+    ("bartowski/mlabonne_Qwen3-8B-abliterated-GGUF", [pattern_cfg, "*Qwen3-8B*Q4_K_M*.gguf"]),
     ("richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF", ["*Q4_K_M*.gguf"]),
     ("bartowski/Qwen2.5-7B-Instruct-abliterated-GGUF", ["*Q4_K_M*.gguf"]),
-    ("mradermacher/Qwen2.5-7B-Instruct-abliterated-GGUF", ["*Q4_K_M*.gguf"]),
 ]
+repos = [(repo_id_cfg, [pattern_cfg])]
+seen_repos = {repo_id_cfg}
+for fb_repo, fb_patterns in fallback_repos:
+    if fb_repo not in seen_repos:
+        repos.append((fb_repo, fb_patterns))
+        seen_repos.add(fb_repo)
 
 for repo_id, patterns in repos:
     try:
@@ -161,7 +187,7 @@ for repo_id, patterns in repos:
             for pat in patterns:
                 matches.extend([f for f in files if fnmatch.fnmatch(Path(f).name.lower(), pat.lower())])
         if matches:
-            target = matches[0]
+            target = sorted(matches)[0]
             print(f"Downloading {repo_id} / {target} ...")
             local_path = hf_hub_download(
                 repo_id=repo_id,
@@ -173,7 +199,7 @@ for repo_id, patterns in repos:
     except Exception as exc:
         print(f"Repo {repo_id} fallback triggered: {exc}")
 
-raise RuntimeError("Could not download any Q4_K_M abliterated Qwen2.5-7B GGUF model.")
+raise RuntimeError(f"Could not download GGUF model matching {pattern_cfg!r} from {repo_id_cfg!r} or fallback repos.")
 "@
 $DownloadModelScript = Join-Path $TempDir "download_gguf.py"
 Set-Content -Path $DownloadModelScript -Value $DownloadModelPy -Encoding UTF8

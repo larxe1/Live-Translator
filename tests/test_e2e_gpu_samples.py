@@ -180,12 +180,35 @@ def test_e2e_gpu_health_jp_centipede_and_ko_webtoon(live_server: dict[str, Any])
         img_w = jp_data["width"]
         img_h = jp_data["height"]
         for b in jp_data["bubbles"]:
+            assert b.get("region_type") in ("bubble", "narration", "floating")
             assert not is_refusal(b["translated"]), f"Refusal leaked into bubble: {b}"
-            assert "カサ" not in b["original"], f"Floating SFX leaked into bubble: {b}"
+            if b.get("region_type") != "floating":
+                assert "カサ" not in b["original"], f"Floating SFX leaked into non-floating bubble: {b}"
+                cx = (b["bbox"]["x1"] + b["bbox"]["x2"]) / 2.0
+                cy = (b["bbox"]["y1"] + b["bbox"]["y2"]) / 2.0
+                in_sfx_region = (0.30 * img_w <= cx <= 0.58 * img_w) and (0.0 <= cy <= 0.29 * img_h)
+                assert not in_sfx_region, f"Top-left floating SFX region covered by non-floating bubble: {b}"
+
+        # With include_floating=False, floating artwork SFX MUST be excluded completely
+        r_jp_no_float = client.post(
+            "/translate",
+            json={
+                "image_base64": jp_b64,
+                "lang": "auto",
+                "chapter_id": "e2e_jp_no_float",
+                "priority": 0,
+                "glossary": {"藍星": "Ranshin"},
+                "include_floating": False,
+            },
+        )
+        assert r_jp_no_float.status_code == 200, r_jp_no_float.text
+        for b in r_jp_no_float.json()["bubbles"]:
+            assert b.get("region_type") != "floating", f"Unexpected floating bubble: {b}"
+            assert "カサ" not in b["original"], f"Floating SFX leaked when include_floating=False: {b}"
             cx = (b["bbox"]["x1"] + b["bbox"]["x2"]) / 2.0
             cy = (b["bbox"]["y1"] + b["bbox"]["y2"]) / 2.0
             in_sfx_region = (0.30 * img_w <= cx <= 0.58 * img_w) and (0.0 <= cy <= 0.29 * img_h)
-            assert not in_sfx_region, f"Top-left floating SFX region covered by bubble: {b}"
+            assert not in_sfx_region, f"Top-left SFX region covered when include_floating=False: {b}"
 
         # Third call must be an instant cache hit
         r_jp_cached = client.post(

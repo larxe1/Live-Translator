@@ -15,7 +15,7 @@ from server.translator.memory import contains_non_english_cjk
 
 logger = logging.getLogger(__name__)
 
-CACHE_KEY_VERSION = "v2-en-only"
+CACHE_KEY_VERSION = "v3-floating-ctx"
 
 
 def _response_has_non_english_cjk(response: TranslateResponse) -> bool:
@@ -89,8 +89,9 @@ class TranslationCache:
         image_bytes: bytes,
         lang: str,
         glossary: dict[str, str] | None = None,
+        include_floating: bool = True,
     ) -> str:
-        """Compute versioned deterministic SHA-256 key over image bytes, language, and glossary."""
+        """Compute versioned deterministic SHA-256 key over image bytes, language, glossary, and floating mode."""
         normalized_glossary = json.dumps(
             glossary or {},
             sort_keys=True,
@@ -105,6 +106,8 @@ class TranslationCache:
         hasher.update(lang.encode("utf-8"))
         hasher.update(b"\x00")
         hasher.update(normalized_glossary.encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(b"1" if include_floating else b"0")
         return hasher.hexdigest()
 
     def _next_seq(self, conn: sqlite3.Connection) -> int:

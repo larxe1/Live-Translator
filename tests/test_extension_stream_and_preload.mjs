@@ -98,6 +98,7 @@ function createMockPortPair(name = "mlt-translate-stream") {
 function loadBackgroundSandbox({ storageInitial = {}, fetchImpl, sendNativeImpl } = {}) {
   const storage = createMockStorage(storageInitial);
   const connectListeners = [];
+  const messageListeners = [];
   const nativeCalls = [];
 
   const chromeMock = {
@@ -116,7 +117,11 @@ function loadBackgroundSandbox({ storageInitial = {}, fetchImpl, sendNativeImpl 
         }
         return Promise.resolve({ ok: true, started: true, already_running: false, pid: 1234 });
       },
-      onMessage: { addListener() {} },
+      onMessage: {
+        addListener(fn) {
+          messageListeners.push(fn);
+        },
+      },
       onConnect: {
         addListener(fn) {
           connectListeners.push(fn);
@@ -173,6 +178,13 @@ function loadBackgroundSandbox({ storageInitial = {}, fetchImpl, sendNativeImpl 
       const pair = createMockPortPair(name);
       for (const fn of connectListeners) fn(pair.bgPort);
       return pair;
+    },
+    sendMessage(msg, sender = {}) {
+      return new Promise((resolve) => {
+        for (const fn of messageListeners) {
+          fn(msg, sender, resolve);
+        }
+      });
     },
   };
 }
@@ -774,4 +786,357 @@ test("7. Failed image in preload records failure once and advances to next page 
 
   assert.equal(calls.filter((c) => c === "bad.jpg").length, 1);
   assert.equal(calls.filter((c) => c === "good.jpg").length, 1);
+});
+
+test("8. deriveSeriesId normalizes common manga/webtoon chapter URLs and falls back safely", () => {
+  assert.equal(
+    content.deriveSeriesId("example.com", "/manga/blue-box/chapter-12/3"),
+    "example.com/manga/blue-box"
+  );
+  assert.equal(
+    content.deriveSeriesId("example.com", "/title/12345/ch-9"),
+    "example.com/title/12345"
+  );
+  assert.equal(
+    content.deriveSeriesId("www.webtoons.com", "/en/romance/blue-box/episode-12/viewer"),
+    "www.webtoons.com/en/romance/blue-box"
+  );
+  assert.equal(
+    content.deriveSeriesId("asura.gg", "/series/solo-leveling/chapter/108/page/4"),
+    "asura.gg/series/solo-leveling"
+  );
+  assert.equal(
+    content.deriveSeriesId("example.com", "/manga/blue-box/vol-2-ch-14"),
+    "example.com/manga/blue-box"
+  );
+  assert.equal(
+    content.deriveSeriesId("example.com", "/manga/blue-box"),
+    "example.com/manga/blue-box"
+  );
+  assert.equal(
+    content.deriveSeriesId("mangadex.org", "/chapter/abc-123"),
+    "mangadex.org/chapter/abc-123"
+  );
+});
+
+test("9. content controller forwards seriesId & includeFloating, resolves per-series glossary, and retranslates on includeFloating toggle", async () => {
+  const { doc, win } = createMinimalDom("https://example.com/manga/blue-box/chapter-12/3");
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/page1.jpg";
+  doc.body.appendChild(img);
+
+  const startPayloads = [];
+  const fallbackPayloads = [];
+  let usePort = true;
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "example.com",
+    storage: {
+      async get() {
+        return {
+          enabledDomains: { "example.com": true },
+          langMode: "ja",
+          includeFloating: true,
+          glossary: { "Global": "Fallback" },
+          glossariesBySeries: {
+            "example.com/manga/blue-box": { "大喜": "Taiki" },
+          },
+        };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "TRANSLATE_IMAGE") {
+        fallbackPayloads.push(msg);
+        return { ok: true, data: { lang: "ja", width: 800, height: 1200, bubbles: [] } };
+      }
+      return { ok: true };
+    },
+    connectPort: () => {
+      if (!usePort) return null;
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          startPayloads.push(msg);
+          setTimeout(() => {
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [] });
+              fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.equal(startPayloads.length, 1);
+  assert.equal(startPayloads[0].seriesId, "example.com/manga/blue-box");
+  assert.equal(startPayloads[0].includeFloating, true);
+  assert.deepEqual(startPayloads[0].glossary, { "大喜": "Taiki" });
+
+  // Toggle includeFloating to false -> cache key misses and triggers fresh retranslation
+  usePort = false;
+  controller.handleStorageChanges({
+    includeFloating: { oldValue: true, newValue: false },
+  });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.equal(fallbackPayloads.length, 1);
+  assert.equal(fallbackPayloads[0].seriesId, "example.com/manga/blue-box");
+  assert.equal(fallbackPayloads[0].includeFloating, false);
+  assert.deepEqual(fallbackPayloads[0].glossary, { "大喜": "Taiki" });
+});
+
+test("10. background forwards include_floating & series_id, preserves region_type in 404 fallback, and routes LOOKUP_GLOSSARY", async () => {
+  const seenRequests = [];
+  const sb = loadBackgroundSandbox({
+    fetchImpl: async (url, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      seenRequests.push({ url, method: opts.method || "GET", body });
+
+      if (url.endsWith("/translate/stream")) {
+        if (body?.request_id === "req-404-floating") {
+          return { ok: false, status: 404, async text() { return "Not Found"; } };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } }) + "\n";
+          },
+        };
+      }
+      if (url.endsWith("/translate")) {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              lang: "ja",
+              width: 800,
+              height: 1200,
+              bubbles: [
+                {
+                  id: 0,
+                  bbox: [10, 10, 90, 60],
+                  safe_box: [12, 12, 88, 58],
+                  translated: "*THUMP*",
+                  original: "ドン",
+                  region_type: "floating",
+                },
+              ],
+            });
+          },
+        };
+      }
+      if (url.endsWith("/glossary/lookup")) {
+        if (body?.query === "bad") {
+          return { ok: false, status: 400, async text() { return JSON.stringify({ detail: "Unsupported host" }); } };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              title: "Blue Box",
+              source: "anilist",
+              url: "https://anilist.co/manga/132182",
+              entries: { "猪股大喜": "Taiki Inomata" },
+              count: 1,
+              warnings: [],
+            });
+          },
+        };
+      }
+      if (url.includes("/glossary") || url.endsWith("/memory/clear")) {
+        return { ok: true, status: 200, async text() { return JSON.stringify({ ok: true }); } };
+      }
+      if (url.endsWith("/health")) {
+        return { ok: true, status: 200, async text() { return JSON.stringify({ ready: true }); } };
+      }
+      return { ok: false, status: 404, async text() { return "{}"; } };
+    },
+  });
+
+  // 1) /translate/stream receives include_floating=false and series_id
+  const streamPair = sb.connectPort("mlt-translate-stream");
+  await new Promise((resolve) => {
+    streamPair.clientPort.onMessage.addListener((evt) => {
+      if (evt.type === "done") resolve();
+    });
+    streamPair.clientPort.postMessage({
+      type: "START",
+      imageBase64: "AAAA",
+      lang: "ja",
+      chapterId: "example.com/manga/blue-box/chapter-12",
+      seriesId: "example.com/manga/blue-box",
+      includeFloating: false,
+      requestId: "req-stream-ctx",
+    });
+  });
+  const streamCall = seenRequests.find((r) => r.url.endsWith("/translate/stream") && r.body?.request_id === "req-stream-ctx");
+  assert.equal(streamCall.body.include_floating, false);
+  assert.equal(streamCall.body.series_id, "example.com/manga/blue-box");
+
+  // 2) HTTP 404 fallback forwards include_floating & series_id and preserves region_type on meta & bubble
+  const fallbackPair = sb.connectPort("mlt-translate-stream");
+  const fallbackEvents = [];
+  await new Promise((resolve) => {
+    fallbackPair.clientPort.onMessage.addListener((evt) => {
+      fallbackEvents.push(evt);
+      if (evt.type === "done") resolve();
+    });
+    fallbackPair.clientPort.postMessage({
+      type: "START",
+      imageBase64: "AAAA",
+      chapterId: "example.com/manga/blue-box/chapter-12",
+      seriesId: "example.com/manga/blue-box",
+      includeFloating: true,
+      requestId: "req-404-floating",
+    });
+  });
+  const fallbackPost = seenRequests.find((r) => r.url.endsWith("/translate") && r.body?.request_id === "req-404-floating");
+  assert.equal(fallbackPost.body.include_floating, true);
+  assert.equal(fallbackPost.body.series_id, "example.com/manga/blue-box");
+  assert.equal(fallbackEvents[0].type, "meta");
+  assert.equal(fallbackEvents[0].bubbles[0].region_type, "floating");
+  assert.equal(fallbackEvents[1].type, "bubble");
+  assert.equal(fallbackEvents[1].region_type, "floating");
+
+  // 3) LOOKUP_GLOSSARY, GET_GLOSSARY, SET_GLOSSARY, CLEAR_MEMORY
+  const lookupOk = await sb.sendMessage({ type: "LOOKUP_GLOSSARY", query: "Blue Box" });
+  assert.equal(lookupOk.ok, true);
+  assert.equal(lookupOk.data.title, "Blue Box");
+  assert.deepEqual(lookupOk.data.entries, { "猪股大喜": "Taiki Inomata" });
+  const lookupReq = seenRequests.find((r) => r.url.endsWith("/glossary/lookup"));
+  assert.deepEqual(lookupReq.body, { query: "Blue Box", source: "auto" });
+
+  const lookupErr = await sb.sendMessage({ type: "LOOKUP_GLOSSARY", query: "bad", source: "fandom" });
+  assert.equal(lookupErr.ok, false);
+  assert.match(lookupErr.error, /Unsupported host/);
+
+  await sb.sendMessage({
+    type: "SET_GLOSSARY",
+    chapterId: "example.com/manga/blue-box/chapter-12",
+    seriesId: "example.com/manga/blue-box",
+    entries: { "猪股大喜": "Taiki Inomata" },
+  });
+  const setReq = seenRequests.find((r) => r.url.endsWith("/glossary") && r.method === "POST");
+  assert.equal(setReq.body.series_id, "example.com/manga/blue-box");
+
+  await sb.sendMessage({
+    type: "GET_GLOSSARY",
+    chapterId: "example.com/manga/blue-box/chapter-12",
+    seriesId: "example.com/manga/blue-box",
+  });
+  const getReq = seenRequests.find((r) => r.url.includes("/glossary?") && r.method === "GET");
+  assert.match(getReq.url, /series_id=example\.com%2Fmanga%2Fblue-box/);
+
+  await sb.sendMessage({
+    type: "CLEAR_MEMORY",
+    chapterId: "example.com/manga/blue-box/chapter-12",
+    seriesId: "example.com/manga/blue-box",
+  });
+  const clearReq = seenRequests.find((r) => r.url.endsWith("/memory/clear"));
+  assert.equal(clearReq.body.series_id, "example.com/manga/blue-box");
+});
+
+test("11. content controller isolates per-series glossaries without leaking Series A flat glossary or retranslating Series B", async () => {
+  const { doc, win } = createMinimalDom("https://example.com/manga/series-b/chapter-1");
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/series-b-p1.jpg";
+  doc.body.appendChild(img);
+
+  const startPayloads = [];
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "example.com",
+    storage: {
+      async get() {
+        return {
+          enabledDomains: { "example.com": true },
+          langMode: "ja",
+          includeFloating: true,
+          // popup.js writes both glossariesBySeries[seriesA] and legacy flat glossary
+          glossary: { "SeriesA": "Alpha" },
+          glossariesBySeries: {
+            "example.com/manga/series-a": { "SeriesA": "Alpha" },
+          },
+        };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          startPayloads.push(msg);
+          setTimeout(() => {
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [] });
+              fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.equal(startPayloads.length, 1);
+  assert.equal(startPayloads[0].seriesId, "example.com/manga/series-b");
+  assert.deepEqual(startPayloads[0].glossary, {});
+
+  // Editing Series A in another tab updates glossariesBySeries + flat glossary -> Series B must NOT retranslate
+  controller.handleStorageChanges({
+    glossariesBySeries: {
+      oldValue: { "example.com/manga/series-a": { "SeriesA": "Alpha" } },
+      newValue: { "example.com/manga/series-a": { "SeriesA": "Alpha", "Extra": "Beta" } },
+    },
+    glossary: {
+      oldValue: { "SeriesA": "Alpha" },
+      newValue: { "SeriesA": "Alpha", "Extra": "Beta" },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(startPayloads.length, 1);
+
+  // Updating Series B itself DOES trigger retranslation with Series B's glossary
+  controller.handleStorageChanges({
+    glossariesBySeries: {
+      oldValue: { "example.com/manga/series-a": { "SeriesA": "Alpha", "Extra": "Beta" } },
+      newValue: {
+        "example.com/manga/series-a": { "SeriesA": "Alpha", "Extra": "Beta" },
+        "example.com/manga/series-b": { "SeriesB": "Gamma" },
+      },
+    },
+    glossary: {
+      oldValue: { "SeriesA": "Alpha", "Extra": "Beta" },
+      newValue: { "SeriesB": "Gamma" },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(startPayloads.length, 2);
+  assert.deepEqual(startPayloads[1].glossary, { "SeriesB": "Gamma" });
 });

@@ -18,11 +18,11 @@ class AppConfig:
     port: int = 8765
     llama_port: int = 8766
     detector_model_id: str = "ogkalu/comic-text-and-bubble-detector"
-    llm_repo_id: str = "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF"
-    llm_filename_pattern: str = "*Q4_K_M*.gguf"
+    llm_repo_id: str = "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
+    llm_filename_pattern: str = "*Qwen3-8B*Q4_K_M*.gguf"
     llm_model_path: Path | None = None
     llm_ctx_size: int = 4096
-    llm_gpu_layers: int = 23
+    llm_gpu_layers: int = 30
     max_cache_entries: int = 2000
     allow_lan: bool = False
     max_image_bytes: int = 25_000_000
@@ -91,12 +91,12 @@ def load_config(
             raw.get("detector_model_id", "ogkalu/comic-text-and-bubble-detector")
         ),
         llm_repo_id=str(
-            raw.get("llm_repo_id", "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF")
+            raw.get("llm_repo_id", "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF")
         ),
-        llm_filename_pattern=str(raw.get("llm_filename_pattern", "*Q4_K_M*.gguf")),
+        llm_filename_pattern=str(raw.get("llm_filename_pattern", "*Qwen3-8B*Q4_K_M*.gguf")),
         llm_model_path=raw.get("llm_model_path"),
         llm_ctx_size=int(raw.get("llm_ctx_size", 4096)),
-        llm_gpu_layers=int(raw.get("llm_gpu_layers", 23)),
+        llm_gpu_layers=int(raw.get("llm_gpu_layers", 30)),
         max_cache_entries=int(raw.get("max_cache_entries", 2000)),
         allow_lan=bool(raw.get("allow_lan", False)),
         max_image_bytes=int(raw.get("max_image_bytes", 25_000_000)),

@@ -46,7 +46,7 @@ class LlamaServerManager:
                 pattern = self.cfg.llm_filename_pattern
                 if pattern:
                     for path in ggufs:
-                        if fnmatch.fnmatch(path.name, pattern):
+                        if fnmatch.fnmatch(path.name.lower(), pattern.lower()):
                             return path
                 return ggufs[0]
 
@@ -73,8 +73,8 @@ class LlamaServerManager:
         )
 
     def build_command(self, exe_path: Path, model_path: Path) -> list[str]:
-        """Build the llama-server CLI invocation with fixed VRAM-safe context/batch caps."""
-        ctx_size = min(int(self.cfg.llm_ctx_size), 4096) if self.cfg.llm_ctx_size > 0 else 4096
+        """Build the llama-server CLI invocation with VRAM-safe context/batch caps."""
+        ctx_size = min(int(self.cfg.llm_ctx_size), 6144) if self.cfg.llm_ctx_size > 0 else 4096
         gpu_layers = int(self.cfg.llm_gpu_layers)
         return [
             str(exe_path),
@@ -92,6 +92,10 @@ class LlamaServerManager:
             "512",
             "--parallel",
             "1",
+            "--reasoning",
+            "off",
+            "--flash-attn",
+            "on",
         ]
 
     def is_healthy(self) -> bool:

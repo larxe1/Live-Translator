@@ -311,17 +311,22 @@ def _make_cache_response(translated_text: str, original_text: str = "夢幻団")
     )
 
 
-def test_translation_cache_v2_key_evicts_on_get_and_purges_on_init(tmp_path):
-    assert CACHE_KEY_VERSION == "v2-en-only"
+def test_translation_cache_v3_key_evicts_on_get_and_purges_on_init(tmp_path):
+    assert CACHE_KEY_VERSION == "v3-floating-ctx"
     db_path = tmp_path / "translations.db"
     cache = TranslationCache(db_path, max_entries=20)
 
     img_bytes = b"fake-manga-page"
-    v2_key = cache.make_key(img_bytes, "ja", {})
+    v3_key = cache.make_key(img_bytes, "ja", {})
+    v3_key_floating_true = cache.make_key(img_bytes, "ja", {}, include_floating=True)
+    v3_key_floating_false = cache.make_key(img_bytes, "ja", {}, include_floating=False)
+    assert v3_key == v3_key_floating_true
+    assert v3_key != v3_key_floating_false
+
     legacy_hasher = hashlib.sha256()
     legacy_hasher.update(img_bytes)
     legacy_hasher.update(b"\x00ja\x00{}")
-    assert v2_key != legacy_hasher.hexdigest()
+    assert v3_key != legacy_hasher.hexdigest()
 
     # Poisoned row is rejected and deleted on get()
     poison_key = cache.make_key(b"poisoned-page", "ja")
@@ -488,3 +493,121 @@ async def test_translator_streaming_retries_failed_bubble_and_emits_final_true()
         (0, "Phantom Troupe", False),
         (1, "What we stole", True),
     ]
+
+
+def test_chapter_memory_multi_page_formatted_context_and_series_continuity():
+    mem = ChapterMemoryStore()
+    assert mem.max_recent == 36
+
+    mem.set_glossary("ch1", {"藍星": "Ranshin", "夢幻団": "Phantom Troupe"}, series_id="series-a")
+    # Chapter 2 inherits series glossary, and chapter-level entries can override/extend it
+    assert mem.get_glossary("ch2", series_id="series-a") == {
+        "藍星": "Ranshin",
+        "夢幻団": "Phantom Troupe",
+    }
+    mem.set_glossary("ch2", {"藍星": "Ranshin-sama"})
+    assert mem.get_glossary("ch2", series_id="series-a") == {
+        "藍星": "Ranshin-sama",
+        "夢幻団": "Phantom Troupe",
+    }
+
+    mem.record_page("ch1", [("行くぞ", "Let's move."), ("わかった", "Got it.")], series_id="series-a")
+    mem.record_page("ch1", [("危ない！", "Watch out!")], series_id="series-a")
+    mem.record_page("ch2", [("間に合ったか", "Did we make it in time?")], series_id="series-a")
+
+    ctx_ch2 = mem.get_context("ch2", series_id="series-a")
+    assert ctx_ch2 == [
+        ("行くぞ", "Let's move."),
+        ("わかった", "Got it."),
+        ("危ない！", "Watch out!"),
+        ("間に合ったか", "Did we make it in time?"),
+    ]
+
+    formatted = mem.get_formatted_context("ch2", series_id="series-a", max_pairs=28)
+    assert "[Page -3]\n- 行くぞ -> Let's move.\n- わかった -> Got it." in formatted
+    assert "[Page -2]\n- 危ない！ -> Watch out!" in formatted
+    assert "[Page -1]\n- 間に合ったか -> Did we make it in time?" in formatted
+
+    # Respects max_pairs cap from the newest entries backward
+    capped = mem.get_formatted_context("ch2", series_id="series-a", max_pairs=2)
+    assert "[Page -2]\n- 危ない！ -> Watch out!" in capped
+    assert "[Page -1]\n- 間に合ったか -> Did we make it in time?" in capped
+    assert "Let's move." not in capped
+
+    # Clearing chapter + series wipes both while preserving glossaries
+    mem.clear("ch2", series_id="series-a")
+    assert mem.get_context("ch2", series_id="series-a") == []
+    assert mem.get_glossary("ch2", series_id="series-a")["夢幻団"] == "Phantom Troupe"
+
+
+@pytest.mark.asyncio
+async def test_translator_prompt_includes_series_context_and_floating_hints():
+    memory = ChapterMemoryStore()
+    memory.set_glossary("ch1", {"藍星": "Ranshin"}, series_id="my-series")
+    memory.record_page("ch1", [("どこだ？", "Where are you?")], series_id="my-series")
+    captured: list[list[dict[str, str]]] = []
+
+    async def fake_llm(messages):
+        captured.append(messages)
+        return '{"0": "Right here, Ranshin.", "1": "*RUSTLE*"}'
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm)
+    out = await tr.translate_page(
+        [(0, "ここだよ、藍星"), (1, "カサカサ")],
+        lang="ja",
+        chapter_id="ch2",
+        series_id="my-series",
+        bubble_types={0: "bubble", 1: "floating"},
+    )
+    assert out == {0: "Right here, Ranshin.", 1: "*RUSTLE*"}
+    sys_prompt = captured[0][0]["content"]
+    usr_prompt = captured[0][1]["content"]
+    assert "STRICTLY ENGLISH ONLY" in sys_prompt
+    assert "[floating]" in sys_prompt
+    assert "[Page -1]" in usr_prompt
+    assert "Where are you?" in usr_prompt
+    assert '"1": [floating]' in usr_prompt
+    assert "Ranshin" in usr_prompt
+    assert len(memory.get_context("ch2", series_id="my-series")) == 3
+
+
+@pytest.mark.asyncio
+async def test_llama_http_payload_disables_thinking_and_raises_max_tokens(monkeypatch):
+    import httpx
+
+    seen_payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(body)
+        if body.get("stream"):
+            sse = (
+                'data: {"choices":[{"delta":{"content":"{\\"0\\": \\"Hello\\"}"}}]}\n\n'
+                "data: [DONE]\n\n"
+            )
+            return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"0": "Hello"}'}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_client)
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", ChapterMemoryStore())
+    raw = await tr._call_llama([{"role": "user", "content": "hi"}])
+    assert raw == '{"0": "Hello"}'
+
+    chunks = [c async for c in tr._call_llama_stream([{"role": "user", "content": "hi"}])]
+    assert "".join(chunks) == '{"0": "Hello"}'
+
+    assert len(seen_payloads) == 2
+    for payload in seen_payloads:
+        assert payload["max_tokens"] == 1536
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}

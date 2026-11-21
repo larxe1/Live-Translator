@@ -114,6 +114,109 @@
     return JSON.stringify(out);
   }
 
+  const SERIES_CONTAINER_SEGMENTS = new Set([
+    "manga",
+    "manhwa",
+    "manhua",
+    "comic",
+    "comics",
+    "webtoon",
+    "webtoons",
+    "series",
+    "title",
+    "titles",
+    "read",
+    "reader",
+    "chapter",
+    "chapters",
+    "ch",
+    "episode",
+    "episodes",
+    "ep",
+    "book",
+    "books",
+    "novel",
+    "novels",
+    "en",
+    "ja",
+    "jp",
+    "ko",
+    "kr",
+  ]);
+  const CHAPTER_KEYWORD_SEGMENTS = new Set([
+    "chapter",
+    "chapters",
+    "chap",
+    "ch",
+    "episode",
+    "episodes",
+    "ep",
+    "page",
+    "pages",
+    "pg",
+    "p",
+    "vol",
+    "volume",
+    "part",
+    "issue",
+  ]);
+
+  /**
+   * Derives a stable series identifier by stripping trailing chapter/episode/page
+   * path segments from a URL, falling back to `hostname + pathname`.
+   */
+  function deriveSeriesId(hostname, pathname) {
+    const host = String(hostname || "").trim().toLowerCase();
+    const rawPath = String(pathname || "/").split("?")[0].split("#")[0].trim();
+    const normalizedPath = rawPath ? (rawPath.startsWith("/") ? rawPath : `/${rawPath}`) : "/";
+    const fallback = host ? `${host}${normalizedPath}` : normalizedPath || "default";
+
+    const parts = normalizedPath.split("/").filter(Boolean);
+    if (parts.length === 0) return fallback;
+
+    let end = parts.length;
+    while (end > 0) {
+      const seg = parts[end - 1].toLowerCase();
+      if (/^(?:viewer|view|read|index\.html?)$/.test(seg)) {
+        end -= 1;
+        continue;
+      }
+      if (
+        /^(?:chapter|chapters|chap|ch|episode|episodes|ep|page|pages|pg|vol|volume|part|issue)[-_.\s]*\d+(?:[-_.][a-z0-9]+)*$/.test(
+          seg
+        ) ||
+        /^(?:c|e|p)[-_.]?\d+(?:[-_.]\d+)*$/.test(seg) ||
+        /^(?:v|s)\d+[-_.]?(?:ch|ep|c|e)[-_.]?\d+(?:[-_.][a-z0-9]+)*$/.test(seg)
+      ) {
+        end -= 1;
+        continue;
+      }
+      if (/^\d+(?:[-_.]\d+)*(?:[a-z])?$/.test(seg)) {
+        const prev = end >= 2 ? parts[end - 2].toLowerCase() : "";
+        if (CHAPTER_KEYWORD_SEGMENTS.has(prev)) {
+          end -= 2;
+          continue;
+        }
+        if (end >= 3 && !SERIES_CONTAINER_SEGMENTS.has(prev)) {
+          end -= 1;
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (end === 0 || end === parts.length) {
+      return fallback;
+    }
+    const lastKept = parts[end - 1].toLowerCase();
+    if (SERIES_CONTAINER_SEGMENTS.has(lastKept)) {
+      return fallback;
+    }
+
+    const strippedPath = `/${parts.slice(0, end).join("/")}`;
+    return host ? `${host}${strippedPath}` : strippedPath;
+  }
+
   async function blobUrlToBase64(blobUrl, fetchImpl = fetch) {
     const res = await fetchImpl(blobUrl);
     if (!res.ok) throw new Error(`Blob fetch failed (${res.status})`);
@@ -132,7 +235,9 @@
     const doc = deps.document || document;
     const win = deps.window || window;
     const hostname = deps.hostname ?? win.location?.hostname ?? "";
-    const chapterId = deps.chapterId ?? `${hostname}${win.location?.pathname || "/"}`;
+    const pathname = win.location?.pathname || "/";
+    const chapterId = deps.chapterId ?? `${hostname}${pathname}`;
+    const seriesId = deps.seriesId ?? deriveSeriesId(hostname, pathname);
     const storage = deps.storage;
     const sendMessage = deps.sendMessage;
     const connectPort = deps.connectPort;
@@ -148,6 +253,9 @@
     let enabled = false;
     let contextInvalidated = false;
     let langMode = "auto";
+    let includeFloating = true;
+    let glossariesBySeries = null;
+    let flatGlossary = {};
     let glossary = {};
     let reqCounter = 0;
     let mutationObserver = null;
@@ -276,11 +384,20 @@
       return rect.bottom > -250 && rect.top < vh + 250 && rect.right > 0 && rect.left < vw;
     }
 
+    function resolveActiveGlossary(bySeries, flat) {
+      if (bySeries && typeof bySeries === "object") {
+        return Object.prototype.hasOwnProperty.call(bySeries, seriesId)
+          ? bySeries[seriesId] || {}
+          : {};
+      }
+      return flat && typeof flat === "object" ? flat : {};
+    }
+
     function getCacheKey(srcKey) {
       if (!srcKey || srcKey.startsWith("data:") || srcKey.startsWith("canvas:")) {
         return null;
       }
-      return `${srcKey}::${langMode}::${stableGlossaryKey(glossary)}`;
+      return `${srcKey}::${langMode}::${includeFloating ? "f1" : "f0"}::${stableGlossaryKey(glossary)}`;
     }
 
     function setCachedResponse(cacheKey, response) {
@@ -1043,6 +1160,8 @@
               refererUrl: win.location?.href || "",
               lang: langMode,
               chapterId,
+              seriesId,
+              includeFloating,
               priority,
               glossary,
               requestId,
@@ -1076,6 +1195,8 @@
           refererUrl: win.location?.href || "",
           lang: langMode,
           chapterId,
+          seriesId,
+          includeFloating,
           priority,
           glossary,
           requestId,
@@ -1344,9 +1465,18 @@
       if (!storage || typeof storage.get !== "function") {
         return { enabled: false };
       }
-      const data = await storage.get(["enabledDomains", "langMode", "glossary"]);
+      const data = await storage.get([
+        "enabledDomains",
+        "langMode",
+        "glossary",
+        "glossariesBySeries",
+        "includeFloating",
+      ]);
       langMode = data?.langMode || "auto";
-      glossary = data?.glossary || {};
+      includeFloating = data?.includeFloating !== false;
+      glossariesBySeries = data?.glossariesBySeries ?? null;
+      flatGlossary = data?.glossary || {};
+      glossary = resolveActiveGlossary(glossariesBySeries, flatGlossary);
       if (isDomainEnabled(hostname, data?.enabledDomains)) {
         enable();
         return { enabled: true };
@@ -1356,14 +1486,36 @@
 
     function handleStorageChanges(changes) {
       if (!changes || contextInvalidated) return;
+      let shouldRetranslate = false;
       if (changes.langMode) {
         langMode = changes.langMode.newValue || "auto";
         if (pillLangSelect) pillLangSelect.value = langMode;
-        if (enabled) retranslateAllActive();
+        shouldRetranslate = true;
       }
-      if (changes.glossary) {
-        glossary = changes.glossary.newValue || {};
-        if (enabled) retranslateAllActive();
+      if (changes.includeFloating) {
+        const nextFloating = changes.includeFloating.newValue !== false;
+        if (nextFloating !== includeFloating) {
+          includeFloating = nextFloating;
+          shouldRetranslate = true;
+        }
+      }
+      if (changes.glossariesBySeries || changes.glossary) {
+        if (changes.glossariesBySeries) {
+          glossariesBySeries = changes.glossariesBySeries.newValue ?? null;
+        }
+        if (changes.glossary) {
+          flatGlossary = changes.glossary.newValue || {};
+        }
+        const nextGlossary = resolveActiveGlossary(glossariesBySeries, flatGlossary);
+        if (stableGlossaryKey(nextGlossary) !== stableGlossaryKey(glossary)) {
+          glossary = nextGlossary;
+          shouldRetranslate = true;
+        } else {
+          glossary = nextGlossary;
+        }
+      }
+      if (shouldRetranslate && enabled) {
+        retranslateAllActive();
       }
       if (changes.enabledDomains) {
         const shouldEnable = isDomainEnabled(hostname, changes.enabledDomains.newValue);
@@ -1502,6 +1654,7 @@
     MAX_LOOKAHEAD,
     MAX_PAGE_CACHE,
     isDomainEnabled,
+    deriveSeriesId,
     isCandidateMangaElement,
     getElementSourceKey,
     computeLookaheadTargets,
