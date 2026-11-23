@@ -2,6 +2,7 @@
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765";
 const DEFAULT_PRELOAD_WHOLE_CHAPTER = false;
+const DEFAULT_INCLUDE_FLOATING = false;
 const hasDom = typeof document !== "undefined";
 
 const statusDot = hasDom ? document.getElementById("statusDot") : null;
@@ -608,7 +609,7 @@ async function initPopup() {
   }
 
   if (floatingToggle) {
-    floatingToggle.checked = stored.includeFloating !== false;
+    floatingToggle.checked = stored.includeFloating === true;
   }
   if (preloadToggle) {
     preloadToggle.checked = stored.preloadWholeChapter === true;
@@ -944,6 +945,7 @@ if (typeof module === "undefined" && typeof document !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     DEFAULT_PRELOAD_WHOLE_CHAPTER,
+    DEFAULT_INCLUDE_FLOATING,
     deriveSeriesId,
     formatGpuTelemetry,
     formatGpuGuardNotice,

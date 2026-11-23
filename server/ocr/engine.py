@@ -89,7 +89,7 @@ class OcrEngine:
         self,
         device: str = "cuda",
         cache_dir: Path | None = None,
-        min_free_vram_mb: int = 1024,
+        min_free_vram_mb: int = 650,
     ) -> None:
         self.device = device
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None

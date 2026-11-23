@@ -16,10 +16,16 @@ from server.config import AppConfig
 from server.pipeline import TranslationPipeline
 from server.schemas import Box, BubbleResult, TranslateResponse
 from server.translator.llama_manager import LlamaServerManager
-from server.translator.memory import ChapterMemoryStore
+from server.translator.memory import ChapterMemoryStore, extract_character_names
 from server.translator.translator import (
+    DEFAULT_REPEAT_PENALTY,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_P,
     DialogueTranslator,
+    _clean_candidate,
+    _normalize_ocr_for_llm,
     _parse_translation_json,
+    _sanitize_translation_candidate,
     contains_non_english_cjk,
     is_refusal,
     is_valid_english_translation,
@@ -208,9 +214,9 @@ async def test_translator_retries_chinese_drift_and_anchors_english_prompt():
     # Primary prompt anchors English-only and includes the multi-bubble example
     primary_sys = calls[0][0]["content"]
     primary_usr = calls[0][1]["content"]
-    assert "STRICTLY ENGLISH ONLY" in primary_sys
+    assert "strictly english only" in primary_sys.lower()
     assert "Phantom Troupe" in primary_sys
-    assert "ENGLISH ONLY" in primary_usr
+    assert "english only" in primary_usr.lower()
 
     # Batch retry includes ONLY failed IDs (0 and 1, not 2) and warns about non-English characters
     retry_sys = calls[1][0]["content"]
@@ -259,7 +265,8 @@ async def test_translator_caps_retry_pass_and_isolates_single_failed_bubble():
     assert "romanize" not in calls[1][0]["content"].lower()
     assert len(memory.get_context("ch-iso")) == 3
 
-    # When >=2 bubbles fail and 1 still fails batch retry, emit "" instead of snowballing retries
+    # When >=2 bubbles fail and 1 still fails batch retry, fall back once to single-bubble retry
+    # before emitting "" (never snowballing beyond 1 single-bubble attempt per remaining bubble).
     batch_calls: list[list[dict[str, str]]] = []
 
     async def stubborn_batch_llm(messages):
@@ -275,8 +282,10 @@ async def test_translator_caps_retry_pass_and_isolates_single_failed_bubble():
         chapter_id="ch-batch-cap",
     )
     assert out2 == {0: "", 1: "The previous leader", 2: "Move out!"}
-    assert len(batch_calls) == 2
+    assert len(batch_calls) == 3  # primary + batch retry + 1 single-bubble fallback for bubble 0
     assert "romanize" not in batch_calls[1][0]["content"].lower()
+    assert '"0"' in batch_calls[2][1]["content"]
+    assert '"1"' not in batch_calls[2][1]["content"]
 
 
 @pytest.mark.asyncio
@@ -333,8 +342,8 @@ def _make_cache_response(translated_text: str, original_text: str = "夢幻団")
     )
 
 
-def test_translation_cache_v4_key_evicts_cjk_and_romaji_and_purges_on_init(tmp_path):
-    assert CACHE_KEY_VERSION == "v4-chunked-en"
+def test_translation_cache_v5_key_evicts_cjk_and_romaji_and_purges_on_init(tmp_path):
+    assert CACHE_KEY_VERSION == "v5-qwen25-natural"
     db_path = tmp_path / "translations.db"
     cache = TranslationCache(db_path, max_entries=20)
 
@@ -654,7 +663,7 @@ def test_chapter_memory_multi_page_formatted_context_and_series_continuity():
 
 
 @pytest.mark.asyncio
-async def test_translator_prompt_omits_story_context_by_default_and_honors_opt_in():
+async def test_translator_prompt_includes_sliding_context_by_default_and_honors_opt_out():
     memory = ChapterMemoryStore()
     memory.set_glossary("ch1", {"藍星": "Ranshin"}, series_id="my-series")
     memory.record_page("ch1", [("どこだ？", "Where are you?")], series_id="my-series")
@@ -664,7 +673,7 @@ async def test_translator_prompt_omits_story_context_by_default_and_honors_opt_i
         captured_default.append(messages)
         return '{"0": "Right here, Ranshin.", "1": "*RUSTLE*"}'
 
-    # Default use_story_context=False: omits [Page -1] Story Context, keeps glossary & floating hints
+    # Default use_story_context=True: includes compact sliding Recent Dialogue Context + glossary + floating hints
     tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm_default)
     out = await tr.translate_page(
         [(0, "ここだよ、藍星"), (1, "カサカサ")],
@@ -676,36 +685,36 @@ async def test_translator_prompt_omits_story_context_by_default_and_honors_opt_i
     assert out == {0: "Right here, Ranshin.", 1: "*RUSTLE*"}
     sys_prompt = captured_default[0][0]["content"]
     usr_prompt = captured_default[0][1]["content"]
-    assert "STRICTLY ENGLISH ONLY" in sys_prompt
+    assert "strictly english only" in sys_prompt.lower()
     assert "[floating]" in sys_prompt
     assert "romanize" not in sys_prompt.lower()
-    assert "[Page -1]" not in usr_prompt
-    assert "Story Context" not in usr_prompt
+    assert "Recent Dialogue Context" in usr_prompt
+    assert "Where are you?" in usr_prompt
     assert '"1": [floating]' in usr_prompt
     assert "Ranshin" in usr_prompt
 
-    # Opt-in use_story_context=True restores [Page -1] Story Context
-    captured_ctx: list[list[dict[str, str]]] = []
+    # Opt-out use_story_context=False omits Recent Dialogue Context
+    captured_no_ctx: list[list[dict[str, str]]] = []
 
-    async def fake_llm_ctx(messages):
-        captured_ctx.append(messages)
+    async def fake_llm_no_ctx(messages):
+        captured_no_ctx.append(messages)
         return '{"0": "Right here, Ranshin.", "1": "*RUSTLE*"}'
 
-    tr_ctx = DialogueTranslator(
+    tr_no_ctx = DialogueTranslator(
         "http://127.0.0.1:8766",
         memory,
-        llm_caller=fake_llm_ctx,
-        cfg=SimpleNamespace(use_story_context=True, llm_chunk_size=10),
+        llm_caller=fake_llm_no_ctx,
+        cfg=SimpleNamespace(use_story_context=False, llm_chunk_size=10),
     )
-    await tr_ctx.translate_page(
+    await tr_no_ctx.translate_page(
         [(0, "ここだよ、藍星"), (1, "カサカサ")],
         lang="ja",
         chapter_id="ch2",
         series_id="my-series",
         bubble_types={0: "bubble", 1: "floating"},
     )
-    assert "[Page -1]" in captured_ctx[0][1]["content"]
-    assert "Where are you?" in captured_ctx[0][1]["content"]
+    assert "Recent Dialogue Context" not in captured_no_ctx[0][1]["content"]
+    assert "Where are you?" not in captured_no_ctx[0][1]["content"]
 
 
 @pytest.mark.asyncio
@@ -743,7 +752,11 @@ async def test_translator_chunks_25_bubbles_with_sampling_params_and_thermal_gua
 
     memory = ChapterMemoryStore()
     memory.record_page("ch-chunk", [("前のページ", "Previous page line")])
-    cfg = SimpleNamespace(use_story_context=False, llm_chunk_size=10)
+    cfg = SimpleNamespace(
+        use_story_context=False,
+        llm_chunk_size=10,
+        llm_filename="Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf",
+    )
     tr = DialogueTranslator("http://127.0.0.1:8766", memory, cfg=cfg)
 
     bubbles = [(i, f"台詞{i}") for i in range(25)]
@@ -755,12 +768,12 @@ async def test_translator_chunks_25_bubbles_with_sampling_params_and_thermal_gua
 
     expected_max_tokens = [560, 560, 280]  # min(640, max(160, n * 56))
     for payload, exp_max in zip(seen_payloads, expected_max_tokens):
-        assert payload["temperature"] == 0.2
-        assert payload["top_p"] == 0.85
-        assert payload["repeat_penalty"] == 1.12
+        assert payload["temperature"] == DEFAULT_TEMPERATURE == 0.3
+        assert payload["top_p"] == DEFAULT_TOP_P == 0.9
+        assert payload["repeat_penalty"] == DEFAULT_REPEAT_PENALTY == 1.05
         assert payload["max_tokens"] == exp_max
-        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-        assert "[Page -1]" not in payload["messages"][1]["content"]
+        assert "chat_template_kwargs" not in payload
+        assert "Recent Dialogue Context" not in payload["messages"][1]["content"]
 
 
 @pytest.mark.asyncio
@@ -792,7 +805,7 @@ async def test_translator_cancel_event_aborts_remaining_chunks():
 
 
 @pytest.mark.asyncio
-async def test_llama_http_payload_disables_thinking_and_sends_sampling_params(monkeypatch):
+async def test_llama_http_payload_conditional_qwen3_thinking_and_sampling_params(monkeypatch):
     import httpx
 
     seen_payloads: list[dict[str, object]] = []
@@ -820,17 +833,189 @@ async def test_llama_http_payload_disables_thinking_and_sends_sampling_params(mo
 
     monkeypatch.setattr(httpx, "AsyncClient", patched_client)
 
-    tr = DialogueTranslator("http://127.0.0.1:8766", ChapterMemoryStore())
-    raw = await tr._call_llama([{"role": "user", "content": "hi"}], max_tokens=280)
+    # Non-Qwen3 (Qwen2.5) must NOT send chat_template_kwargs
+    tr_qwen25 = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        ChapterMemoryStore(),
+        cfg=SimpleNamespace(llm_filename="Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"),
+    )
+    raw = await tr_qwen25._call_llama([{"role": "user", "content": "hi"}], max_tokens=280)
     assert raw == '{"0": "Hello"}'
-
-    chunks = [c async for c in tr._call_llama_stream([{"role": "user", "content": "hi"}], max_tokens=280)]
+    chunks = [c async for c in tr_qwen25._call_llama_stream([{"role": "user", "content": "hi"}], max_tokens=280)]
     assert "".join(chunks) == '{"0": "Hello"}'
 
     assert len(seen_payloads) == 2
     for payload in seen_payloads:
         assert payload["max_tokens"] == 280
-        assert payload["temperature"] == 0.2
-        assert payload["top_p"] == 0.85
-        assert payload["repeat_penalty"] == 1.12
+        assert payload["temperature"] == 0.3
+        assert payload["top_p"] == 0.9
+        assert payload["repeat_penalty"] == 1.05
+        assert "chat_template_kwargs" not in payload
+
+    # Qwen3 MUST send chat_template_kwargs={"enable_thinking": False}
+    seen_payloads.clear()
+    tr_qwen3 = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        ChapterMemoryStore(),
+        cfg=SimpleNamespace(llm_filename="mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"),
+    )
+    await tr_qwen3._call_llama([{"role": "user", "content": "hi"}], max_tokens=280)
+    _ = [c async for c in tr_qwen3._call_llama_stream([{"role": "user", "content": "hi"}], max_tokens=280)]
+    assert len(seen_payloads) == 2
+    for payload in seen_payloads:
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_normalize_ocr_clean_candidate_and_dot_dot_hallucination_rejection():
+    assert _normalize_ocr_for_llm("まさき．．．！！") == "まさき...!!"
+    assert _normalize_ocr_for_llm("．．．すき") == "...すき"
+    assert _normalize_ocr_for_llm("カサ・・・") == "カサ..."
+    assert _normalize_ocr_for_llm("テスト。。") == "テスト..."
+    assert _normalize_ocr_for_llm("藍星……？") == "藍星...?"
+    # Single middle dot / period must be preserved
+    assert _normalize_ocr_for_llm("フーメン・餃子") == "フーメン・餃子"
+    assert _normalize_ocr_for_llm("そうだ。") == "そうだ。"
+
+    # Trailing {} artifacts stripped cleanly
+    assert _clean_candidate("Nnn...{}") == "Nnn..."
+    assert _clean_candidate("Mmh... { } ") == "Mmh..."
+    assert _clean_candidate("{}") == ""
+    assert _sanitize_translation_candidate("んん．．．", "Nnn...{}") == ("Nnn...", True)
+    assert _sanitize_translation_candidate("んん．．．", "{}") == ("", False)
+
+    # Literal "dot dot" hallucination rejected when source contains ellipsis
+    assert is_valid_english_translation("．．．すき", "Dot dot like") is False
+    assert is_valid_english_translation("．．．うん", "Dot dot dot un") is False
+    assert is_valid_english_translation("…すき", "dot dot love") is False
+    assert is_valid_english_translation("．．．すき", "...I love you.") is True
+    # No ellipsis in source -> "dot" phrasing not falsely rejected
+    assert is_valid_english_translation("ドット柄", "Dot dot pattern") is True
+
+
+def test_extract_character_names_captures_names_without_english_false_positives():
+    pairs = [
+        ("まさき．．．！！", "Masaki...!!"),
+        ("琴音ちゃんって将暉の何なの？", "What is Kotone-chan to Masaki?"),
+        ("夢幻団", "Phantom Troupe"),
+        ("ちょっと待って", "Wait a second!"),
+        ("ぎゃああああっ！", "GYAAAAAH!"),
+        ("カサカサ", "*RUSTLE*"),
+        ("ここだよ、藍星", "Right here, Ranshin."),
+        ("ナナスを団長に選んだ", "They chose Nanasu as leader."),
+    ]
+    names = extract_character_names(pairs)
+    assert "Masaki" in names
+    assert "Kotone" in names
+    assert "Ranshin" in names
+    assert "Nanasu" in names
+    for non_name in ("Phantom", "Troupe", "Wait", "GYAAAAAH", "RUSTLE", "What", "Right", "They"):
+        assert non_name not in names
+
+
+@pytest.mark.asyncio
+async def test_sliding_6_pair_context_and_intra_page_chunk_carryover_preserves_names():
+    memory = ChapterMemoryStore()
+    # Seed 12 prior pairs; only the latest 6 should enter chunk 0
+    memory.record_page("ch-slide", [(f"昔{i}", f"Old line {i}.") for i in range(12)])
+    captured: list[list[dict[str, str]]] = []
+
+    async def fake_llm(messages):
+        captured.append(messages)
+        user_msg = messages[1]["content"]
+        in_map = json.loads(user_msg[user_msg.rfind("{") :])
+        responses = {
+            "0": "Masaki...!!",
+            "1": "...I love you.",
+            "2": "Me too.",
+            "3": "It's been a while since we did this...",
+            "4": "Wait a second!",
+            "5": "Hold on!",
+            "6": "I had a one-sided crush.",
+            "7": "No way, right? haha",
+            "8": "Bottom tier...",
+            "9": "Masaki?",
+        }
+        return json.dumps({k: responses[k] for k in in_map})
+
+    tr = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_caller=fake_llm,
+        cfg=SimpleNamespace(use_story_context=True, max_context_pairs=6, llm_chunk_size=3),
+    )
+    bubbles = [
+        (0, "まさき．．．！！"),
+        (1, "．．．すき"),
+        (2, "俺も"),
+        (3, "こういうの久々だな．．．"),
+        (4, "ちょっと待って"),
+        (5, "待ってよ"),
+        (6, "片思いしていた"),
+        (7, "なわけねーじゃんｗ"),
+        (8, "三軍っていう部類で"),
+        (9, "将暉？"),
+    ]
+    out = await tr.translate_page(bubbles, lang="ja", chapter_id="ch-slide")
+
+    assert len(captured) == 4  # 3 + 3 + 3 + 1
+    assert out[0] == "Masaki...!!"
+    assert out[9] == "Masaki?"
+
+    # Chunk 0: normalized OCR input AND strictly last 6 prior pairs (Old line 6..11, NOT Old line 0..5)
+    c0_user = captured[0][1]["content"]
+    assert "まさき...!!" in c0_user
+    assert "まさき．．．！！" not in c0_user
+    assert "Old line 6." in c0_user and "Old line 11." in c0_user
+    assert "Old line 5." not in c0_user
+
+    # Chunk 1: intra-page carry-over includes Chunk 0 pairs + Established Character Names: Masaki
+    c1_user = captured[1][1]["content"]
+    assert "Masaki...!!" in c1_user
+    assert "...I love you." in c1_user
+    assert "Established Character Names" in c1_user
+    assert "Masaki" in c1_user
+
+    # Chunk 3 (bubble 9 '将暉？'): even though bubble 0 scrolled past the 6-pair window,
+    # Established Character Names still carries 'Masaki' across chunks!
+    c3_user = captured[3][1]["content"]
+    assert "Established Character Names" in c3_user
+    assert "Masaki" in c3_user
+    # Sliding window stays capped at 6 pairs (bubbles 3..8, NOT bubble 0..2)
+    assert "It's been a while since we did this..." in c3_user
+    assert "Bottom tier..." in c3_user
+    assert "...I love you." not in c3_user
+
+
+@pytest.mark.asyncio
+async def test_batch_retry_falls_back_to_single_bubble_with_context_instead_of_dropping():
+    memory = ChapterMemoryStore()
+    calls: list[list[dict[str, str]]] = []
+
+    async def recovering_llm(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            # Primary: 0 succeeds, 1 & 2 fail (dot-dot hallucination + Romaji)
+            return '{"0": "Masaki...!!", "1": "Dot dot like", "2": "Chotto chotto matte"}'
+        if len(calls) == 2:
+            # Batch retry recovers 1, still leaks Romaji on 2
+            return '{"1": "...I love you.", "2": "Chotto matte"}'
+        # Single-bubble fallback recovers 2 instead of silently dropping to ""
+        return '{"2": "W-Wait a second!"}'
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=recovering_llm)
+    out = await tr.translate_page(
+        [(0, "まさき．．．！！"), (1, "．．．すき"), (2, "ちょつちょっと待って")],
+        lang="ja",
+        chapter_id="ch-recover",
+    )
+
+    assert len(calls) == 3
+    assert out == {
+        0: "Masaki...!!",
+        1: "...I love you.",
+        2: "W-Wait a second!",
+    }
+    # Single-bubble fallback received rolling context from the same chunk
+    single_user = calls[2][1]["content"]
+    assert "Masaki...!!" in single_user
+    assert '"2"' in single_user

@@ -45,7 +45,17 @@ class LlamaServerManager:
         if models_dir.is_dir():
             ggufs = sorted(p for p in models_dir.rglob("*.gguf") if p.is_file())
             if ggufs:
-                pattern = self.cfg.llm_filename_pattern
+                target_name = str(getattr(self.cfg, "llm_filename", "") or "").strip()
+                pattern = str(getattr(self.cfg, "llm_filename_pattern", "") or "").strip()
+                # If caller overrode pattern without matching target_name, honor pattern first.
+                if pattern and (not target_name or not fnmatch.fnmatch(target_name.lower(), pattern.lower())):
+                    for path in ggufs:
+                        if fnmatch.fnmatch(path.name.lower(), pattern.lower()):
+                            return path
+                if target_name:
+                    for path in ggufs:
+                        if path.name.lower() == target_name.lower():
+                            return path
                 if pattern:
                     for path in ggufs:
                         if fnmatch.fnmatch(path.name.lower(), pattern.lower()):
@@ -80,7 +90,18 @@ class LlamaServerManager:
         ctx_size = min(raw_ctx, 4096) if raw_ctx > 0 else 2048
         batch_size = max(1, int(getattr(self.cfg, "llm_batch_size", 256)))
         requested_layers = int(getattr(self.cfg, "llm_gpu_layers", 99))
-        gpu_layers = self.gpu_guard.choose_safe_gpu_layers(requested_layers)
+        estimated_model_mb = (
+            int(model_path.stat().st_size / (1024 * 1024)) + 200
+            if model_path.is_file()
+            else 4500
+        )
+        fname = model_path.name.lower()
+        total_layers = 29 if "qwen2.5-7b" in fname else 37
+        gpu_layers = self.gpu_guard.choose_safe_gpu_layers(
+            requested_layers,
+            total_layers=total_layers,
+            estimated_model_mb=estimated_model_mb,
+        )
         cmd = [
             str(exe_path),
             "--model",
@@ -99,12 +120,13 @@ class LlamaServerManager:
             str(batch_size),
             "--parallel",
             "1",
-            "--reasoning",
-            "off",
             "--flash-attn",
             "on",
             "--cache-prompt",
         ]
+        cfg_llm_filename = str(getattr(self.cfg, "llm_filename", "") or "").lower()
+        if "qwen3" in cfg_llm_filename:
+            cmd.extend(["--reasoning", "off"])
         kv_type = str(getattr(self.cfg, "llm_kv_cache_type", "") or "").strip()
         if kv_type:
             cmd.extend(["-ctk", kv_type, "-ctv", kv_type])

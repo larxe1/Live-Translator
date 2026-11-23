@@ -254,7 +254,7 @@ class BubbleDetector:
         model_id: str = "ogkalu/comic-text-and-bubble-detector",
         device: str = "cuda",
         score_threshold: float = 0.30,
-        min_free_vram_mb: int = 1024,
+        min_free_vram_mb: int = 650,
     ) -> None:
         self.model_id = model_id
         self.device = device

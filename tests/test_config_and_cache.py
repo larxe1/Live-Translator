@@ -8,7 +8,7 @@ from pathlib import Path
 
 from server.cache import TranslationCache
 from server.config import AppConfig, enforce_d_drive_env, load_config
-from server.schemas import Box, BubbleResult, TranslateResponse
+from server.schemas import Box, BubbleResult, TranslateRequest, TranslateResponse
 from server.translator.llama_manager import LlamaServerManager
 
 
@@ -57,16 +57,18 @@ def test_enforce_d_drive_env_sets_all_caches_under_project_root(tmp_path: Path, 
     assert cfg.host == "127.0.0.1"
     assert cfg.port == 8765
     assert cfg.llama_port == 8766
-    assert cfg.llm_repo_id == "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
-    assert cfg.llm_filename_pattern == "*Qwen3-8B*Q4_K_M*.gguf"
+    assert cfg.llm_repo_id == "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF"
+    assert cfg.llm_filename == "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    assert cfg.llm_filename_pattern == "*Qwen2.5-7B*Q4_K_M*.gguf"
     assert cfg.llm_gpu_layers == 99
     assert cfg.llm_ctx_size == 2048
     assert cfg.llm_kv_cache_type == "q8_0"
     assert cfg.llm_batch_size == 256
-    assert cfg.llm_chunk_size == 10
-    assert cfg.use_story_context is False
-    assert cfg.gpu_min_free_vram_mb == 1024
-    assert cfg.gpu_llama_headroom_mb == 600
+    assert cfg.llm_chunk_size == 12
+    assert cfg.use_story_context is True
+    assert cfg.max_context_pairs == 6
+    assert cfg.gpu_min_free_vram_mb == 650
+    assert cfg.gpu_llama_headroom_mb == 550
     assert cfg.gpu_temp_soft_c == 78
     assert cfg.gpu_temp_hard_c == 84
     assert cfg.gpu_temp_resume_c == 76
@@ -79,17 +81,22 @@ def test_enforce_d_drive_env_sets_all_caches_under_project_root(tmp_path: Path, 
     assert cfg.idle_unload_minutes == 3
 
 
-def test_repo_config_json_has_qwen3_defaults() -> None:
+def test_repo_config_json_has_qwen25_defaults() -> None:
     cfg = load_config()
-    assert cfg.llm_repo_id == "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
-    assert cfg.llm_filename_pattern == "*Qwen3-8B*Q4_K_M*.gguf"
+    assert cfg.llm_repo_id == "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF"
+    assert cfg.llm_filename == "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    assert cfg.llm_filename_pattern == "*Qwen2.5-7B*Q4_K_M*.gguf"
     assert cfg.llm_gpu_layers == 99
     assert cfg.llm_ctx_size == 2048
     assert cfg.llm_kv_cache_type == "q8_0"
     assert cfg.llm_batch_size == 256
-    assert cfg.llm_chunk_size == 10
-    assert cfg.use_story_context is False
+    assert cfg.llm_chunk_size == 12
+    assert cfg.use_story_context is True
+    assert cfg.max_context_pairs == 6
+    assert cfg.gpu_min_free_vram_mb == 650
+    assert cfg.gpu_llama_headroom_mb == 550
     assert cfg.idle_unload_minutes == 3
+    assert TranslateRequest(image_base64="abc").include_floating is False
 
 
 def test_load_config_reads_custom_json_overrides(tmp_path: Path) -> None:
@@ -185,7 +192,7 @@ def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path, monkeypat
     )
 
     exe = tmp_path / "bin" / "llama-cpp" / "llama-server.exe"
-    gguf = tmp_path / "models" / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
+    gguf = tmp_path / "models" / "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
 
     cfg_default = AppConfig(project_root=tmp_path)
     cmd_default = LlamaServerManager(cfg_default).build_command(exe, gguf)
@@ -201,12 +208,20 @@ def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path, monkeypat
         ("-ctk", "q8_0"),
         ("-ctv", "q8_0"),
         ("--parallel", "1"),
-        ("--reasoning", "off"),
         ("--flash-attn", "on"),
     ]:
         idx = cmd_default.index(flag)
         assert cmd_default[idx + 1] == val
     assert "--cache-prompt" in cmd_default
+    assert "--reasoning" not in cmd_default
+
+    cfg_qwen3 = AppConfig(
+        project_root=tmp_path,
+        llm_filename="mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf",
+    )
+    gguf_qwen3 = tmp_path / "models" / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
+    cmd_qwen3 = LlamaServerManager(cfg_qwen3).build_command(exe, gguf_qwen3)
+    assert cmd_qwen3[cmd_qwen3.index("--reasoning") + 1] == "off"
 
     cfg_4096 = AppConfig(project_root=tmp_path, llm_ctx_size=4096)
     cmd_4096 = LlamaServerManager(cfg_4096).build_command(exe, gguf)
@@ -219,19 +234,51 @@ def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path, monkeypat
     assert "-ctv" not in cmd_8192
 
 
+def test_llama_manager_estimates_vram_and_layers_from_gguf(tmp_path: Path, monkeypatch) -> None:
+    seen: list[tuple[int, int, int]] = []
+
+    class FakeGuard:
+        def choose_safe_gpu_layers(
+            self,
+            requested_layers: int,
+            total_layers: int = 37,
+            estimated_model_mb: int = 4850,
+        ) -> int:
+            seen.append((requested_layers, total_layers, estimated_model_mb))
+            return requested_layers
+
+    exe = tmp_path / "bin" / "llama-cpp" / "llama-server.exe"
+    models_dir = tmp_path / "models"
+    models_dir.mkdir(parents=True)
+
+    missing_qwen25 = models_dir / "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    mgr = LlamaServerManager(AppConfig(project_root=tmp_path), gpu_guard=FakeGuard())
+    mgr.build_command(exe, missing_qwen25)
+    assert seen[-1] == (99, 29, 4500)
+
+    existing_qwen3 = models_dir / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
+    existing_qwen3.write_bytes(b"\x00" * (10 * 1024 * 1024))
+    mgr_qwen3 = LlamaServerManager(
+        AppConfig(project_root=tmp_path, llm_filename=existing_qwen3.name),
+        gpu_guard=FakeGuard(),
+    )
+    mgr_qwen3.build_command(exe, existing_qwen3)
+    assert seen[-1] == (99, 37, 210)
+
+
 def test_llama_manager_resolve_model_path_pattern_priority_and_fallback(tmp_path: Path) -> None:
     models_dir = tmp_path / "models"
     models_dir.mkdir(parents=True)
 
-    legacy = models_dir / "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
-    legacy.write_bytes(b"legacy")
+    qwen3 = models_dir / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
+    qwen3.write_bytes(b"qwen3")
 
     cfg = AppConfig(project_root=tmp_path)
     mgr = LlamaServerManager(cfg)
-    # Graceful fallback to ggufs[0] when pattern does not match yet
-    assert mgr.resolve_model_path() == legacy
-
-    qwen3 = models_dir / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
-    qwen3.write_bytes(b"qwen3")
-    # Pattern match takes priority over earlier alphabetical legacy file
+    # Graceful fallback to ggufs[0] when default Qwen2.5 file is absent
     assert mgr.resolve_model_path() == qwen3
+
+    qwen25 = models_dir / "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    qwen25.write_bytes(b"qwen25")
+    # Default Qwen2.5 match takes priority over Qwen3 regardless of sort order
+    assert mgr.resolve_model_path() == qwen25

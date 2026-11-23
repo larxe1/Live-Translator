@@ -3,6 +3,7 @@
 
   const MAX_LOOKAHEAD = 1;
   const DEFAULT_PRELOAD_WHOLE_CHAPTER = false;
+  const DEFAULT_INCLUDE_FLOATING = false;
   const MAX_PAGE_CACHE = 50;
 
   function isDomainEnabled(hostname, enabledDomains) {
@@ -257,7 +258,7 @@
     let enabled = false;
     let contextInvalidated = false;
     let langMode = "auto";
-    let includeFloating = true;
+    let includeFloating = DEFAULT_INCLUDE_FLOATING;
     let glossariesBySeries = null;
     let flatGlossary = {};
     let glossary = {};
@@ -1090,6 +1091,24 @@
             }
             if (!evt || typeof evt !== "object") return;
 
+            if (evt.type === "status") {
+              if (evt.stage === "ocr") {
+                const totalR = Number(evt.total) || 0;
+                const doneR = Number(evt.done) || 0;
+                if (totalR > 0) {
+                  showPageLoadingBadge(
+                    el,
+                    doneR === 0
+                      ? `Reading text (${totalR})...`
+                      : `Reading text ${doneR}/${totalR}...`
+                  );
+                } else {
+                  showPageLoadingBadge(el, "Reading text...");
+                }
+              }
+              return;
+            }
+
             if (evt.type === "meta") {
               meta = evt;
               const count = Array.isArray(evt.bubbles) ? evt.bubbles.length : 0;
@@ -1490,7 +1509,7 @@
         "preloadWholeChapter",
       ]);
       langMode = data?.langMode || "auto";
-      includeFloating = data?.includeFloating !== false;
+      includeFloating = data?.includeFloating === true;
       if (!hasExplicitPreloadDep) {
         preloadWholeChapter = data?.preloadWholeChapter === true;
       }
@@ -1513,7 +1532,7 @@
         shouldRetranslate = true;
       }
       if (changes.includeFloating) {
-        const nextFloating = changes.includeFloating.newValue !== false;
+        const nextFloating = changes.includeFloating.newValue === true;
         if (nextFloating !== includeFloating) {
           includeFloating = nextFloating;
           shouldRetranslate = true;
@@ -1773,6 +1792,7 @@
   const exportsApi = {
     MAX_LOOKAHEAD,
     DEFAULT_PRELOAD_WHOLE_CHAPTER,
+    DEFAULT_INCLUDE_FLOATING,
     MAX_PAGE_CACHE,
     isDomainEnabled,
     deriveSeriesId,

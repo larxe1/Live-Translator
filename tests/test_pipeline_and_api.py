@@ -408,12 +408,19 @@ def test_api_translate_stream_ndjson_miss_and_cache_hit(tmp_path: Path) -> None:
             assert resp1.headers["content-type"].startswith("application/x-ndjson")
             events1 = [json.loads(line) for line in resp1.iter_lines() if line.strip()]
 
-        assert events1[0]["type"] == "meta"
-        assert events1[0]["lang"] == "ja"
-        assert len(events1[0]["bubbles"]) == 2
-        assert isinstance(events1[0]["bubbles"][0]["bbox"], list)
-        assert len(events1[0]["bubbles"][0]["bbox"]) == 4
-        assert "translated" not in events1[0]["bubbles"][0]
+        status_events1 = [e for e in events1 if e["type"] == "status"]
+        assert status_events1 == [
+            {"type": "status", "stage": "ocr", "done": 0, "total": 3},
+            {"type": "status", "stage": "ocr", "done": 3, "total": 3},
+        ]
+        meta_idx1 = next(i for i, e in enumerate(events1) if e["type"] == "meta")
+        assert meta_idx1 == len(status_events1)
+        meta_ev1 = events1[meta_idx1]
+        assert meta_ev1["lang"] == "ja"
+        assert len(meta_ev1["bubbles"]) == 2
+        assert isinstance(meta_ev1["bubbles"][0]["bbox"], list)
+        assert len(meta_ev1["bubbles"][0]["bbox"]) == 4
+        assert "translated" not in meta_ev1["bubbles"][0]
 
         bubble_events1 = [e for e in events1 if e["type"] == "bubble"]
         assert [(e["id"], e["translated"], e["final"]) for e in bubble_events1] == [
@@ -684,7 +691,9 @@ def test_api_region_type_floating_toggle_series_glossary_and_lookup(
         ) as resp:
             assert resp.status_code == 200
             events = [json.loads(line) for line in resp.iter_lines() if line.strip()]
-        assert [b["region_type"] for b in events[0]["bubbles"]] == ["bubble", "floating"]
+        assert events[0] == {"type": "status", "stage": "ocr", "done": 0, "total": 2}
+        meta_ev = next(e for e in events if e["type"] == "meta")
+        assert [b["region_type"] for b in meta_ev["bubbles"]] == ["bubble", "floating"]
         assert [b["region_type"] for b in events[-1]["response"]["bubbles"]] == ["bubble", "floating"]
 
         # Multipart /translate with include_floating=false omits floating regions
@@ -825,3 +834,102 @@ async def test_pipeline_wires_gpu_guard_into_stages_and_translator(tmp_path: Pat
     assert len(guard_calls) >= 3
     assert all(guard_calls)
     assert seen_guard_in_translator == [fake_guard]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_stream_emits_incremental_ocr_status_events_and_cancels_between_slices(
+    tmp_path: Path,
+) -> None:
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=20)
+    dets = [
+        RawDetection(
+            Box(x1=10 + (i % 5) * 40, y1=10 + (i // 5) * 40, x2=40 + (i % 5) * 40, y2=40 + (i // 5) * 40),
+            "bubble",
+            0.95,
+        )
+        for i in range(20)
+    ]
+    detector = _FakeDetector(detections=dets)
+
+    class _SliceCountingOcr:
+        def __init__(self) -> None:
+            self.slice_sizes: list[int] = []
+
+        def read_page_bubbles(self, crops, lang_hint="auto", aspect_ratio=1.0):
+            self.slice_sizes.append(len(crops))
+            resolved = "ko" if lang_hint == "ko" else "ja"
+            return resolved, [f"台詞{i}" for i in range(len(crops))]
+
+    ocr = _SliceCountingOcr()
+    translator = _FakeTranslator(memory)
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=translator,
+        memory=memory,
+        cache=cache,
+    )
+    await pipeline.start()
+
+    img_bytes = _make_sample_png_bytes()
+    events = [
+        ev
+        async for ev in pipeline.translate_image_stream(
+            img_bytes,
+            lang="ja",
+            chapter_id="ch-ocr-stream",
+        )
+    ]
+    status_events = [e for e in events if e["type"] == "status"]
+    assert status_events == [
+        {"type": "status", "stage": "ocr", "done": 0, "total": 20},
+        {"type": "status", "stage": "ocr", "done": 8, "total": 20},
+        {"type": "status", "stage": "ocr", "done": 16, "total": 20},
+        {"type": "status", "stage": "ocr", "done": 20, "total": 20},
+    ]
+    assert ocr.slice_sizes == [8, 8, 4]
+    meta_idx = next(i for i, e in enumerate(events) if e["type"] == "meta")
+    assert meta_idx == len(status_events)
+    assert events[-1]["type"] == "done"
+    assert len(events[-1]["response"]["bubbles"]) == 20
+
+    # Cancelling during OCR slice 1 aborts immediately before remaining OCR slices or translation
+    cache.clear()
+    ocr_cancel_calls = 0
+    slice1_started = asyncio.Event()
+    slice1_release = asyncio.Event()
+
+    class _SlowCancelOcr:
+        async def read_page_bubbles(self, crops, lang_hint="auto", aspect_ratio=1.0):
+            nonlocal ocr_cancel_calls
+            ocr_cancel_calls += 1
+            if ocr_cancel_calls == 1:
+                slice1_started.set()
+                await slice1_release.wait()
+            return "ja", [f"台詞{i}" for i in range(len(crops))]
+
+    translator2 = _FakeTranslator(memory)
+    pipeline2 = TranslationPipeline(
+        detector=detector,
+        ocr=_SlowCancelOcr(),
+        translator=translator2,
+        memory=memory,
+        cache=cache,
+    )
+    await pipeline2.start()
+
+    task = asyncio.create_task(
+        pipeline2.translate_image(img_bytes, lang="ja", chapter_id="ch-ocr-cancel", request_id="ocr-req-1")
+    )
+    await asyncio.wait_for(slice1_started.wait(), timeout=2.0)
+    pipeline2.cancel_request("ocr-req-1")
+    slice1_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await pipeline.stop()
+    await pipeline2.stop()
+    assert ocr_cancel_calls == 1
+    assert translator2.calls == 0

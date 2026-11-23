@@ -42,7 +42,7 @@ class TranslateRequest(BaseModel):
     priority: int = 0
     glossary: dict[str, str] = Field(default_factory=dict)
     request_id: str | None = None
-    include_floating: bool = True
+    include_floating: bool = False
     series_id: str | None = None
 
 

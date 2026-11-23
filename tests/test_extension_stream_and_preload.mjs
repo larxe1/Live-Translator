@@ -860,7 +860,6 @@ test("9. content controller forwards seriesId & includeFloating, resolves per-se
         return {
           enabledDomains: { "example.com": true },
           langMode: "ja",
-          includeFloating: true,
           glossary: { "Global": "Fallback" },
           glossariesBySeries: {
             "example.com/manga/blue-box": { "大喜": "Taiki" },
@@ -904,19 +903,19 @@ test("9. content controller forwards seriesId & includeFloating, resolves per-se
 
   assert.equal(startPayloads.length, 1);
   assert.equal(startPayloads[0].seriesId, "example.com/manga/blue-box");
-  assert.equal(startPayloads[0].includeFloating, true);
+  assert.equal(startPayloads[0].includeFloating, false);
   assert.deepEqual(startPayloads[0].glossary, { "大喜": "Taiki" });
 
-  // Toggle includeFloating to false -> cache key misses and triggers fresh retranslation
+  // Toggle includeFloating to true -> cache key misses and triggers fresh retranslation
   usePort = false;
   controller.handleStorageChanges({
-    includeFloating: { oldValue: true, newValue: false },
+    includeFloating: { oldValue: false, newValue: true },
   });
   await new Promise((r) => setTimeout(r, 25));
 
   assert.equal(fallbackPayloads.length, 1);
   assert.equal(fallbackPayloads[0].seriesId, "example.com/manga/blue-box");
-  assert.equal(fallbackPayloads[0].includeFloating, false);
+  assert.equal(fallbackPayloads[0].includeFloating, true);
   assert.deepEqual(fallbackPayloads[0].glossary, { "大喜": "Taiki" });
 });
 
@@ -1348,11 +1347,14 @@ test("13. Storage toggle of preloadWholeChapter from true to false cancels offsc
 
 test("14. popup GPU guard & temperature rendering handles absent, ok, throttled, and paused states", () => {
   assert.equal(popup.DEFAULT_PRELOAD_WHOLE_CHAPTER, false);
+  assert.equal(popup.DEFAULT_INCLUDE_FLOATING, false);
 
   const popupHtml = fs.readFileSync(path.join(EXT_DIR, "popup.html"), "utf8");
   assert.match(popupHtml, /id="gpuGuardNotice"/);
   assert.match(popupHtml, /id="preloadToggle"/);
   assert.equal(/id="preloadToggle"[^>]*checked/.test(popupHtml), false);
+  assert.match(popupHtml, /id="floatingToggle"/);
+  assert.equal(/id="floatingToggle"[^>]*checked/.test(popupHtml), false);
 
   const makeDom = () => ({
     statusDot: { className: "" },
@@ -1431,4 +1433,86 @@ test("14. popup GPU guard & temperature rendering handles absent, ok, throttled,
   assert.equal(domLoading.statusText.textContent, "Loading LLM...");
   assert.equal(domLoading.statusVram.textContent, "");
   assert.equal(domLoading.gpuGuardNotice.hidden, true);
+});
+
+test("15. stream OCR status events update per-image loading badge before meta arrives", async () => {
+  assert.equal(content.DEFAULT_INCLUDE_FLOATING, false);
+
+  const { doc, win } = createMinimalDom("https://mangadex.org/chapter/99");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/ocr-progress.jpg";
+  doc.body.appendChild(img);
+
+  const badgeLabels = [];
+  const getBadgeText = () => {
+    const badges = doc.body.children.filter((c) => c.className === "mlt-page-loading");
+    return badges.length > 0 ? badges[0].children[1].textContent : "";
+  };
+
+  let emitEvents = null;
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          badgeLabels.push(getBadgeText());
+          emitEvents = () => {
+            for (const fn of listeners) fn({ type: "status", stage: "ocr", done: 0, total: 40 });
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) fn({ type: "status", stage: "ocr", done: 8, total: 40 });
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [{ id: 0, bbox: [0, 0, 100, 100] }] });
+            }
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) fn({ type: "bubble", id: 0, translated: "Hello!", final: true });
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) {
+              fn({
+                type: "done",
+                response: {
+                  lang: "ja",
+                  width: 800,
+                  height: 1200,
+                  bubbles: [{ id: 0, bbox: [0, 0, 100, 100], translated: "Hello!" }],
+                },
+              });
+            }
+          };
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  assert.equal(typeof emitEvents, "function");
+  emitEvents();
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.deepEqual(badgeLabels, [
+    "Translating...",
+    "Reading text (40)...",
+    "Reading text 8/40...",
+    "Translating 0/1...",
+    "Translating 1/1...",
+  ]);
+  assert.equal(getBadgeText(), "");
 });

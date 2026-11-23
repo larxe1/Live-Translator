@@ -257,9 +257,10 @@ def test_detector_uses_gpu_guard_headroom(monkeypatch) -> None:
         lambda *args, **kwargs: FakeModel(),
     )
 
-    det = BubbleDetector(device="cuda", min_free_vram_mb=1024)
+    det = BubbleDetector(device="cuda")
+    assert det.min_free_vram_mb == 650
     det.load()
-    assert seen_thresholds == [1024]
+    assert seen_thresholds == [650]
     assert det._runtime_device == "cpu"
     assert det._use_fp16 is False
     assert torch is not None

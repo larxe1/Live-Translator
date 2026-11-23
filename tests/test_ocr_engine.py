@@ -134,12 +134,20 @@ def test_load_ja_converts_model_to_fp16_on_cuda_and_preserves_offline_fallback(m
             self.last_input_dtype = t.dtype
             return "テスト"
 
-    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
-    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: True)
+    seen_thresholds: list[int] = []
 
-    engine = OcrEngine(device="cuda", min_free_vram_mb=1024)
+    def fake_headroom(min_free_mb: int) -> bool:
+        seen_thresholds.append(min_free_mb)
+        return True
+
+    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", fake_headroom)
+
+    engine = OcrEngine(device="cuda")
+    assert engine.min_free_vram_mb == 650
     engine.load_ja()
 
+    assert seen_thresholds == [650]
     assert attempts == [(False, "1"), (False, None)]
     assert engine._ja_fp16 is True
     assert engine._ja_ocr.model.dtype == "fp16"
@@ -173,7 +181,7 @@ def test_load_ja_falls_back_to_fp32_when_fp16_fails(monkeypatch):
     monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
     monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: True)
 
-    engine = OcrEngine(device="cuda", min_free_vram_mb=1024)
+    engine = OcrEngine(device="cuda")
     engine.load_ja()
 
     assert engine._ja_fp16 is False
@@ -182,6 +190,11 @@ def test_load_ja_falls_back_to_fp32_when_fp16_fails(monkeypatch):
 
 def test_load_ja_uses_cpu_when_vram_headroom_insufficient(monkeypatch):
     seen: list[bool] = []
+    seen_thresholds: list[int] = []
+
+    def fake_headroom(min_free_mb: int) -> bool:
+        seen_thresholds.append(min_free_mb)
+        return False
 
     class FakeMangaOcr:
         def __init__(self, force_cpu: bool = False) -> None:
@@ -189,9 +202,10 @@ def test_load_ja_uses_cpu_when_vram_headroom_insufficient(monkeypatch):
             self.model = None
 
     monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
-    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: False)
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", fake_headroom)
 
-    engine = OcrEngine(device="cuda", min_free_vram_mb=1024)
+    engine = OcrEngine(device="cuda")
     engine.load_ja()
+    assert seen_thresholds == [650]
     assert seen == [True]
     assert engine._ja_fp16 is False

@@ -1130,3 +1130,56 @@ test("17. streaming addBubble without upfront meta re-clamps previously expanded
 
   session.destroy();
 });
+
+test("18. content controller defaults includeFloating to false and honors explicit true opt-in", async () => {
+  assert.equal(content.DEFAULT_INCLUDE_FLOATING, false);
+
+  const runWithStoredFloating = async (storedFloating) => {
+    const doc = createMockDocument();
+    const win = createMockWindow(doc, "https://mangadex.org/chapter/42");
+    const img = doc.createElement("img");
+    img.src = "https://cdn.example.org/p1.jpg";
+    img.width = 800;
+    img.height = 1200;
+    img.naturalWidth = 800;
+    img.naturalHeight = 1200;
+    doc.body.appendChild(img);
+
+    const payloads = [];
+    const controller = content.createPageController({
+      document: doc,
+      window: win,
+      hostname: "mangadex.org",
+      storage: {
+        async get() {
+          const base = { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+          if (storedFloating !== undefined) base.includeFloating = storedFloating;
+          return base;
+        },
+      },
+      sendMessage: async (msg) => {
+        if (msg.type === "TRANSLATE_IMAGE") {
+          payloads.push(msg);
+          return { ok: true, data: { lang: "ja", width: 800, height: 1200, bubbles: [] } };
+        }
+        return { ok: true };
+      },
+      overlayApi: overlay,
+      MutationObserver: null,
+      IntersectionObserver: null,
+    });
+
+    await controller.init();
+    controller.setVisibility(img, true);
+    await controller.refreshVisibleAndLookahead();
+    return payloads;
+  };
+
+  const defaultPayloads = await runWithStoredFloating(undefined);
+  assert.equal(defaultPayloads.length, 1);
+  assert.equal(defaultPayloads[0].includeFloating, false);
+
+  const optInPayloads = await runWithStoredFloating(true);
+  assert.equal(optInPayloads.length, 1);
+  assert.equal(optInPayloads[0].includeFloating, true);
+});

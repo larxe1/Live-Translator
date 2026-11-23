@@ -18,17 +18,19 @@ class AppConfig:
     port: int = 8765
     llama_port: int = 8766
     detector_model_id: str = "ogkalu/comic-text-and-bubble-detector"
-    llm_repo_id: str = "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
-    llm_filename_pattern: str = "*Qwen3-8B*Q4_K_M*.gguf"
+    llm_repo_id: str = "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF"
+    llm_filename: str = "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    llm_filename_pattern: str = "*Qwen2.5-7B*Q4_K_M*.gguf"
     llm_model_path: Path | None = None
     llm_ctx_size: int = 2048
     llm_gpu_layers: int = 99
     llm_kv_cache_type: str = "q8_0"
     llm_batch_size: int = 256
-    llm_chunk_size: int = 10
-    use_story_context: bool = False
-    gpu_min_free_vram_mb: int = 1024
-    gpu_llama_headroom_mb: int = 600
+    llm_chunk_size: int = 12
+    use_story_context: bool = True
+    max_context_pairs: int = 6
+    gpu_min_free_vram_mb: int = 650
+    gpu_llama_headroom_mb: int = 550
     gpu_temp_soft_c: int = 78
     gpu_temp_hard_c: int = 84
     gpu_temp_resume_c: int = 76
@@ -92,6 +94,18 @@ def load_config(
     if cfg_path.exists():
         raw = json.loads(cfg_path.read_text(encoding="utf-8"))
 
+    raw_filename = raw.get("llm_filename")
+    raw_pattern = raw.get("llm_filename_pattern")
+    if raw_filename is not None:
+        llm_filename = str(raw_filename)
+        llm_filename_pattern = str(raw_pattern if raw_pattern is not None else raw_filename)
+    elif raw_pattern is not None:
+        llm_filename_pattern = str(raw_pattern)
+        llm_filename = llm_filename_pattern
+    else:
+        llm_filename = "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+        llm_filename_pattern = "*Qwen2.5-7B*Q4_K_M*.gguf"
+
     return AppConfig(
         project_root=resolved_root,
         host=str(raw.get("host", "127.0.0.1")),
@@ -101,9 +115,10 @@ def load_config(
             raw.get("detector_model_id", "ogkalu/comic-text-and-bubble-detector")
         ),
         llm_repo_id=str(
-            raw.get("llm_repo_id", "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF")
+            raw.get("llm_repo_id", "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF")
         ),
-        llm_filename_pattern=str(raw.get("llm_filename_pattern", "*Qwen3-8B*Q4_K_M*.gguf")),
+        llm_filename=llm_filename,
+        llm_filename_pattern=llm_filename_pattern,
         llm_model_path=raw.get("llm_model_path"),
         llm_ctx_size=int(raw.get("llm_ctx_size", 2048)),
         llm_gpu_layers=int(raw.get("llm_gpu_layers", 99)),
@@ -113,10 +128,11 @@ def load_config(
             else "q8_0"
         ).strip(),
         llm_batch_size=int(raw.get("llm_batch_size", 256)),
-        llm_chunk_size=int(raw.get("llm_chunk_size", 10)),
-        use_story_context=bool(raw.get("use_story_context", False)),
-        gpu_min_free_vram_mb=int(raw.get("gpu_min_free_vram_mb", 1024)),
-        gpu_llama_headroom_mb=int(raw.get("gpu_llama_headroom_mb", 600)),
+        llm_chunk_size=int(raw.get("llm_chunk_size", 12)),
+        use_story_context=bool(raw.get("use_story_context", True)),
+        max_context_pairs=int(raw.get("max_context_pairs", 6)),
+        gpu_min_free_vram_mb=int(raw.get("gpu_min_free_vram_mb", 650)),
+        gpu_llama_headroom_mb=int(raw.get("gpu_llama_headroom_mb", 550)),
         gpu_temp_soft_c=int(raw.get("gpu_temp_soft_c", 78)),
         gpu_temp_hard_c=int(raw.get("gpu_temp_hard_c", 84)),
         gpu_temp_resume_c=int(raw.get("gpu_temp_resume_c", 76)),

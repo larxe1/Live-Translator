@@ -15,7 +15,7 @@ from server.translator.memory import contains_non_english_cjk, looks_like_romaji
 
 logger = logging.getLogger(__name__)
 
-CACHE_KEY_VERSION = "v4-chunked-en"
+CACHE_KEY_VERSION = "v5-qwen25-natural"
 
 
 def _response_has_non_english_cjk(response: TranslateResponse) -> bool:

@@ -328,6 +328,135 @@ def looks_like_romaji(orig: str, candidate: str) -> bool:
     return False
 
 
+_SFX_SPAN_RE = re.compile(r"\*[^*]+\*")
+_HONORIFIC_NAME_RE = re.compile(
+    r"\b([A-Z][a-z]{2,})-(?:chan|kun|san|sama|senpai|sensei|ssi|nim|hyung|oppa|noona|unnie)\b"
+)
+_MID_SENTENCE_CAP_RE = re.compile(
+    r"(?:(?:^|[\s,(])[a-z]+\s+|,\s+)([A-Z][a-z]{2,})\b"
+)
+_SENTENCE_START_CAP_RE = re.compile(r"(?:^|[.!?]\s+)([A-Z][a-z]{2,})\b")
+_REPEATED_TRIPLE_RE = re.compile(r"(.)\1\1", re.IGNORECASE)
+
+# Common English words that may appear capitalized in dialogue but are not character names.
+_COMMON_ENGLISH_NON_NAMES: frozenset[str] = frozenset(
+    {
+        "the", "and", "but", "for", "nor", "not", "yet", "you", "your", "yours", "she", "her",
+        "hers", "his", "him", "its", "our", "ours", "they", "them", "their", "theirs", "this",
+        "that", "these", "those", "here", "there", "where", "when", "what", "which", "who",
+        "whom", "whose", "why", "how", "all", "any", "both", "each", "few", "more", "most",
+        "other", "some", "such", "only", "own", "same", "than", "too", "very", "just", "now",
+        "then", "once", "ever", "never", "always", "still", "even", "also", "too", "again",
+        "well", "yes", "yeah", "yep", "nah", "nope", "okay", "sure", "fine", "good", "great",
+        "nice", "bad", "sorry", "please", "thanks", "thank", "hello", "hey", "wait", "stop",
+        "hold", "come", "look", "listen", "shut", "move", "run", "get", "let", "don", "can",
+        "won", "isn", "aren", "wasn", "weren", "hasn", "haven", "hadn", "couldn", "wouldn",
+        "shouldn", "mustn", "didn", "doesn", "ain", "really", "actually", "honestly", "maybe",
+        "probably", "perhaps", "definitely", "totally", "seriously", "literally", "basically",
+        "because", "though", "although", "however", "anyway", "besides", "meanwhile", "instead",
+        "nothing", "something", "anything", "everything", "someone", "anyone", "everyone",
+        "nobody", "somebody", "anybody", "everybody", "somewhere", "anywhere", "everywhere",
+        "nowhere", "myself", "yourself", "himself", "herself", "itself", "ourselves",
+        "themselves", "today", "tomorrow", "yesterday", "morning", "afternoon", "evening",
+        "night", "midnight", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+        "sunday", "january", "february", "march", "april", "may", "june", "july", "august",
+        "september", "october", "november", "december", "english", "japanese", "korean",
+        "chinese", "america", "american", "japan", "korea", "china", "tokyo", "kyoto", "osaka",
+        "seoul", "god", "lord", "jesus", "christ", "hell", "damn", "shit", "fuck", "crap",
+        "bitch", "bastard", "idiot", "moron", "fool", "stupid", "crazy", "insane", "weird",
+        "cute", "pretty", "beautiful", "handsome", "cool", "hot", "cold", "warm", "sweet",
+        "dear", "honey", "darling", "baby", "sweetheart", "cutie", "friend", "friends",
+        "brother", "sister", "mother", "father", "mom", "dad", "mama", "papa", "grandpa",
+        "grandma", "uncle", "aunt", "cousin", "husband", "wife", "boyfriend", "girlfriend",
+        "master", "boss", "leader", "captain", "chief", "king", "queen", "prince", "princess",
+        "sir", "miss", "mister", "mrs", "doctor", "professor", "teacher", "student", "sensei",
+        "senpai", "school", "class", "club", "team", "room", "house", "home", "store", "shop",
+        "station", "street", "city", "town", "world", "life", "time", "year", "month", "week",
+        "day", "hour", "minute", "second", "moment", "episode", "chapter", "part", "page",
+        "volume", "title", "end", "continued", "line", "bubble", "text", "voice", "heart",
+        "love", "like", "hate", "want", "need", "know", "think", "feel", "mean", "tell",
+        "give", "take", "make", "keep", "leave", "stay", "back", "down", "away", "out",
+        "off", "over", "under", "into", "onto", "from", "with", "about", "after", "before",
+        "during", "until", "since", "while", "where", "could", "would", "should", "might",
+        "must", "will", "shall", "have", "been", "being", "were", "does", "done", "doing",
+        "going", "gonna", "wanna", "gotta", "whoa", "ouch", "oops", "huh", "heh", "meh",
+        "ugh", "aww", "ooh", "eek", "gasp", "sigh", "gulp", "pant", "huff", "phew", "hmm",
+        "mhm", "mmh", "nnn", "ahh", "uhh", "err", "tch", "tsk", "pfft", "haha", "hehe",
+        "hoho", "hahaha", "lol", "lmao", "omg", "wtf", "phantom", "troupe", "right", "left",
+        "first", "last", "next", "little", "long", "much", "many", "another", "excuse",
+        "pardon", "welcome", "congratulations", "translated", "bottom", "tier", "third",
+        "rate", "junior", "senior", "high", "middle", "dot",
+    }
+)
+
+
+def extract_character_names(
+    pairs: list[tuple[str, str]],
+    existing: list[str] | None = None,
+    max_names: int = 8,
+) -> list[str]:
+    """Extract compact proper character names from (orig, trans) dialogue pairs.
+
+    Preserves first-seen order and deduplicates case-insensitively so earlier
+    kana readings (e.g., ``まさき -> Masaki``) carry into later kanji chunks.
+    """
+    names: list[str] = []
+    seen_lower: set[str] = set()
+
+    def _add(name: str) -> None:
+        cleaned = name.strip()
+        if len(cleaned) < 3:
+            return
+        low = cleaned.lower()
+        if low in seen_lower:
+            return
+        if low in _COMMON_ENGLISH_NON_NAMES or low in _ENGLISH_OR_LOANWORD_MORAIC:
+            return
+        if low in _STRONG_ROMAJI_WORDS or low in _WEAK_ROMAJI_TOKENS:
+            return
+        if _REPEATED_TRIPLE_RE.search(cleaned):
+            return
+        seen_lower.add(low)
+        names.append(cleaned)
+
+    if existing:
+        for item in existing:
+            if len(names) >= max_names:
+                return names
+            _add(item)
+
+    for orig, trans in pairs:
+        if len(names) >= max_names:
+            break
+        if not trans:
+            continue
+        text = _SFX_SPAN_RE.sub(" ", trans)
+
+        # 1. Honorific-suffixed names (e.g., Kotone-chan, Masaki-kun)
+        for m in _HONORIFIC_NAME_RE.finditer(text):
+            if len(names) >= max_names:
+                break
+            _add(m.group(1))
+
+        # 2. Mid-sentence capitalized proper nouns preceded by a lowercase word
+        for m in _MID_SENTENCE_CAP_RE.finditer(text):
+            if len(names) >= max_names:
+                break
+            _add(m.group(1))
+
+        # 3. Standalone / sentence-start Japanese-moraic proper names (e.g., "Masaki...!!", "Ranshin...?")
+        if contains_non_english_cjk(orig):
+            for m in _SENTENCE_START_CAP_RE.finditer(text):
+                if len(names) >= max_names:
+                    break
+                word = m.group(1)
+                low = word.lower()
+                if len(word) >= 4 and _JP_MORA_WORD_RE.match(low) is not None:
+                    _add(word)
+
+    return names[:max_names]
+
+
 def _is_clean_pair(orig: str, trans: str) -> bool:
     return bool(
         orig
@@ -431,7 +560,7 @@ class ChapterMemoryStore:
         self,
         chapter_id: str,
         series_id: str | None = None,
-        max_pairs: int = 28,
+        max_pairs: int = 6,
     ) -> str:
         """Return page-grouped recent dialogue lines ([Page -2], [Page -1], ...) across pages/chapters."""
         if max_pairs <= 0:

@@ -30,6 +30,7 @@ from server.vision.slicer import RawDetection
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+OCR_SLICE_SIZE = 8
 
 
 class PayloadTooLargeError(ValueError):
@@ -434,6 +435,82 @@ class TranslationPipeline:
             if state == "cancelled" or cancel_event.is_set():
                 raise asyncio.CancelledError("Translation request cancelled")
 
+    async def _run_ocr_sliced(
+        self,
+        crops_with_dark: list[tuple[Image.Image, bool]],
+        *,
+        lang: Literal["auto", "ja", "ko"],
+        aspect_ratio: float,
+        emit: Callable[[dict[str, Any]], Awaitable[None]] | None,
+        cancel_ev: asyncio.Event,
+    ) -> tuple[Literal["ja", "ko"], list[str]]:
+        """Run OCR in small cancel-aware slices and emit incremental progress status events."""
+        total = len(crops_with_dark)
+        if total <= OCR_SLICE_SIZE:
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+            resolved_lang, ocr_texts = await _call_maybe_async(
+                self.ocr.read_page_bubbles,
+                crops_with_dark,
+                lang_hint=lang,
+                aspect_ratio=aspect_ratio,
+            )
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+            if emit is not None:
+                await emit({"type": "status", "stage": "ocr", "done": total, "total": total})
+            return resolved_lang, list(ocr_texts)
+
+        ocr_by_idx: dict[int, str] = {}
+        resolved_lang: Literal["ja", "ko"]
+        if lang == "auto":
+            indexed_by_area = sorted(
+                range(total),
+                key=lambda i: crops_with_dark[i][0].width * crops_with_dark[i][0].height,
+                reverse=True,
+            )
+            probe_indices = indexed_by_area[:2]
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+            resolved_lang, probe_texts = await _call_maybe_async(
+                self.ocr.read_page_bubbles,
+                [crops_with_dark[i] for i in probe_indices],
+                lang_hint="auto",
+                aspect_ratio=aspect_ratio,
+            )
+            for idx, txt in zip(probe_indices, probe_texts):
+                ocr_by_idx[idx] = txt
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+            if emit is not None:
+                await emit({"type": "status", "stage": "ocr", "done": len(ocr_by_idx), "total": total})
+            remaining_indices = [i for i in range(total) if i not in ocr_by_idx]
+        else:
+            resolved_lang = lang
+            remaining_indices = list(range(total))
+
+        for start in range(0, len(remaining_indices), OCR_SLICE_SIZE):
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+            slice_indices = remaining_indices[start : start + OCR_SLICE_SIZE]
+            slice_crops = [crops_with_dark[i] for i in slice_indices]
+            slice_lang, slice_texts = await _call_maybe_async(
+                self.ocr.read_page_bubbles,
+                slice_crops,
+                lang_hint=resolved_lang,
+                aspect_ratio=aspect_ratio,
+            )
+            if slice_lang in ("ja", "ko"):
+                resolved_lang = slice_lang
+            for idx, txt in zip(slice_indices, slice_texts):
+                ocr_by_idx[idx] = txt
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+            if emit is not None:
+                await emit({"type": "status", "stage": "ocr", "done": len(ocr_by_idx), "total": total})
+
+        return resolved_lang, [ocr_by_idx.get(i, "") for i in range(total)]
+
     async def _run_gpu_job(
         self,
         image_bytes: bytes,
@@ -542,6 +619,12 @@ class TranslationPipeline:
                     await emit({"type": "done", "response": empty_resp.model_dump()})
                 return empty_resp
 
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+
+            if emit is not None:
+                await emit({"type": "status", "stage": "ocr", "done": 0, "total": len(detections)})
+
             det_styles: list[tuple[RawDetection, BubbleStyle]] = []
             crops_with_dark: list[tuple[Image.Image, bool]] = []
             for det in detections:
@@ -577,11 +660,12 @@ class TranslationPipeline:
 
             await self._wait_gpu_guard(cancel_ev)
             t_ocr0 = time.perf_counter()
-            resolved_lang, ocr_texts = await _call_maybe_async(
-                self.ocr.read_page_bubbles,
+            resolved_lang, ocr_texts = await self._run_ocr_sliced(
                 crops_with_dark,
-                lang_hint=lang,
+                lang=lang,
                 aspect_ratio=infer_h / max(infer_w, 1),
+                emit=emit,
+                cancel_ev=cancel_ev,
             )
             ocr_ms = int((time.perf_counter() - t_ocr0) * 1000)
             if cancel_ev.is_set():
@@ -838,7 +922,7 @@ class TranslationPipeline:
         include_floating: bool = True,
         series_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream translation events (meta -> bubble* -> done | error) for an image."""
+        """Stream translation events (status* -> meta -> bubble* -> done | error) for an image."""
         merged_glossary, cache_key = self._prepare_request_context(
             image_bytes,
             lang,
