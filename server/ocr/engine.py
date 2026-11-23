@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -9,6 +10,10 @@ from typing import Any, Literal
 
 import numpy as np
 from PIL import Image, ImageOps
+
+from server import gpu_guard
+
+logger = logging.getLogger(__name__)
 
 # Meaningful dialogue character ranges (excludes standalone punctuation, ellipses, dashes, spaces)
 _MEANINGFUL_RE = re.compile(
@@ -77,40 +82,95 @@ def classify_script(texts: list[str], aspect_ratio: float) -> Literal["ja", "ko"
     return "ko" if _is_tall_webtoon_aspect(aspect_ratio) else "ja"
 
 
-def _has_cuda_vram_headroom(min_free_mb: int) -> bool:
-    """Return True only when CUDA is available and has at least min_free_mb free VRAM."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        return (free_bytes / (1024 * 1024)) >= float(min_free_mb)
-    except Exception:
-        return False
-
-
 class OcrEngine:
     """Lazy-loading dual OCR engine for Japanese manga and Korean manhwa."""
 
-    def __init__(self, device: str = "cuda", cache_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        device: str = "cuda",
+        cache_dir: Path | None = None,
+        min_free_vram_mb: int = 1024,
+    ) -> None:
         self.device = device
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.min_free_vram_mb = int(min_free_vram_mb)
         self._ja_ocr: Any = None
         self._ko_ocr: Any = None
+        self._ja_fp16: bool = False
 
     def load_ja(self) -> None:
-        """Lazy-load manga-ocr onto CUDA (when VRAM headroom suffices) or CPU."""
+        """Lazy-load manga-ocr onto CUDA (fp16 when VRAM headroom suffices) or CPU."""
         from manga_ocr import MangaOcr
 
-        use_cuda = self.device.startswith("cuda") and _has_cuda_vram_headroom(min_free_mb=1400)
-        self._ja_ocr = MangaOcr(force_cpu=not use_cuda)
+        use_cuda = self.device.startswith("cuda") and gpu_guard.has_safe_vram_headroom(
+            self.min_free_vram_mb
+        )
+        prev_hf = os.environ.get("HF_HUB_OFFLINE")
+        prev_tf = os.environ.get("TRANSFORMERS_OFFLINE")
+        try:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            self._ja_ocr = MangaOcr(force_cpu=not use_cuda)
+        except OSError:
+            if prev_hf is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev_hf
+            if prev_tf is None:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            else:
+                os.environ["TRANSFORMERS_OFFLINE"] = prev_tf
+            self._ja_ocr = MangaOcr(force_cpu=not use_cuda)
+        finally:
+            if prev_hf is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev_hf
+            if prev_tf is None:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            else:
+                os.environ["TRANSFORMERS_OFFLINE"] = prev_tf
+
+        self._ja_fp16 = False
+        if use_cuda and self._ja_ocr is not None:
+            model = getattr(self._ja_ocr, "model", None)
+            if model is not None and hasattr(model, "half"):
+                orig_preprocess = getattr(self._ja_ocr, "_preprocess", None)
+                try:
+                    import torch
+
+                    model.half()
+                    if callable(orig_preprocess):
+                        def _fp16_preprocess(img: Any, _orig: Any = orig_preprocess) -> Any:
+                            tensor = _orig(img)
+                            return tensor.half() if hasattr(tensor, "half") else tensor
+
+                        self._ja_ocr._preprocess = _fp16_preprocess
+                    if callable(self._ja_ocr):
+                        with torch.inference_mode():
+                            self._ja_ocr(Image.new("RGB", (64, 64), (255, 255, 255)))
+                    self._ja_fp16 = True
+                except Exception as exc:
+                    logger.warning(
+                        "manga-ocr fp16 conversion failed; falling back to fp32: %s",
+                        exc,
+                    )
+                    if orig_preprocess is not None:
+                        self._ja_ocr._preprocess = orig_preprocess
+                    try:
+                        if hasattr(model, "float"):
+                            model.float()
+                    except Exception:
+                        pass
+                    self._ja_fp16 = False
 
     def load_ko(self) -> None:
         """Lazy-load EasyOCR Korean reader onto CUDA (when VRAM headroom suffices) or CPU."""
         import easyocr
 
-        use_cuda = self.device.startswith("cuda") and _has_cuda_vram_headroom(min_free_mb=1600)
+        use_cuda = self.device.startswith("cuda") and gpu_guard.has_safe_vram_headroom(
+            self.min_free_vram_mb
+        )
 
         storage_dir: Path | None = None
         if self.cache_dir is not None:

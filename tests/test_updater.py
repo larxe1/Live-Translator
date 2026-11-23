@@ -358,3 +358,28 @@ def test_fastapi_update_endpoints_and_health_contract(
         assert auto_data["update_available"] is False
         assert auto_data["commits_behind"] == 0
         assert auto_data["extension_build_id"] != apply_data["status"]["extension_build_id"]
+
+
+def test_update_manager_caches_git_snapshot_during_health_polls(tmp_path: Path) -> None:
+    _bare, _seed, local = _setup_bare_and_clones(tmp_path)
+    mgr = UpdateManager(repo_root=local, extension_dir=local / "extension")
+
+    calls = 0
+    orig_inspect = mgr._inspect_git_local
+
+    def _counting_inspect():  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return orig_inspect()
+
+    mgr._inspect_git_local = _counting_inspect  # type: ignore[method-assign]
+
+    h1 = mgr.get_health_fields()
+    h2 = mgr.get_health_fields()
+    h3 = mgr.get_health_fields()
+    assert h1["has_remote"] is True
+    assert h1["extension_build_id"] == h2["extension_build_id"] == h3["extension_build_id"]
+    assert calls == 1
+
+    mgr.get_status()
+    assert calls == 2

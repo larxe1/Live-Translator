@@ -521,7 +521,7 @@ test("6. paginated src swap clears stale overlay and discards late in-flight res
   assert.equal(renderedText, "Page Two Dialogue");
 });
 
-test("7. look-ahead priority ordering sends visible=0, next 3=1, and defers distant pages", async () => {
+test("7. look-ahead priority ordering sends visible=0, next 1=1, and defers distant pages", async () => {
   const doc = createMockDocument();
   const win = createMockWindow(doc, "https://webtoons.example/ep1");
   const pages = [];
@@ -567,20 +567,22 @@ test("7. look-ahead priority ordering sends visible=0, next 3=1, and defers dist
     [
       ["p0.jpg", 0],
       ["p1.jpg", 1],
-      ["p2.jpg", 1],
-      ["p3.jpg", 1],
     ]
   );
 
-  // Scroll closer to p3 -> p4 and p5 are now queued.
+  // Scroll closer to p3 -> p3 (priority 0) and p4 (priority 1) are queued; p5 remains deferred.
   calls.length = 0;
   controller.setVisibility(pages[0], false);
   controller.setVisibility(pages[3], true);
   await controller.refreshVisibleAndLookahead();
 
-  const urlsAfterScroll = calls.map((c) => c.url.split("/").pop());
-  assert.ok(urlsAfterScroll.includes("p4.jpg"));
-  assert.ok(urlsAfterScroll.includes("p5.jpg"));
+  assert.deepEqual(
+    calls.map((c) => [c.url.split("/").pop(), c.priority]),
+    [
+      ["p3.jpg", 0],
+      ["p4.jpg", 1],
+    ]
+  );
 });
 
 test("8. background Referer session rule is added before fetch and removed in finally", async () => {

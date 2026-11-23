@@ -246,19 +246,6 @@ def sort_reading_order(
     return _sort_bands(detections, rtl=True)
 
 
-def _has_cuda_vram_headroom(min_free_mb: int) -> bool:
-    """Return True only when CUDA is available and has at least min_free_mb free VRAM."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        return (free_bytes / (1024 * 1024)) >= float(min_free_mb)
-    except Exception:
-        return False
-
-
 class BubbleDetector:
     """RT-DETR comic speech-bubble detector with tall-strip slicing and SFX filtering."""
 
@@ -267,10 +254,12 @@ class BubbleDetector:
         model_id: str = "ogkalu/comic-text-and-bubble-detector",
         device: str = "cuda",
         score_threshold: float = 0.30,
+        min_free_vram_mb: int = 1024,
     ) -> None:
         self.model_id = model_id
         self.device = device
         self.score_threshold = score_threshold
+        self.min_free_vram_mb = int(min_free_vram_mb)
         self._processor: Any = None
         self._model: Any = None
         self._runtime_device: str = "cpu"
@@ -280,12 +269,19 @@ class BubbleDetector:
         """Load AutoImageProcessor and AutoModelForObjectDetection (RT-DETR / RT-DETR-v2) onto CUDA/CPU."""
         import torch
         from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        from server import gpu_guard
 
-        use_cuda = self.device.startswith("cuda") and _has_cuda_vram_headroom(min_free_mb=1200)
+        use_cuda = self.device.startswith("cuda") and gpu_guard.has_safe_vram_headroom(
+            self.min_free_vram_mb
+        )
         self._runtime_device = self.device if use_cuda else "cpu"
 
-        self._processor = AutoImageProcessor.from_pretrained(self.model_id)
-        model = AutoModelForObjectDetection.from_pretrained(self.model_id)
+        try:
+            self._processor = AutoImageProcessor.from_pretrained(self.model_id, local_files_only=True)
+            model = AutoModelForObjectDetection.from_pretrained(self.model_id, local_files_only=True)
+        except OSError:
+            self._processor = AutoImageProcessor.from_pretrained(self.model_id)
+            model = AutoModelForObjectDetection.from_pretrained(self.model_id)
         model.eval()
         model.to(self._runtime_device)
 

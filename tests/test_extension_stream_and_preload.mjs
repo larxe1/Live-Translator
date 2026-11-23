@@ -14,6 +14,7 @@ const EXT_DIR = path.join(ROOT_DIR, "extension");
 
 const content = require("../extension/content.js");
 const overlay = require("../extension/overlay.js");
+const popup = require("../extension/popup.js");
 
 function createMockStorage(initial = {}) {
   const data = { ...initial };
@@ -250,7 +251,14 @@ function createMinimalDom(href = "https://mangadex.org/chapter/10") {
         return out;
       },
       getBoundingClientRect() {
-        return { left: 0, top: 0, width: el.width, height: el.height };
+        return {
+          left: 0,
+          top: 0,
+          width: el.width,
+          height: el.height,
+          right: el.width,
+          bottom: el.height,
+        };
       },
     };
     return el;
@@ -478,7 +486,12 @@ test("4. Whole-chapter pre-translation queues offscreen loaded images at priorit
     hostname: "mangadex.org",
     storage: {
       async get() {
-        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+        return {
+          enabledDomains: { "mangadex.org": true },
+          langMode: "ja",
+          glossary: {},
+          preloadWholeChapter: true,
+        };
       },
     },
     sendMessage: async (msg) => {
@@ -527,8 +540,10 @@ test("4. Whole-chapter pre-translation queues offscreen loaded images at priorit
   controller.setVisibility(p0, true);
   await controller.refreshVisibleAndLookahead();
 
-  // Wait for background sequential preload to walk p4 -> p5 (where p5 stays in-flight)
-  await new Promise((r) => setTimeout(r, 60));
+  // Wait for background sequential preload to walk p2 -> p3 -> p4 -> p5 (where p5 stays in-flight)
+  for (let i = 0; i < 50 && !started.some((s) => s.file === "p5.jpg"); i += 1) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
 
   assert.equal(started[0].file, "p0.jpg");
   assert.equal(started[0].priority, 0);
@@ -749,7 +764,12 @@ test("7. Failed image in preload records failure once and advances to next page 
     hostname: "mangadex.org",
     storage: {
       async get() {
-        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+        return {
+          enabledDomains: { "mangadex.org": true },
+          langMode: "ja",
+          glossary: {},
+          preloadWholeChapter: true,
+        };
       },
     },
     sendMessage: async () => ({ ok: true }),
@@ -821,6 +841,8 @@ test("8. deriveSeriesId normalizes common manga/webtoon chapter URLs and falls b
 
 test("9. content controller forwards seriesId & includeFloating, resolves per-series glossary, and retranslates on includeFloating toggle", async () => {
   const { doc, win } = createMinimalDom("https://example.com/manga/blue-box/chapter-12/3");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
   const img = doc.createElement("img");
   img.src = "https://cdn.example.org/page1.jpg";
   doc.body.appendChild(img);
@@ -1054,6 +1076,8 @@ test("10. background forwards include_floating & series_id, preserves region_typ
 
 test("11. content controller isolates per-series glossaries without leaking Series A flat glossary or retranslating Series B", async () => {
   const { doc, win } = createMinimalDom("https://example.com/manga/series-b/chapter-1");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
   const img = doc.createElement("img");
   img.src = "https://cdn.example.org/series-b-p1.jpg";
   doc.body.appendChild(img);
@@ -1139,4 +1163,272 @@ test("11. content controller isolates per-series glossaries without leaking Seri
   await new Promise((r) => setTimeout(r, 25));
   assert.equal(startPayloads.length, 2);
   assert.deepEqual(startPayloads[1].glossary, { "SeriesB": "Gamma" });
+});
+
+test("12. MAX_LOOKAHEAD is 1, preloadWholeChapter defaults to false, and offscreen/stop cancels requests", async () => {
+  assert.equal(content.MAX_LOOKAHEAD, 1);
+  assert.equal(content.DEFAULT_PRELOAD_WHOLE_CHAPTER, false);
+
+  const { doc, win } = createMinimalDom();
+  const pages = [];
+  for (let i = 0; i <= 4; i += 1) {
+    const img = doc.createElement("img");
+    img.src = `https://cdn.example.org/page-${i}.jpg`;
+    doc.body.appendChild(img);
+    pages.push(img);
+  }
+
+  const started = [];
+  const disconnectedIds = [];
+  const cancelledIds = [];
+  let holdP1 = null;
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "CANCEL_TRANSLATE") {
+        cancelledIds.push(msg.requestId);
+      }
+      return { ok: true };
+    },
+    connectPort: () => {
+      const listeners = [];
+      let reqId = null;
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {
+          if (reqId) disconnectedIds.push(reqId);
+        },
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          reqId = msg.requestId;
+          const file = msg.imageUrl.split("/").pop();
+          started.push({ file, priority: msg.priority, requestId: reqId });
+          if (file === "page-1.jpg") {
+            holdP1 = () => {
+              for (const fn of listeners) {
+                fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+              }
+            };
+            return;
+          }
+          setTimeout(() => {
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [] });
+              fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  controller.setVisibility(pages[0], true);
+  void controller.refreshVisibleAndLookahead();
+  await new Promise((r) => setTimeout(r, 40));
+
+  // Only visible page-0 (priority 0) and 1 adjacent lookahead page-1 (priority 1) are translated
+  assert.deepEqual(
+    started.map((s) => ({ file: s.file, priority: s.priority })),
+    [
+      { file: "page-0.jpg", priority: 0 },
+      { file: "page-1.jpg", priority: 1 },
+    ]
+  );
+
+  // Scrolling far ahead to page-3 cancels in-flight lookahead page-1
+  const p1ReqId = started[1].requestId;
+  controller.setVisibility(pages[0], false);
+  controller.setVisibility(pages[3], true);
+  const refreshPromise = controller.refreshVisibleAndLookahead();
+  await new Promise((r) => setTimeout(r, 20));
+  await refreshPromise;
+
+  assert.ok(disconnectedIds.includes(p1ReqId));
+  assert.ok(cancelledIds.includes(p1ReqId));
+  assert.deepEqual(
+    started.map((s) => s.file),
+    ["page-0.jpg", "page-1.jpg", "page-3.jpg", "page-4.jpg"]
+  );
+  if (holdP1) holdP1();
+
+  // Disabling (Stop) cancels all remaining active requests
+  controller.disable();
+  assert.equal(controller.isEnabled(), false);
+});
+
+test("13. Storage toggle of preloadWholeChapter from true to false cancels offscreen preload", async () => {
+  const { doc, win } = createMinimalDom();
+  const pages = [];
+  for (let i = 0; i <= 3; i += 1) {
+    const img = doc.createElement("img");
+    img.src = `https://cdn.example.org/p-${i}.jpg`;
+    doc.body.appendChild(img);
+    pages.push(img);
+  }
+
+  const started = [];
+  const cancelledIds = [];
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return {
+          enabledDomains: { "mangadex.org": true },
+          langMode: "ja",
+          glossary: {},
+          preloadWholeChapter: true,
+        };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "CANCEL_TRANSLATE") cancelledIds.push(msg.requestId);
+      return { ok: true };
+    },
+    connectPort: () => {
+      const listeners = [];
+      let reqId = null;
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          reqId = msg.requestId;
+          const file = msg.imageUrl.split("/").pop();
+          started.push({ file, requestId: reqId });
+          if (file === "p-3.jpg") {
+            return; // hold p-3 in flight
+          }
+          setTimeout(() => {
+            for (const fn of listeners) {
+              fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  controller.setVisibility(pages[0], true);
+  void controller.refreshVisibleAndLookahead();
+  for (let i = 0; i < 50 && !started.some((s) => s.file === "p-3.jpg"); i += 1) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+
+  assert.ok(started.some((s) => s.file === "p-3.jpg"));
+  const p3ReqId = started.find((s) => s.file === "p-3.jpg").requestId;
+
+  // Turn off preloadWholeChapter via storage change -> offscreen p-3 is cancelled
+  controller.handleStorageChanges({
+    preloadWholeChapter: { oldValue: true, newValue: false },
+  });
+  assert.ok(cancelledIds.includes(p3ReqId));
+  controller.disable();
+});
+
+test("14. popup GPU guard & temperature rendering handles absent, ok, throttled, and paused states", () => {
+  assert.equal(popup.DEFAULT_PRELOAD_WHOLE_CHAPTER, false);
+
+  const popupHtml = fs.readFileSync(path.join(EXT_DIR, "popup.html"), "utf8");
+  assert.match(popupHtml, /id="gpuGuardNotice"/);
+  assert.match(popupHtml, /id="preloadToggle"/);
+  assert.equal(/id="preloadToggle"[^>]*checked/.test(popupHtml), false);
+
+  const makeDom = () => ({
+    statusDot: { className: "" },
+    statusText: { textContent: "" },
+    statusVram: { textContent: "" },
+    gpuGuardNotice: { hidden: true, textContent: "", title: "", className: "gpu-guard-notice" },
+  });
+
+  // 1) Backward-compatible when gpu_guard is absent
+  const domAbsent = makeDom();
+  popup.applyHealthUI(
+    { ready: true, gpu_name: "RTX 3070", vram_used_mb: 3200, vram_total_mb: 8192 },
+    domAbsent
+  );
+  assert.equal(domAbsent.statusDot.className, "status-dot ready");
+  assert.equal(domAbsent.statusText.textContent, "Ready — RTX 3070");
+  assert.equal(domAbsent.statusVram.textContent, "3200/8192 MB");
+  assert.equal(domAbsent.gpuGuardNotice.hidden, true);
+
+  // 2) gpu_guard ok with temperature
+  const domOk = makeDom();
+  popup.applyHealthUI(
+    {
+      ready: true,
+      gpu_name: "RTX 3070",
+      vram_used_mb: 4800,
+      vram_total_mb: 8192,
+      gpu_guard: { state: "ok", temp_c: 64, vram_used_mb: 4800, vram_total_mb: 8192, vram_free_mb: 3392, message: "" },
+    },
+    domOk
+  );
+  assert.equal(domOk.statusDot.className, "status-dot ready");
+  assert.equal(domOk.statusVram.textContent, "4800/8192 MB · 64°C");
+  assert.equal(domOk.gpuGuardNotice.hidden, true);
+
+  // 3) gpu_guard throttled
+  const domThrottled = makeDom();
+  popup.applyHealthUI(
+    {
+      ready: true,
+      gpu_name: "RTX 3070",
+      vram_used_mb: 6100,
+      vram_total_mb: 8192,
+      gpu_guard: { state: "throttled", temp_c: 79, message: "Cooling between chunks" },
+    },
+    domThrottled
+  );
+  assert.equal(domThrottled.statusDot.className, "status-dot ready");
+  assert.equal(domThrottled.statusVram.textContent, "6100/8192 MB · 79°C");
+  assert.equal(domThrottled.gpuGuardNotice.hidden, false);
+  assert.equal(domThrottled.gpuGuardNotice.textContent, "Cooling GPU (79°C)...");
+  assert.equal(domThrottled.gpuGuardNotice.className, "gpu-guard-notice");
+
+  // 4) gpu_guard paused
+  const domPaused = makeDom();
+  popup.applyHealthUI(
+    {
+      ready: true,
+      gpu_name: "RTX 3070",
+      vram_used_mb: 6200,
+      vram_total_mb: 8192,
+      gpu_guard: { state: "paused", temp_c: 85, message: "GPU thermal pause" },
+    },
+    domPaused
+  );
+  assert.equal(domPaused.statusDot.className, "status-dot loading");
+  assert.equal(domPaused.statusVram.textContent, "6200/8192 MB · 85°C");
+  assert.equal(domPaused.gpuGuardNotice.hidden, false);
+  assert.equal(domPaused.gpuGuardNotice.textContent, "Paused: GPU hot (85°C)");
+  assert.equal(domPaused.gpuGuardNotice.className, "gpu-guard-notice paused");
+
+  // 5) Loading state without gpu_guard does not throw
+  const domLoading = makeDom();
+  popup.applyHealthUI({ ready: false, loading_stage: "starting_llm" }, domLoading);
+  assert.equal(domLoading.statusDot.className, "status-dot loading");
+  assert.equal(domLoading.statusText.textContent, "Loading LLM...");
+  assert.equal(domLoading.statusVram.textContent, "");
+  assert.equal(domLoading.gpuGuardNotice.hidden, true);
 });

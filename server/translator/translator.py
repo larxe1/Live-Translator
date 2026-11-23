@@ -1,18 +1,22 @@
-"""Context-aware uncensored manga/manhwa page translator with refusal guard and retry."""
+"""Fast chunked uncensored manga/manhwa page translator with Romaji/CJK guard and cancellation."""
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import re
-import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal
 
 import httpx
 
-from server.translator.memory import ChapterMemoryStore, contains_non_english_cjk
+from server.translator.memory import (
+    ChapterMemoryStore,
+    contains_non_english_cjk,
+    looks_like_romaji,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,167 +55,10 @@ _REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 _KV_FALLBACK_RE = re.compile(r'"(\d+)"\s*:\s*"((?:\\.|[^"\\])*)"')
-_HANZI_OR_HANGUL_RE = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-    r"\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]"
-)
-_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
-_KANA_SPAN_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff\uff65-\uff9f]+")
-_KANA_WORD_RE = re.compile(r"[\u3040-\u309f\u30a1-\u30fa\u30fc-\u30fe]+")
 
-_KANA_DIGRAPHS: dict[str, str] = {
-    # Hiragana digraphs
-    "きゃ": "kya", "きゅ": "kyu", "きょ": "kyo", "きぇ": "kye",
-    "しゃ": "sha", "しゅ": "shu", "しょ": "sho", "しぇ": "she",
-    "ちゃ": "cha", "ちゅ": "chu", "ちょ": "cho", "ちぇ": "che",
-    "にゃ": "nya", "にゅ": "nyu", "にょ": "nyo", "にぇ": "nye",
-    "ひゃ": "hya", "ひゅ": "hyu", "ひょ": "hyo", "ひぇ": "hye",
-    "みゃ": "mya", "みゅ": "myu", "みょ": "myo", "みぇ": "mye",
-    "りゃ": "rya", "りゅ": "ryu", "りょ": "ryo", "りぇ": "rye",
-    "ぎゃ": "gya", "ぎゅ": "gyu", "ぎょ": "gyo", "ぎぇ": "gye",
-    "じゃ": "ja", "じゅ": "ju", "じょ": "jo", "じぇ": "je",
-    "ぢゃ": "ja", "ぢゅ": "ju", "ぢょ": "jo",
-    "びゃ": "bya", "びゅ": "byu", "びょ": "byo", "びぇ": "bye",
-    "ぴゃ": "pya", "ぴゅ": "pyu", "ぴょ": "pyo", "ぴぇ": "pye",
-    "ふぁ": "fa", "ふぃ": "fi", "ふぇ": "fe", "ふぉ": "fo", "ふゅ": "fyu",
-    "てぃ": "ti", "てゅ": "tyu", "でぃ": "di", "でゅ": "dyu",
-    "とぅ": "tu", "どぅ": "du",
-    "うぃ": "wi", "うぇ": "we", "うぉ": "wo",
-    "ゔぁ": "va", "ゔぃ": "vi", "ゔぇ": "ve", "ゔぉ": "vo", "ゔゅ": "vyu",
-    "つぁ": "tsa", "つぃ": "tsi", "つぇ": "tse", "つぉ": "tso",
-    "いぇ": "ye", "くぁ": "kwa", "くぃ": "kwi", "くぇ": "kwe", "くぉ": "kwo", "ぐぁ": "gwa",
-    # Katakana digraphs
-    "キャ": "kya", "キュ": "kyu", "キョ": "kyo", "キェ": "kye",
-    "シャ": "sha", "シュ": "shu", "ショ": "sho", "シェ": "she",
-    "チャ": "cha", "チュ": "chu", "チョ": "cho", "チェ": "che",
-    "ニャ": "nya", "ニュ": "nyu", "ニョ": "nyo", "ニェ": "nye",
-    "ヒャ": "hya", "ヒュ": "hyu", "ヒョ": "hyo", "ヒェ": "hye",
-    "ミャ": "mya", "ミュ": "myu", "ミョ": "myo", "ミェ": "mye",
-    "リャ": "rya", "リュ": "ryu", "リョ": "ryo", "リェ": "rye",
-    "ギャ": "gya", "ギュ": "gyu", "ギョ": "gyo", "ギェ": "gye",
-    "ジャ": "ja", "ジュ": "ju", "ジョ": "jo", "ジェ": "je",
-    "ヂャ": "ja", "ヂュ": "ju", "ヂョ": "jo",
-    "ビャ": "bya", "ビュ": "byu", "ビョ": "byo", "ビェ": "bye",
-    "ピャ": "pya", "ピュ": "pyu", "ピョ": "pyo", "ピェ": "pye",
-    "ファ": "fa", "フィ": "fi", "フェ": "fe", "フォ": "fo", "フュ": "fyu",
-    "ティ": "ti", "テュ": "tyu", "ディ": "di", "デュ": "dyu",
-    "トゥ": "tu", "ドゥ": "du",
-    "ウィ": "wi", "ウェ": "we", "ウォ": "wo",
-    "ヴァ": "va", "ヴィ": "vi", "ヴェ": "ve", "ヴォ": "vo", "ヴュ": "vyu",
-    "ツァ": "tsa", "ツィ": "tsi", "ツェ": "tse", "ツォ": "tso",
-    "イェ": "ye", "クァ": "kwa", "クィ": "kwi", "クェ": "kwe", "クォ": "kwo", "グァ": "gwa",
-}
-
-_KANA_MONOS: dict[str, str] = {
-    # Hiragana
-    "あ": "a", "い": "i", "う": "u", "え": "e", "お": "o",
-    "か": "ka", "き": "ki", "く": "ku", "け": "ke", "こ": "ko",
-    "さ": "sa", "し": "shi", "す": "su", "せ": "se", "そ": "so",
-    "た": "ta", "ち": "chi", "つ": "tsu", "て": "te", "と": "to",
-    "な": "na", "に": "ni", "ぬ": "nu", "ね": "ne", "の": "no",
-    "は": "ha", "ひ": "hi", "ふ": "fu", "へ": "he", "ほ": "ho",
-    "ま": "ma", "み": "mi", "む": "mu", "め": "me", "も": "mo",
-    "や": "ya", "ゆ": "yu", "よ": "yo",
-    "ら": "ra", "り": "ri", "る": "ru", "れ": "re", "ろ": "ro",
-    "わ": "wa", "ゐ": "wi", "ゑ": "we", "を": "wo", "ん": "n",
-    "が": "ga", "ぎ": "gi", "ぐ": "gu", "げ": "ge", "ご": "go",
-    "ざ": "za", "じ": "ji", "ず": "zu", "ぜ": "ze", "ぞ": "zo",
-    "だ": "da", "ぢ": "ji", "づ": "zu", "で": "de", "ど": "do",
-    "ば": "ba", "び": "bi", "ぶ": "bu", "べ": "be", "ぼ": "bo",
-    "ぱ": "pa", "ぴ": "pi", "ぷ": "pu", "ぺ": "pe", "ぽ": "po",
-    "ゔ": "vu",
-    "ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o",
-    "ゃ": "ya", "ゅ": "yu", "ょ": "yo", "ゎ": "wa",
-    "ゕ": "ka", "ゖ": "ke",
-    # Katakana
-    "ア": "a", "イ": "i", "ウ": "u", "エ": "e", "オ": "o",
-    "カ": "ka", "キ": "ki", "ク": "ku", "ケ": "ke", "コ": "ko",
-    "サ": "sa", "シ": "shi", "ス": "su", "セ": "se", "ソ": "so",
-    "タ": "ta", "チ": "chi", "ツ": "tsu", "テ": "te", "ト": "to",
-    "ナ": "na", "ニ": "ni", "ヌ": "nu", "ネ": "ne", "ノ": "no",
-    "ハ": "ha", "ヒ": "hi", "フ": "fu", "ヘ": "he", "ホ": "ho",
-    "マ": "ma", "ミ": "mi", "ム": "mu", "メ": "me", "モ": "mo",
-    "ヤ": "ya", "ユ": "yu", "ヨ": "yo",
-    "ラ": "ra", "リ": "ri", "ル": "ru", "レ": "re", "ロ": "ro",
-    "ワ": "wa", "ヰ": "wi", "ヱ": "we", "ヲ": "wo", "ン": "n",
-    "ガ": "ga", "ギ": "gi", "グ": "gu", "ゲ": "ge", "ゴ": "go",
-    "ザ": "za", "ジ": "ji", "ズ": "zu", "ゼ": "ze", "ゾ": "zo",
-    "ダ": "da", "ヂ": "ji", "ヅ": "zu", "デ": "de", "ド": "do",
-    "バ": "ba", "ビ": "bi", "ブ": "bu", "ベ": "be", "ボ": "bo",
-    "パ": "pa", "ピ": "pi", "プ": "pu", "ペ": "pe", "ポ": "po",
-    "ヴ": "vu",
-    "ァ": "a", "ィ": "i", "ゥ": "u", "ェ": "e", "ォ": "o",
-    "ャ": "ya", "ュ": "yu", "ョ": "yo", "ヮ": "wa",
-    "ヵ": "ka", "ヶ": "ga",
-}
-
-
-def _romanize_kana_word(word: str) -> str:
-    """Convert a contiguous Hiragana/Katakana token into capitalized Hepburn romaji."""
-    tokens: list[str] = []
-    i = 0
-    n = len(word)
-    while i < n:
-        ch = word[i]
-        if ch in ("っ", "ッ"):
-            tokens.append("_GEM_")
-            i += 1
-            continue
-        if ch == "ー":
-            tokens.append("_LONG_")
-            i += 1
-            continue
-        if i + 1 < n:
-            pair = word[i : i + 2]
-            digraph = _KANA_DIGRAPHS.get(pair)
-            if digraph is not None:
-                tokens.append(digraph)
-                i += 2
-                continue
-        mono = _KANA_MONOS.get(ch)
-        if mono is not None:
-            tokens.append(mono)
-        i += 1
-
-    out: list[str] = []
-    for idx, tok in enumerate(tokens):
-        if tok == "_GEM_":
-            next_tok = ""
-            for j in range(idx + 1, len(tokens)):
-                if tokens[j] not in ("_GEM_", "_LONG_"):
-                    next_tok = tokens[j]
-                    break
-            if next_tok.startswith("ch"):
-                out.append("t")
-            elif next_tok and next_tok[0] in "bcdfghjklmnpqrstvwxyz":
-                out.append(next_tok[0])
-        elif tok == "_LONG_":
-            if out:
-                last_char = out[-1][-1]
-                if last_char in "aeiou":
-                    out.append(last_char)
-        else:
-            out.append(tok)
-
-    joined = "".join(out)
-    if not joined:
-        return ""
-    return joined[0].upper() + joined[1:]
-
-
-def romanize_residual_kana(text: str) -> str:
-    """Convert Hiragana/Katakana spans in text to Hepburn romaji while preserving ASCII text."""
-    if not text:
-        return text
-
-    def _replace_span(match: re.Match[str]) -> str:
-        normalized = unicodedata.normalize("NFKC", match.group(0))
-        normalized = normalized.replace("\u30fb", " ").replace("\u30a0", "-").replace("\u30ff", "koto")
-        converted = _KANA_WORD_RE.sub(lambda m: _romanize_kana_word(m.group(0)), normalized)
-        # Strip any remaining stray kana marks (e.g., standalone dakuten/iteration marks)
-        return re.sub(r"[\u3040-\u309f\u30a0-\u30ff]", "", converted)
-
-    return _KANA_SPAN_RE.sub(_replace_span, text)
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TOP_P = 0.85
+DEFAULT_REPEAT_PENALTY = 1.12
 
 
 def is_refusal(text: str) -> bool:
@@ -222,7 +69,7 @@ def is_refusal(text: str) -> bool:
 
 
 def is_valid_english_translation(orig: str, candidate: str) -> bool:
-    """Return True if candidate is a non-empty, non-refusal English translation without CJK scripts."""
+    """Return True if candidate is a non-empty, non-refusal, non-Romaji English translation without CJK scripts."""
     cleaned = (candidate or "").strip()
     if not cleaned:
         return False
@@ -232,26 +79,22 @@ def is_valid_english_translation(orig: str, candidate: str) -> bool:
         return False
     if contains_non_english_cjk(orig) and cleaned == orig.strip():
         return False
+    if looks_like_romaji(orig, cleaned):
+        return False
     return True
 
 
 def _sanitize_translation_candidate(orig: str, candidate: str) -> tuple[str, bool]:
-    """Validate candidate, salvaging otherwise-English text with residual kana via romanization."""
+    """Strictly validate candidate as English without ever auto-converting kana to Romaji."""
     cleaned = (candidate or "").strip()
     if is_valid_english_translation(orig, cleaned):
         return (cleaned, True)
-    if not cleaned or is_refusal(cleaned):
-        return (cleaned, False)
-    if _HANZI_OR_HANGUL_RE.search(cleaned) is None and len(_ASCII_LETTER_RE.findall(cleaned)) >= 2:
-        romanized = romanize_residual_kana(cleaned).strip()
-        if is_valid_english_translation(orig, romanized):
-            logger.warning(
-                "Sanitized residual kana in translation candidate: %r -> %r",
-                cleaned,
-                romanized,
-            )
-            return (romanized, True)
     return (cleaned, False)
+
+
+def _chunk_max_tokens(chunk_len: int) -> int:
+    """Compute tight per-chunk token cap so small chunks never burn excessive generation budget."""
+    return min(640, max(160, int(chunk_len) * 56))
 
 
 def _extract_int_key(raw_key: Any) -> int | None:
@@ -308,7 +151,7 @@ def _parse_translation_json(raw: str) -> dict[int, str]:
 
 
 class DialogueTranslator:
-    """Single-call page-context manga/manhwa translator backed by local llama-server."""
+    """Chunked streaming manga/manhwa translator backed by local llama-server."""
 
     def __init__(
         self,
@@ -317,35 +160,64 @@ class DialogueTranslator:
         llm_caller: LlmCaller | None = None,
         timeout_s: float = 45.0,
         llm_stream_caller: LlmStreamCaller | None = None,
+        cfg: Any = None,
     ) -> None:
         self.llama_base_url = llama_base_url.rstrip("/")
         self.memory = memory
         self._llm_caller = llm_caller
         self._llm_stream_caller = llm_stream_caller
         self.timeout_s = timeout_s
+        self.cfg = cfg
 
     async def _call_llama(
         self,
         messages: list[dict[str, str]],
         *,
-        temperature: float = 0.25,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        repeat_penalty: float = DEFAULT_REPEAT_PENALTY,
+        max_tokens: int = 640,
         json_mode: bool = True,
+        cancel_event: asyncio.Event | None = None,
     ) -> str:
         """Send chat completion request to local llama-server OpenAI-compatible API."""
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
         payload: dict[str, Any] = {
             "model": "local-model",
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 1536,
+            "top_p": top_p,
+            "repeat_penalty": repeat_penalty,
+            "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            resp = await client.post(
-                f"{self.llama_base_url}/v1/chat/completions",
-                json=payload,
-            )
+            if cancel_event is not None:
+                req_task = asyncio.create_task(
+                    client.post(f"{self.llama_base_url}/v1/chat/completions", json=payload)
+                )
+                cancel_task = asyncio.create_task(cancel_event.wait())
+                done, pending = await asyncio.wait(
+                    {req_task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for p in pending:
+                    p.cancel()
+                    try:
+                        await p
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                if cancel_task in done:
+                    return ""
+                resp = req_task.result()
+            else:
+                resp = await client.post(
+                    f"{self.llama_base_url}/v1/chat/completions",
+                    json=payload,
+                )
             resp.raise_for_status()
             data = resp.json()
             return str(data["choices"][0]["message"]["content"])
@@ -354,14 +226,22 @@ class DialogueTranslator:
         self,
         messages: list[dict[str, str]],
         *,
-        temperature: float = 0.25,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        repeat_penalty: float = DEFAULT_REPEAT_PENALTY,
+        max_tokens: int = 640,
+        cancel_event: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
         """Stream chat completion content deltas from local llama-server SSE API."""
+        if cancel_event is not None and cancel_event.is_set():
+            return
         payload: dict[str, Any] = {
             "model": "local-model",
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 1536,
+            "top_p": top_p,
+            "repeat_penalty": repeat_penalty,
+            "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {"type": "json_object"},
             "stream": True,
@@ -373,7 +253,35 @@ class DialogueTranslator:
                 json=payload,
             ) as resp:
                 resp.raise_for_status()
-                async for line in resp.aiter_lines():
+                line_iter = resp.aiter_lines().__aiter__()
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if cancel_event is not None:
+                        next_task = asyncio.create_task(line_iter.__anext__())
+                        cancel_task = asyncio.create_task(cancel_event.wait())
+                        done, pending = await asyncio.wait(
+                            {next_task, cancel_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for p in pending:
+                            p.cancel()
+                            try:
+                                await p
+                            except (asyncio.CancelledError, StopAsyncIteration):
+                                pass
+                        if cancel_task in done:
+                            break
+                        try:
+                            line = next_task.result()
+                        except StopAsyncIteration:
+                            break
+                    else:
+                        try:
+                            line = await line_iter.__anext__()
+                        except StopAsyncIteration:
+                            break
+
                     stripped = line.strip()
                     if not stripped or not stripped.startswith("data:"):
                         continue
@@ -396,12 +304,26 @@ class DialogueTranslator:
         self,
         messages: list[dict[str, str]],
         *,
-        temperature: float = 0.25,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        repeat_penalty: float = DEFAULT_REPEAT_PENALTY,
+        max_tokens: int = 640,
         json_mode: bool = True,
+        cancel_event: asyncio.Event | None = None,
     ) -> str:
+        if cancel_event is not None and cancel_event.is_set():
+            return ""
         if self._llm_caller is not None:
             return await self._llm_caller(messages)
-        return await self._call_llama(messages, temperature=temperature, json_mode=json_mode)
+        return await self._call_llama(
+            messages,
+            temperature=temperature,
+            top_p=top_p,
+            repeat_penalty=repeat_penalty,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            cancel_event=cancel_event,
+        )
 
     def _build_primary_messages(
         self,
@@ -411,37 +333,39 @@ class DialogueTranslator:
         context: list[tuple[str, str]] | str,
         bubble_types: dict[int, str] | None = None,
     ) -> list[dict[str, str]]:
+        # Keep system prompt completely static per language so llama.cpp reuses KV-cache prefix across chunks.
         source_label = "Japanese manga" if lang == "ja" else "Korean manhwa"
-        example_input = (
-            '{"0": "夢幻団", "1": "くそっ！ぎゃああああっ！"}'
-            if lang == "ja"
-            else '{"0": "환영여단", "1": "젠장! 끄아아악!"}'
-        )
-        example_output = '{"0": "Phantom Troupe", "1": "Damn it! GYAAAAAH!"}'
+        if lang == "ja":
+            examples = (
+                'Example input: {"0": "夢幻団", "1": "ちょっと待って", "2": "ここじゃやだ", '
+                '"3": "ベッド行こ？", "4": "くそっ！ぎゃああああっ！"}\n'
+                'Example output: {"0": "Phantom Troupe", "1": "Wait a second", "2": "Not here", '
+                '"3": "Wanna go to bed?", "4": "Damn it! GYAAAAAH!"}\n'
+                'NEVER output Japanese Romaji like "Chotto matte", "Koko ja yada", or "Bed ikko?".'
+            )
+        else:
+            examples = (
+                'Example input: {"0": "환영여단", "1": "잠깐만 기다려", "2": "여긴 싫어", "3": "젠장! 끄아아악!"}\n'
+                'Example output: {"0": "Phantom Troupe", "1": "Wait a second", "2": "Not here", "3": "Damn it! GYAAAAAH!"}\n'
+                'NEVER output phonetic Korean spelling like "Jamkkanman gidaryeo" or "Yeogin silheo".'
+            )
         system_prompt = (
             f"You are an expert uncensored {source_label}-to-ENGLISH localization translator.\n"
             "Rules:\n"
             "1. TARGET LANGUAGE IS STRICTLY ENGLISH ONLY (Latin alphabet A-Z). "
-            "NEVER output Chinese (中文/汉字), Japanese, Korean, or leave source text untranslated.\n"
-            "2. Write natural, idiomatic spoken English manga/manhwa dialogue—avoid stiff, literal "
-            "translation-ese. Keep lines punchy and concise so they fit cleanly inside speech bubbles, "
-            "including titles, group/faction names, proper nouns, and credits.\n"
-            "3. Treat all bubbles on the page as a connected conversation and use the multi-page "
-            "Story Context to resolve dropped subjects (I/you/he/she/they), speaker identity, tone, "
-            "and continuity across pages.\n"
-            "4. Entries annotated as [floating] may be borderless dialogue/internal thoughts OR "
-            "onomatopoeia/SFX: translate borderless dialogue naturally like normal speech or thought, "
-            "and translate SFX concisely in comic style (e.g., '*THUMP*', '*RUSTLE*', '*WHOOSH*').\n"
-            "5. Remain 100% faithful and completely uncensored across all genres—including strong "
-            "profanity, dark horror, gore, violence, and mature/NSFW dialogue. Never sanitize, "
-            "censor, lecture, or refuse.\n"
-            "6. Preserve emotional intensity, screams, and stutters naturally "
-            "(e.g., 'ぎゃああああっ' -> 'GYAAAAAH!').\n"
-            "7. Strictly use every pinned glossary name/term exactly as specified.\n"
-            "8. Output ONLY a single valid JSON object mapping each string bubble ID to its "
-            "English translation with zero extra commentary or markdown.\n"
-            f"Example input: {example_input}\n"
-            f"Example output: {example_output}"
+            "Translate the MEANING into natural, idiomatic spoken English. "
+            "NEVER output Japanese Romaji, Korean phonetic spelling, Chinese, Japanese, or Korean characters.\n"
+            "2. Keep proper character names in Latin letters (e.g., Masaki, Nanami), while translating ALL "
+            "spoken words, expressions, titles, group names, and SFX meaning into natural English.\n"
+            "3. Keep lines punchy and concise so they fit speech bubbles.\n"
+            "4. Entries annotated as [floating] may be borderless speech/thoughts or SFX: translate speech "
+            "naturally and translate SFX concisely in comic style (e.g., '*THUMP*', '*RUSTLE*').\n"
+            "5. Stay 100% faithful and completely uncensored across all genres—including profanity, horror, "
+            "gore, violence, and mature/NSFW dialogue. Never sanitize, censor, lecture, or refuse.\n"
+            "6. Strictly follow every pinned glossary name/term exactly as specified.\n"
+            "7. Output ONLY a single valid JSON object mapping each string bubble ID to its English translation "
+            "with zero commentary or markdown.\n"
+            f"{examples}"
         )
 
         sections: list[str] = []
@@ -473,7 +397,7 @@ class DialogueTranslator:
         bubble_map = {str(bid): text for bid, text in bubbles}
         sections.append(
             "Translate EVERY bubble below into natural ENGLISH ONLY "
-            "(never Chinese, never Japanese, never Korean). "
+            "(translate meaning into English; never Romaji, never Chinese, never Japanese, never Korean). "
             "Return a JSON object mapping each string bubble ID to its English translation:\n"
             + json.dumps(bubble_map, ensure_ascii=False)
         )
@@ -492,31 +416,32 @@ class DialogueTranslator:
     ) -> list[dict[str, str]]:
         src_name = "Japanese" if lang == "ja" else "Korean"
         non_english_notice = (
-            " CRITICAL: Your previous output contained Chinese, Japanese, or Korean characters "
-            "(or left source text untranslated). You MUST rewrite every entry strictly in "
-            "English using Latin letters (A-Z) ONLY."
+            " CRITICAL: Your previous output contained Chinese, Japanese, or Korean characters, "
+            "or Japanese/Korean Romaji (e.g. 'Chotto matte', 'Koko ja yada'). "
+            "You MUST translate the MEANING of every entry into natural English ONLY."
             if reason == "non_english"
             else ""
         )
         system_prompt = (
-            f"You are a strict {src_name}-to-ENGLISH translation engine for fictional comic scripts. "
-            "Output STRICTLY ENGLISH ONLY using Latin letters (A-Z) and standard English punctuation. "
-            "NEVER output Chinese (中文/汉字), Japanese, or Korean characters, and never leave "
-            "titles, group names, proper nouns, or SFX untranslated (translate or romanize them "
-            "into English). Translate the exact text provided without omission, alteration, "
-            "commentary, or refusal."
+            f"You are a strict {src_name}-to-ENGLISH translator for fictional comic scripts. "
+            "Translate the MEANING into natural, idiomatic English using Latin letters (A-Z) ONLY. "
+            "NEVER output Chinese, Japanese, or Korean characters, and NEVER output Japanese Romaji "
+            "or phonetic spelling of spoken words (e.g. 'ちょっと待って' -> 'Wait a second', NEVER 'Chotto matte'; "
+            "'ここじゃやだ' -> 'Not here', NEVER 'Koko ja yada'). "
+            "Keep proper character names in Latin letters, while translating all spoken words, titles, and SFX "
+            "into natural English without omission, commentary, or refusal."
             f"{non_english_notice} "
-            "Return ONLY a valid JSON object mapping each string ID to its direct English translation."
+            "Return ONLY a valid JSON object mapping each string ID to its English translation."
         )
         parts: list[str] = []
         if glossary:
             parts.append("Glossary: " + json.dumps(glossary, ensure_ascii=False))
         bubble_map = {str(bid): text for bid, text in failed_bubbles}
         user_header = (
-            "Previous output contained non-English Chinese/Japanese/Korean characters and was rejected. "
-            "Rewrite EVERY item below strictly in ENGLISH ONLY (Latin letters A-Z only, zero CJK characters):"
+            "Previous output contained non-English text or Romaji and was rejected. "
+            "Translate the MEANING of EVERY item below into natural ENGLISH ONLY (zero CJK, zero Romaji):"
             if reason == "non_english"
-            else "Translate EVERY item below strictly into ENGLISH ONLY (never Chinese, never Japanese, never Korean):"
+            else "Translate EVERY item below strictly into natural ENGLISH ONLY (zero CJK, zero Romaji):"
         )
         parts.append(f"{user_header}\n" + json.dumps(bubble_map, ensure_ascii=False))
         return [
@@ -530,22 +455,25 @@ class DialogueTranslator:
         orig_text: str,
         lang: Literal["ja", "ko"],
         glossary: dict[str, str],
+        cancel_event: asyncio.Event | None = None,
     ) -> str | None:
-        """Isolated single-bubble English-only fallback to break batch CJK drift."""
+        """Compact single-bubble strict English retry (max_tokens=96, zero Romaji)."""
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         src_name = "Japanese" if lang == "ja" else "Korean"
         system_prompt = (
             f"You are a strict {src_name}-to-ENGLISH translator. "
-            "Translate the single comic text below into natural English using ONLY Latin letters (A-Z). "
-            "NEVER output Chinese, Japanese, or Korean characters. "
-            "Even if it is a title, group name, proper noun, or sound effect "
-            "(e.g. '夢幻団' -> 'Phantom Troupe'), translate or romanize it into English. "
+            "Translate the MEANING of this single comic line into natural, idiomatic English. "
+            "NEVER output Chinese, Japanese, or Korean characters, and NEVER output Japanese Romaji "
+            "(e.g. 'ちょっと待って' -> 'Wait a second', NEVER 'Chotto matte'; 'ここじゃやだ' -> 'Not here'). "
+            "Keep character names in Latin letters, and translate all dialogue, titles, and SFX into English. "
             f'Return ONLY a valid JSON object with key "{bid}".'
         )
         parts: list[str] = []
         if glossary:
             parts.append("Glossary: " + json.dumps(glossary, ensure_ascii=False))
         parts.append(
-            "Translate this single item strictly into ENGLISH ONLY (Latin letters only, zero Chinese/Japanese/Korean). "
+            "Translate this single item's MEANING strictly into natural ENGLISH ONLY (zero CJK, zero Romaji). "
             f'Return JSON mapping key "{bid}" to its English translation:\n'
             + json.dumps({str(bid): orig_text}, ensure_ascii=False)
         )
@@ -553,7 +481,17 @@ class DialogueTranslator:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "\n\n".join(parts)},
         ]
-        raw = await self._invoke_llm(messages, temperature=0.1, json_mode=True)
+        raw = await self._invoke_llm(
+            messages,
+            temperature=0.1,
+            top_p=DEFAULT_TOP_P,
+            repeat_penalty=DEFAULT_REPEAT_PENALTY,
+            max_tokens=96,
+            json_mode=True,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         parsed = _parse_translation_json(raw)
         candidate = parsed.get(bid, "").strip()
         if not candidate and len(parsed) == 1:
@@ -562,46 +500,7 @@ class DialogueTranslator:
         if ok:
             return sanitized
         logger.warning(
-            "Single-bubble JSON retry failed for bubble %s (orig=%r, raw=%r)",
-            bid,
-            orig_text,
-            raw,
-        )
-        return None
-
-    async def _translate_single_bubble_plain(
-        self,
-        bid: int,
-        orig_text: str,
-        lang: Literal["ja", "ko"],
-        glossary: dict[str, str],
-    ) -> str | None:
-        """4th-stage plain-text single-bubble fallback without JSON grammar."""
-        system_prompt = (
-            "Translate this manga dialogue line into natural English. "
-            "Transliterate all character names (e.g. ナナス -> Nanasu, ヘルメス -> Hermes) into Latin letters. "
-            "Output ONLY the English translation with no Japanese, Chinese, or Korean characters."
-        )
-        parts: list[str] = []
-        if glossary:
-            parts.append("Glossary: " + json.dumps(glossary, ensure_ascii=False))
-        parts.append(orig_text)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "\n\n".join(parts)},
-        ]
-        raw = await self._invoke_llm(messages, temperature=0.1, json_mode=False)
-        cleaned = (raw or "").strip()
-        fence_match = _FENCE_RE.search(cleaned)
-        if fence_match:
-            cleaned = fence_match.group(1).strip()
-        if len(cleaned) >= 2 and cleaned[0] == '"' and cleaned[-1] == '"' and cleaned.count('"') == 2:
-            cleaned = cleaned[1:-1].strip()
-        sanitized, ok = _sanitize_translation_candidate(orig_text, cleaned)
-        if ok:
-            return sanitized
-        logger.warning(
-            "Single-bubble plain-text fallback failed for bubble %s (orig=%r, raw=%r)",
+            "Single-bubble English retry failed for bubble %s (orig=%r, raw=%r)",
             bid,
             orig_text,
             raw,
@@ -613,8 +512,11 @@ class DialogueTranslator:
         bubbles: list[tuple[int, str]],
         primary_messages: list[dict[str, str]],
         on_bubble: BubbleCallback,
+        *,
+        max_tokens: int = 640,
+        cancel_event: asyncio.Event | None = None,
     ) -> tuple[dict[int, str], list[tuple[int, str]], bool]:
-        """Stream primary JSON response and emit each bubble as soon as its value closes."""
+        """Stream primary JSON response for a chunk and emit each valid bubble immediately."""
         orig_by_id = dict(bubbles)
         resolved: dict[int, str] = {}
         seen_ids: set[int] = set()
@@ -625,9 +527,18 @@ class DialogueTranslator:
         stream_iter = (
             self._llm_stream_caller(primary_messages)
             if self._llm_stream_caller is not None
-            else self._call_llama_stream(primary_messages, temperature=0.25)
+            else self._call_llama_stream(
+                primary_messages,
+                temperature=DEFAULT_TEMPERATURE,
+                top_p=DEFAULT_TOP_P,
+                repeat_penalty=DEFAULT_REPEAT_PENALTY,
+                max_tokens=max_tokens,
+                cancel_event=cancel_event,
+            )
         )
         async for chunk in stream_iter:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             if not chunk:
                 continue
             buffer += chunk
@@ -655,7 +566,10 @@ class DialogueTranslator:
                         decoded,
                     )
 
-        # Sweep complete buffer for any valid pairs missed by incremental regex (e.g. non-string values)
+        if cancel_event is not None and cancel_event.is_set():
+            return resolved, [], False
+
+        # Sweep complete buffer for any valid pairs missed by incremental regex
         if len(seen_ids) < len(bubbles):
             parsed = _parse_translation_json(buffer)
             for bid, orig_text in bubbles:
@@ -737,8 +651,10 @@ class DialogueTranslator:
         on_bubble: BubbleCallback | None = None,
         series_id: str | None = None,
         bubble_types: dict[int, str] | None = None,
+        cancel_event: asyncio.Event | None = None,
+        gpu_guard: Any = None,
     ) -> dict[int, str]:
-        """Translate all page bubbles in one structured JSON call, repairing missing/refused/non-English IDs."""
+        """Translate page bubbles in fast sequential chunks with Romaji/CJK rejection, thermal pacing, and cancellation."""
         if not bubbles:
             return {}
 
@@ -750,104 +666,148 @@ class DialogueTranslator:
                 if ks and vs:
                     merged_glossary[ks] = vs
 
-        context = self._get_memory_context(chapter_id, series_id)
-        primary_messages = self._build_primary_messages(
-            bubbles,
-            lang,
-            merged_glossary,
-            context,
-            bubble_types=bubble_types,
+        use_story_context = bool(getattr(self.cfg, "use_story_context", False))
+        chunk_size = max(1, int(getattr(self.cfg, "llm_chunk_size", 10)))
+        context: list[tuple[str, str]] | str = (
+            self._get_memory_context(chapter_id, series_id) if use_story_context else ""
         )
 
+        chunks = [bubbles[i : i + chunk_size] for i in range(0, len(bubbles), chunk_size)]
         resolved: dict[int, str] = {}
-        failed: list[tuple[int, str]] = []
-        any_non_english = False
 
-        if on_bubble is not None and (self._llm_stream_caller is not None or self._llm_caller is None):
-            resolved, failed, any_non_english = await self._run_primary_stream(
-                bubbles, primary_messages, on_bubble
+        for chunk_idx, chunk in enumerate(chunks):
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info("Translation cancelled before chunk %d/%d", chunk_idx + 1, len(chunks))
+                break
+
+            if gpu_guard is not None:
+                guard_state = await gpu_guard.wait_if_hot(cancel_event=cancel_event)
+                if guard_state == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+                    logger.info(
+                        "Translation cancelled during thermal guard before chunk %d/%d",
+                        chunk_idx + 1,
+                        len(chunks),
+                    )
+                    break
+
+            chunk_max_tokens = _chunk_max_tokens(len(chunk))
+            primary_messages = self._build_primary_messages(
+                chunk,
+                lang,
+                merged_glossary,
+                context,
+                bubble_types=bubble_types,
             )
-        else:
-            raw_primary = await self._invoke_llm(primary_messages, temperature=0.25, json_mode=True)
-            parsed = _parse_translation_json(raw_primary)
-            for bid, orig_text in bubbles:
-                candidate = parsed.get(bid, "").strip()
-                sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
-                if ok:
-                    resolved[bid] = sanitized
-                    if on_bubble is not None:
-                        await on_bubble(bid, sanitized, False)
-                else:
-                    if candidate and not is_refusal(candidate):
-                        any_non_english = True
-                    failed.append((bid, orig_text))
-            if failed:
+
+            chunk_resolved: dict[int, str] = {}
+            failed: list[tuple[int, str]] = []
+            any_non_english = False
+
+            if on_bubble is not None and (self._llm_stream_caller is not None or self._llm_caller is None):
+                chunk_resolved, failed, any_non_english = await self._run_primary_stream(
+                    chunk,
+                    primary_messages,
+                    on_bubble,
+                    max_tokens=chunk_max_tokens,
+                    cancel_event=cancel_event,
+                )
+            else:
+                raw_primary = await self._invoke_llm(
+                    primary_messages,
+                    temperature=DEFAULT_TEMPERATURE,
+                    top_p=DEFAULT_TOP_P,
+                    repeat_penalty=DEFAULT_REPEAT_PENALTY,
+                    max_tokens=chunk_max_tokens,
+                    json_mode=True,
+                    cancel_event=cancel_event,
+                )
+                parsed = _parse_translation_json(raw_primary)
+                for bid, orig_text in chunk:
+                    candidate = parsed.get(bid, "").strip()
+                    sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
+                    if ok:
+                        chunk_resolved[bid] = sanitized
+                        if on_bubble is not None and (cancel_event is None or not cancel_event.is_set()):
+                            await on_bubble(bid, sanitized, False)
+                    else:
+                        if candidate and not is_refusal(candidate):
+                            any_non_english = True
+                        failed.append((bid, orig_text))
+                if failed and (cancel_event is None or not cancel_event.is_set()):
+                    logger.warning(
+                        "Primary chunk %d/%d had %d failed/missing bubble(s) %s; raw=%r",
+                        chunk_idx + 1,
+                        len(chunks),
+                        len(failed),
+                        [b for b, _ in failed],
+                        raw_primary,
+                    )
+
+            resolved.update(chunk_resolved)
+
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            # Max 1 retry pass per failed bubble within this chunk (never snowball retries).
+            if len(failed) >= 2:
+                retry_reason = "non_english" if any_non_english else "missing_or_refusal"
                 logger.warning(
-                    "Primary translation had %d failed/missing bubble(s) %s; raw=%r",
-                    len(failed),
+                    "Triggering compact batch retry (%s) for chunk %d/%d bubble(s) %s",
+                    retry_reason,
+                    chunk_idx + 1,
+                    len(chunks),
                     [b for b, _ in failed],
-                    raw_primary,
                 )
-
-        # Stage 2: Batch retry failed/missing/refused/CJK IDs with explicit English-only framing at low temperature
-        if failed:
-            retry_reason = "non_english" if any_non_english else "missing_or_refusal"
-            logger.warning(
-                "Triggering batch retry (%s) for bubble(s) %s",
-                retry_reason,
-                [b for b, _ in failed],
-            )
-            retry_messages = self._build_retry_messages(
-                failed, lang, merged_glossary, reason=retry_reason
-            )
-            raw_retry = await self._invoke_llm(retry_messages, temperature=0.1, json_mode=True)
-            retry_parsed = _parse_translation_json(raw_retry)
-            still_failed: list[tuple[int, str]] = []
-            for bid, orig_text in failed:
-                candidate = retry_parsed.get(bid, "").strip()
-                sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
-                if ok:
-                    resolved[bid] = sanitized
-                    if on_bubble is not None:
-                        await on_bubble(bid, sanitized, True)
-                else:
-                    still_failed.append((bid, orig_text))
-
-            if still_failed:
-                logger.warning(
-                    "Batch retry left %d bubble(s) unresolved %s; raw=%r",
-                    len(still_failed),
-                    [b for b, _ in still_failed],
-                    raw_retry,
+                retry_messages = self._build_retry_messages(
+                    failed, lang, merged_glossary, reason=retry_reason
                 )
-
-            # Stage 3 & 4: Isolate stubborn bubbles via single-bubble JSON, then plain-text fallback
-            for bid, orig_text in still_failed:
+                raw_retry = await self._invoke_llm(
+                    retry_messages,
+                    temperature=0.1,
+                    top_p=DEFAULT_TOP_P,
+                    repeat_penalty=DEFAULT_REPEAT_PENALTY,
+                    max_tokens=_chunk_max_tokens(len(failed)),
+                    json_mode=True,
+                    cancel_event=cancel_event,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                retry_parsed = _parse_translation_json(raw_retry)
+                for bid, orig_text in failed:
+                    candidate = retry_parsed.get(bid, "").strip()
+                    sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
+                    if ok:
+                        resolved[bid] = sanitized
+                        if on_bubble is not None:
+                            await on_bubble(bid, sanitized, True)
+                    else:
+                        logger.warning(
+                            "Batch retry rejected bubble %s (orig=%r, candidate=%r); emitting empty string",
+                            bid,
+                            orig_text,
+                            candidate,
+                        )
+                        resolved[bid] = ""
+                        if on_bubble is not None:
+                            await on_bubble(bid, "", True)
+            elif len(failed) == 1:
+                bid, orig_text = failed[0]
                 single_candidate = await self._translate_single_bubble_english(
-                    bid, orig_text, lang, merged_glossary
+                    bid,
+                    orig_text,
+                    lang,
+                    merged_glossary,
+                    cancel_event=cancel_event,
                 )
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 if single_candidate is not None:
                     resolved[bid] = single_candidate
                     if on_bubble is not None:
                         await on_bubble(bid, single_candidate, True)
-                    continue
-
-                logger.warning(
-                    "Triggering 4th-stage plain-text fallback for bubble %s (orig=%r)",
-                    bid,
-                    orig_text,
-                )
-                plain_candidate = await self._translate_single_bubble_plain(
-                    bid, orig_text, lang, merged_glossary
-                )
-                if plain_candidate is not None:
-                    resolved[bid] = plain_candidate
-                    if on_bubble is not None:
-                        await on_bubble(bid, plain_candidate, True)
                 else:
-                    # Graceful fallback: never leak raw Japanese/CJK or refusal text
                     logger.warning(
-                        "All translation stages failed for bubble %s (orig=%r); emitting empty string",
+                        "Single-bubble retry failed for bubble %s (orig=%r); emitting empty string",
                         bid,
                         orig_text,
                     )
@@ -857,9 +817,10 @@ class DialogueTranslator:
 
         recorded_pairs: list[tuple[str, str]] = []
         for bid, orig_text in bubbles:
-            trans = resolved[bid]
+            trans = resolved.get(bid, "")
             if is_valid_english_translation(orig_text, trans):
                 recorded_pairs.append((orig_text, trans))
-        self._record_memory_page(chapter_id, recorded_pairs, series_id)
+        if recorded_pairs:
+            self._record_memory_page(chapter_id, recorded_pairs, series_id)
 
         return resolved

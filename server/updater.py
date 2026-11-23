@@ -118,6 +118,7 @@ class UpdateManager:
         self._updating: bool = False
         self._restart_required: bool = False
         self._restart_scheduled: bool = False
+        self._git_snap_cache: tuple[float, _GitSnapshot] | None = None
 
     def _run_git(self, args: list[str], timeout: float) -> tuple[int, str, str]:
         if not (self.repo_root / ".git").exists():
@@ -212,13 +213,27 @@ class UpdateManager:
                 return candidate
         return None
 
+    def _get_cached_git_snapshot(self, max_age_sec: float = 5.0) -> _GitSnapshot:
+        now = time.monotonic()
+        with self._state_lock:
+            if self._git_snap_cache is not None and (now - self._git_snap_cache[0]) < max_age_sec:
+                return self._git_snap_cache[1]
+        snap = self._inspect_git_local()
+        with self._state_lock:
+            self._git_snap_cache = (time.monotonic(), snap)
+        return snap
+
+    def _invalidate_git_snapshot(self) -> None:
+        with self._state_lock:
+            self._git_snap_cache = None
+
     def detect_has_remote(self) -> bool:
         """Return True if repo_root is a git repository with a configured remote."""
-        return self._inspect_git_local().has_remote
+        return self._get_cached_git_snapshot().has_remote
 
     def get_health_fields(self) -> dict[str, object]:
         """Return extension version/build ID and cached remote update flags for /health."""
-        snap = self._inspect_git_local()
+        snap = self._get_cached_git_snapshot()
         ext_version = read_extension_version(self.extension_dir)
         ext_build_id = compute_extension_build_id(self.extension_dir)
         with self._state_lock:
@@ -232,6 +247,7 @@ class UpdateManager:
 
     def get_status(self) -> UpdateStatusResponse:
         """Return live extension build ID, local git metadata, and cached remote update state."""
+        self._invalidate_git_snapshot()
         snap = self._inspect_git_local()
         ext_version = read_extension_version(self.extension_dir)
         ext_build_id = compute_extension_build_id(self.extension_dir)
@@ -266,6 +282,7 @@ class UpdateManager:
     def check_for_updates(self, auto_apply: bool = False) -> UpdateStatusResponse:
         """Fetch remote commits if configured and optionally apply fast-forward updates."""
         with self._op_lock:
+            self._invalidate_git_snapshot()
             snap = self._inspect_git_local()
             if not snap.has_remote:
                 with self._state_lock:
@@ -353,6 +370,7 @@ class UpdateManager:
     def apply_update(self) -> UpdateApplyResponse:
         """Apply a safe fast-forward git pull when a remote exists and tree is clean."""
         with self._op_lock:
+            self._invalidate_git_snapshot()
             snap = self._inspect_git_local()
             if not snap.has_remote:
                 return UpdateApplyResponse(

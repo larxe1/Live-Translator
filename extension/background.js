@@ -179,6 +179,92 @@ function getAlarms(deps = {}) {
   return typeof chrome !== "undefined" ? chrome.alarms ?? null : null;
 }
 
+function getTabs(deps = {}) {
+  if (deps.tabs !== undefined) return deps.tabs;
+  return typeof chrome !== "undefined" ? chrome.tabs ?? null : null;
+}
+
+function getScripting(deps = {}) {
+  if (deps.scripting !== undefined) return deps.scripting;
+  return typeof chrome !== "undefined" ? chrome.scripting ?? null : null;
+}
+
+async function ensureTabContentScript(tabId, deps = {}) {
+  const tabs = getTabs(deps);
+  const scripting = getScripting(deps);
+  if (!tabId) return { ok: false, error: "No tabId" };
+
+  if (tabs && typeof tabs.sendMessage === "function") {
+    try {
+      const pong = await tabs.sendMessage(tabId, { type: "PING_CONTENT_SCRIPT" });
+      if (pong && pong.ok) {
+        return { ok: true, injected: false, alreadyActive: true };
+      }
+    } catch (_err) {
+      // Content script missing or invalidated; proceed to inject.
+    }
+  }
+
+  if (!scripting || typeof scripting.executeScript !== "function") {
+    return { ok: false, error: "Scripting API unavailable" };
+  }
+
+  try {
+    if (typeof scripting.insertCSS === "function") {
+      try {
+        await scripting.insertCSS({ target: { tabId }, files: ["styles.css"] });
+      } catch (_cssErr) {
+        // Ignore CSS injection failures on restricted frames.
+      }
+    }
+    await scripting.executeScript({
+      target: { tabId },
+      files: ["overlay.js", "content.js"],
+    });
+    return { ok: true, injected: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function reinjectContentScriptsInOpenTabs(deps = {}) {
+  const tabs = getTabs(deps);
+  if (!tabs || typeof tabs.query !== "function") return 0;
+  let list = [];
+  try {
+    list = (await tabs.query({ url: ["http://*/*", "https://*/*"] })) || [];
+  } catch (_err) {
+    return 0;
+  }
+  let count = 0;
+  for (const tab of list) {
+    if (!tab?.id) continue;
+    const res = await ensureTabContentScript(tab.id, deps);
+    if (res.ok && res.injected) count += 1;
+  }
+  return count;
+}
+
+async function notifyOpenTabsEngineReady(deps = {}) {
+  const tabs = getTabs(deps);
+  if (!tabs || typeof tabs.query !== "function" || typeof tabs.sendMessage !== "function") {
+    return;
+  }
+  try {
+    const list = (await tabs.query({ url: ["http://*/*", "https://*/*"] })) || [];
+    for (const tab of list) {
+      if (!tab?.id) continue;
+      try {
+        await tabs.sendMessage(tab.id, { type: "ENGINE_READY" });
+      } catch (_err) {
+        // Ignore tabs without active content script.
+      }
+    }
+  } catch (_err) {
+    // Ignore tab query errors.
+  }
+}
+
 function getLocalManifestVersion(deps = {}) {
   if (deps.localVersion) return String(deps.localVersion);
   const runtime = getRuntime(deps);
@@ -648,7 +734,10 @@ async function handleMessage(message, sender = {}, deps = {}) {
       try {
         const data = await fetchJson(`${serverBase}/health`, { method: "GET" }, fetchImpl);
         if (data?.ready === true) {
-          await clearServerStartingAt(deps);
+          const wasStarting = await clearServerStartingAt(deps);
+          if (wasStarting) {
+            void notifyOpenTabsEngineReady(deps);
+          }
         }
         await maybeAutoReloadForBuild(data?.extension_build_id, {}, deps);
         return { ok: true, data };
@@ -659,6 +748,22 @@ async function handleMessage(message, sender = {}, deps = {}) {
         );
         return { ok: false, offline: true, starting, error: err.message };
       }
+    }
+
+    case "ENSURE_CONTENT_SCRIPT": {
+      let targetTabId = message?.tabId || sender?.tab?.id || null;
+      if (!targetTabId) {
+        const tabs = getTabs(deps);
+        if (tabs && typeof tabs.query === "function") {
+          try {
+            const [activeTab] = (await tabs.query({ active: true, currentWindow: true })) || [];
+            targetTabId = activeTab?.id || null;
+          } catch (_err) {
+            targetTabId = null;
+          }
+        }
+      }
+      return await ensureTabContentScript(targetTabId, deps);
     }
 
     case "START_SERVER": {
@@ -1212,6 +1317,7 @@ function registerExtensionListeners() {
       }
       void ensureUpdateAlarm();
       void runScheduledUpdateCheck();
+      void reinjectContentScriptsInOpenTabs();
     });
   }
 
@@ -1219,6 +1325,7 @@ function registerExtensionListeners() {
     chrome.runtime.onStartup.addListener(() => {
       void ensureUpdateAlarm();
       void runScheduledUpdateCheck();
+      void reinjectContentScriptsInOpenTabs();
     });
   }
 
@@ -1269,6 +1376,9 @@ if (typeof module !== "undefined" && module.exports) {
     runScheduledUpdateCheck,
     sendNativeCommand,
     startServerViaNativeHost,
+    ensureTabContentScript,
+    reinjectContentScriptsInOpenTabs,
+    notifyOpenTabsEngineReady,
     handleMessage,
     handlePortConnect,
     registerExtensionListeners,

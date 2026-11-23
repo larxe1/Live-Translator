@@ -455,3 +455,58 @@ test("7. content.js transitions to 'Starting Engine...', polls GET_HEALTH, and a
   assert.equal(translateCalls, 2);
   assert.equal(statusText.textContent, "Translated 1/1");
 });
+
+test("8. content.js notifyEngineReady recovers from start timeout and auto-translates", async () => {
+  const { doc, win } = createMinimalDom();
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/page1.jpg";
+  doc.body.appendChild(img);
+
+  let serverReady = false;
+  let translateCalls = 0;
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    healthPollIntervalMs: 5,
+    healthPollMaxTries: 2,
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "auto", glossary: {} };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "TRANSLATE_IMAGE") {
+        translateCalls += 1;
+        if (!serverReady) {
+          return { ok: false, offline: true, starting: true, error: "Starting..." };
+        }
+        return { ok: true, data: { lang: "ja", width: 800, height: 1200, bubbles: [] } };
+      }
+      if (msg.type === "GET_HEALTH") {
+        return { ok: true, data: { ready: false, loading_stage: "starting_llm" } };
+      }
+      return { ok: true };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  controller.setVisibility(img, true);
+  await controller.refreshVisibleAndLookahead();
+  await new Promise((r) => setTimeout(r, 40));
+
+  const pill = doc.body.children.find((c) => c.className === "mlt-pill");
+  const statusText = pill.children[0].children[0].children[1];
+  assert.equal(statusText.textContent, "Start timed out — Click to retry");
+
+  serverReady = true;
+  controller.notifyEngineReady();
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(translateCalls, 2);
+  assert.equal(statusText.textContent, "Translated 1/1");
+});

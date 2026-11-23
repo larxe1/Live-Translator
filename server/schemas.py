@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -72,6 +72,7 @@ class HealthResponse(BaseModel):
     extension_build_id: str = ""
     has_remote: bool = False
     update_available: bool = False
+    gpu_guard: dict[str, Any] = Field(default_factory=dict)
 
 
 class UpdateStatusResponse(BaseModel):

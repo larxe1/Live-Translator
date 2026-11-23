@@ -18,7 +18,11 @@ from PIL import Image
 from server.cache import TranslationCache
 from server.ocr.engine import is_meaningful_dialogue
 from server.schemas import Box, BubbleResult, TranslateResponse
-from server.translator.memory import ChapterMemoryStore, contains_non_english_cjk
+from server.translator.memory import (
+    ChapterMemoryStore,
+    contains_non_english_cjk,
+    looks_like_romaji,
+)
 from server.vision.detector import sort_reading_order
 from server.vision.geometry import BubbleStyle, analyze_bubble_appearance
 from server.vision.slicer import RawDetection
@@ -39,6 +43,7 @@ class _QueueItem:
     fn: Callable[[], Awaitable[Any]]
     future: asyncio.Future[Any]
     request_id: str | None = None
+    cancel_event: asyncio.Event | None = None
     cancelled: bool = False
 
 
@@ -57,6 +62,8 @@ class PriorityGpuQueue:
         self._counter = itertools.count()
         self._worker_task: asyncio.Task[None] | None = None
         self._items_by_id: dict[str, list[_QueueItem]] = defaultdict(list)
+        self._active_cancel_events: dict[str, list[asyncio.Event]] = defaultdict(list)
+        self._all_active_events: set[asyncio.Event] = set()
         self._stopping = False
 
     async def start(self) -> None:
@@ -68,14 +75,20 @@ class PriorityGpuQueue:
             self._worker_task = asyncio.create_task(self._worker_loop(), name="gpu-priority-worker")
 
     async def stop(self) -> None:
-        """Stop the worker coroutine and cancel any pending queued jobs."""
+        """Stop the worker coroutine and cancel any pending or active GPU jobs."""
         self._stopping = True
         while self._heap:
             _, _, item = heapq.heappop(self._heap)
             item.cancelled = True
+            if item.cancel_event is not None:
+                item.cancel_event.set()
             if not item.future.done():
                 item.future.cancel()
         self._items_by_id.clear()
+        for ev in list(self._all_active_events):
+            ev.set()
+        self._active_cancel_events.clear()
+        self._all_active_events.clear()
         if self._wakeup is not None:
             self._wakeup.set()
 
@@ -138,6 +151,7 @@ class PriorityGpuQueue:
         priority: int,
         fn: Callable[[], Awaitable[T]],
         request_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> T:
         """Enqueue an async job and await its result in priority + FIFO order."""
         await self.start()
@@ -155,6 +169,7 @@ class PriorityGpuQueue:
             fn=fn,
             future=future,
             request_id=request_id,
+            cancel_event=cancel_event,
         )
         if request_id:
             self._items_by_id[request_id].append(item)
@@ -165,15 +180,23 @@ class PriorityGpuQueue:
             return await future
         except asyncio.CancelledError:
             item.cancelled = True
+            if item.cancel_event is not None:
+                item.cancel_event.set()
             raise
 
     def cancel(self, request_id: str) -> None:
-        """Cancel all pending queued jobs matching request_id."""
+        """Cancel all pending queued jobs AND signal any active in-flight job matching request_id."""
         items = self._items_by_id.pop(request_id, [])
         for item in items:
             item.cancelled = True
+            if item.cancel_event is not None:
+                item.cancel_event.set()
             if not item.future.done():
                 item.future.cancel()
+        active_events = self._active_cancel_events.get(request_id)
+        if active_events:
+            for ev in list(active_events):
+                ev.set()
 
     async def _worker_loop(self) -> None:
         assert self._wakeup is not None
@@ -197,6 +220,11 @@ class PriorityGpuQueue:
             if item.cancelled or item.future.cancelled() or item.future.done():
                 continue
 
+            if item.cancel_event is not None:
+                self._all_active_events.add(item.cancel_event)
+                if item.request_id:
+                    self._active_cancel_events[item.request_id].append(item.cancel_event)
+
             try:
                 result = await item.fn()
             except asyncio.CancelledError:
@@ -210,6 +238,19 @@ class PriorityGpuQueue:
             else:
                 if not item.future.done():
                     item.future.set_result(result)
+            finally:
+                if item.cancel_event is not None:
+                    self._all_active_events.discard(item.cancel_event)
+                    if item.request_id and item.request_id in self._active_cancel_events:
+                        rem_ev = [
+                            ev
+                            for ev in self._active_cancel_events[item.request_id]
+                            if ev is not item.cancel_event
+                        ]
+                        if rem_ev:
+                            self._active_cancel_events[item.request_id] = rem_ev
+                        else:
+                            del self._active_cancel_events[item.request_id]
 
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -303,6 +344,8 @@ class TranslationPipeline:
         max_image_width: int = 2400,
         max_queue_size: int = 12,
         ensure_llm_ready: Callable[[], Awaitable[None]] | None = None,
+        gpu_guard: Any = None,
+        cfg: Any = None,
     ) -> None:
         self.detector = detector
         self.ocr = ocr
@@ -312,6 +355,15 @@ class TranslationPipeline:
         self.max_image_bytes = int(max_image_bytes)
         self.max_image_width = int(max_image_width)
         self.ensure_llm_ready = ensure_llm_ready
+        self.cfg = cfg
+        if gpu_guard is None and cfg is not None:
+            try:
+                from server.gpu_guard import GpuSafetyGuard
+
+                gpu_guard = GpuSafetyGuard(cfg)
+            except Exception:
+                gpu_guard = None
+        self.gpu_guard = gpu_guard
         self.queue = queue if queue is not None else PriorityGpuQueue(max_queue_size=max_queue_size)
 
     async def start(self) -> None:
@@ -322,9 +374,13 @@ class TranslationPipeline:
         """Stop the underlying priority GPU worker queue."""
         await self.queue.stop()
 
-    def cancel(self, request_id: str) -> None:
-        """Cancel a pending queued translation request by request_id."""
+    def cancel_request(self, request_id: str) -> None:
+        """Cancel pending queued items and abort any active in-flight request matching request_id."""
         self.queue.cancel(request_id)
+
+    def cancel(self, request_id: str) -> None:
+        """Alias for cancel_request(request_id)."""
+        self.cancel_request(request_id)
 
     def _record_cached_context(
         self,
@@ -370,6 +426,14 @@ class TranslationPipeline:
             cache_key = self.cache.make_key(image_bytes, lang, merged_glossary)
         return merged_glossary, cache_key
 
+    async def _wait_gpu_guard(self, cancel_event: asyncio.Event) -> None:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError("Translation request cancelled")
+        if self.gpu_guard is not None:
+            state = await self.gpu_guard.wait_if_hot(cancel_event=cancel_event)
+            if state == "cancelled" or cancel_event.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
+
     async def _run_gpu_job(
         self,
         image_bytes: bytes,
@@ -382,7 +446,12 @@ class TranslationPipeline:
         *,
         include_floating: bool = True,
         series_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> TranslateResponse:
+        cancel_ev = cancel_event if cancel_event is not None else asyncio.Event()
+        if cancel_ev.is_set():
+            raise asyncio.CancelledError("Translation request cancelled")
+
         # Re-check cache in case an identical image finished while we waited in queue.
         cached_inner = self.cache.get(cache_key)
         if cached_inner is not None:
@@ -403,6 +472,8 @@ class TranslationPipeline:
 
         if self.ensure_llm_ready is not None:
             await self.ensure_llm_ready()
+
+        await self._wait_gpu_guard(cancel_ev)
 
         t0 = time.perf_counter()
         detector_ms = 0
@@ -504,6 +575,7 @@ class TranslationPipeline:
                 det_styles.append((det, style))
                 crops_with_dark.append((crop, style.is_dark))
 
+            await self._wait_gpu_guard(cancel_ev)
             t_ocr0 = time.perf_counter()
             resolved_lang, ocr_texts = await _call_maybe_async(
                 self.ocr.read_page_bubbles,
@@ -512,6 +584,8 @@ class TranslationPipeline:
                 aspect_ratio=infer_h / max(infer_w, 1),
             )
             ocr_ms = int((time.perf_counter() - t_ocr0) * 1000)
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
 
             meaningful: list[tuple[RawDetection, BubbleStyle, str]] = []
             for (det, style), text in zip(det_styles, ocr_texts):
@@ -641,11 +715,18 @@ class TranslationPipeline:
                 tr_kwargs["series_id"] = series_id
             if _accepts_kwarg(self.translator.translate_page, "bubble_types"):
                 tr_kwargs["bubble_types"] = bubble_types
+            if _accepts_kwarg(self.translator.translate_page, "cancel_event"):
+                tr_kwargs["cancel_event"] = cancel_ev
+            if _accepts_kwarg(self.translator.translate_page, "gpu_guard"):
+                tr_kwargs["gpu_guard"] = self.gpu_guard
 
+            await self._wait_gpu_guard(cancel_ev)
             translations: dict[int, str] = await self.translator.translate_page(
                 prompt_bubbles,
                 **tr_kwargs,
             )
+            if cancel_ev.is_set():
+                raise asyncio.CancelledError("Translation request cancelled")
 
             if emit is not None:
                 for idx, _ in prompt_bubbles:
@@ -727,6 +808,7 @@ class TranslationPipeline:
             self._record_cached_context(chapter_id, cached, series_id=series_id)
             return cached
 
+        cancel_ev = asyncio.Event()
         return await self.queue.enqueue(
             priority=priority,
             fn=lambda: self._run_gpu_job(
@@ -739,8 +821,10 @@ class TranslationPipeline:
                 emit=None,
                 include_floating=include_floating,
                 series_id=series_id,
+                cancel_event=cancel_ev,
             ),
             request_id=request_id,
+            cancel_event=cancel_ev,
         )
 
     async def translate_image_stream(
@@ -779,6 +863,7 @@ class TranslationPipeline:
 
         event_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         sentinel = object()
+        cancel_ev = asyncio.Event()
 
         async def _emit(event: dict[str, Any]) -> None:
             await event_queue.put(event)
@@ -797,8 +882,10 @@ class TranslationPipeline:
                         emit=_emit,
                         include_floating=include_floating,
                         series_id=series_id,
+                        cancel_event=cancel_ev,
                     ),
                     request_id=request_id,
+                    cancel_event=cancel_ev,
                 )
             except asyncio.CancelledError:
                 await event_queue.put({"type": "error", "detail": "Translation request cancelled"})
@@ -816,8 +903,9 @@ class TranslationPipeline:
                     break
                 yield item  # type: ignore[misc]
         finally:
+            cancel_ev.set()
             if request_id:
-                self.cancel(request_id)
+                self.cancel_request(request_id)
             if not driver_task.done():
                 driver_task.cancel()
                 try:
@@ -837,10 +925,15 @@ class TranslationPipeline:
         response: TranslateResponse,
         include_floating: bool = True,
     ) -> None:
-        bad_bubbles = [b.id for b in response.bubbles if contains_non_english_cjk(b.translated)]
+        bad_bubbles = [
+            b.id
+            for b in response.bubbles
+            if contains_non_english_cjk(b.translated)
+            or looks_like_romaji(b.original, b.translated)
+        ]
         if bad_bubbles:
             logger.warning(
-                "Skipping translation cache write: non-English CJK characters remain in bubble(s) %s",
+                "Skipping translation cache write: non-English CJK or Romaji remains in bubble(s) %s",
                 bad_bubbles,
             )
             return

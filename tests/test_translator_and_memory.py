@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +23,7 @@ from server.translator.translator import (
     contains_non_english_cjk,
     is_refusal,
     is_valid_english_translation,
-    romanize_residual_kana,
+    looks_like_romaji,
 )
 
 
@@ -126,12 +128,15 @@ def test_llama_manager_model_resolution_and_vram_capped_command(tmp_path):
     assert mgr.model_name == gguf.name
 
     cmd = mgr.build_command(exe, gguf)
+    expected_batch = str(getattr(cfg, "llm_batch_size", 512))
     assert "--host" in cmd and "127.0.0.1" in cmd
     assert "--port" in cmd and "8766" in cmd
     assert "--ctx-size" in cmd and "4096" in cmd
-    assert "--batch-size" in cmd and "512" in cmd
+    assert "--batch-size" in cmd and expected_batch in cmd
     assert "--parallel" in cmd and "1" in cmd
-    assert "-ngl" in cmd and "99" in cmd
+    assert "-ngl" in cmd
+    ngl_val = int(cmd[cmd.index("-ngl") + 1])
+    assert 0 <= ngl_val <= 99
 
 
 def test_contains_non_english_cjk_and_valid_english_translation():
@@ -222,22 +227,19 @@ async def test_translator_retries_chinese_drift_and_anchors_english_prompt():
 
 
 @pytest.mark.asyncio
-async def test_translator_falls_back_to_single_bubble_isolation_after_batch_retry():
+async def test_translator_caps_retry_pass_and_isolates_single_failed_bubble():
     memory = ChapterMemoryStore()
     calls: list[list[dict[str, str]]] = []
 
-    async def stubborn_cjk_llm(messages):
+    async def single_failure_llm(messages):
         calls.append(messages)
         if len(calls) == 1:
-            # Primary: 0 and 1 drift to Chinese, 2 is English
-            return '{"0": "夢幻団", "1": "之前的首领", "2": "Move out!"}'
-        if len(calls) == 2:
-            # Batch retry: 1 recovers to English, 0 STILL fails
-            return '{"0": "梦幻团", "1": "The previous leader"}'
-        # Single-bubble isolation fallback for 0
+            # Primary: only bubble 0 fails with CJK drift; 1 & 2 succeed
+            return '{"0": "夢幻団", "1": "The previous leader", "2": "Move out!"}'
+        # Direct single-bubble English retry for bubble 0 (max 1 retry pass)
         return '{"0": "Phantom Troupe"}'
 
-    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=stubborn_cjk_llm)
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=single_failure_llm)
     out = await tr.translate_page(
         [(0, "夢幻団"), (1, "以前の長"), (2, "進め！")],
         lang="ja",
@@ -249,12 +251,32 @@ async def test_translator_falls_back_to_single_bubble_isolation_after_batch_retr
         1: "The previous leader",
         2: "Move out!",
     }
-    assert len(calls) == 3
-    # 3rd call is isolated to bubble 0 only
-    assert '"0"' in calls[2][1]["content"]
-    assert '"1"' not in calls[2][1]["content"]
-    assert '"2"' not in calls[2][1]["content"]
+    assert len(calls) == 2
+    assert '"0"' in calls[1][1]["content"]
+    assert '"1"' not in calls[1][1]["content"]
+    assert '"2"' not in calls[1][1]["content"]
+    assert "romanize" not in calls[0][0]["content"].lower()
+    assert "romanize" not in calls[1][0]["content"].lower()
     assert len(memory.get_context("ch-iso")) == 3
+
+    # When >=2 bubbles fail and 1 still fails batch retry, emit "" instead of snowballing retries
+    batch_calls: list[list[dict[str, str]]] = []
+
+    async def stubborn_batch_llm(messages):
+        batch_calls.append(messages)
+        if len(batch_calls) == 1:
+            return '{"0": "夢幻団", "1": "之前的首领", "2": "Move out!"}'
+        return '{"0": "梦幻团", "1": "The previous leader"}'
+
+    tr2 = DialogueTranslator("http://127.0.0.1:8766", ChapterMemoryStore(), llm_caller=stubborn_batch_llm)
+    out2 = await tr2.translate_page(
+        [(0, "夢幻団"), (1, "以前の長"), (2, "進め！")],
+        lang="ja",
+        chapter_id="ch-batch-cap",
+    )
+    assert out2 == {0: "", 1: "The previous leader", 2: "Move out!"}
+    assert len(batch_calls) == 2
+    assert "romanize" not in batch_calls[1][0]["content"].lower()
 
 
 @pytest.mark.asyncio
@@ -311,63 +333,83 @@ def _make_cache_response(translated_text: str, original_text: str = "夢幻団")
     )
 
 
-def test_translation_cache_v3_key_evicts_on_get_and_purges_on_init(tmp_path):
-    assert CACHE_KEY_VERSION == "v3-floating-ctx"
+def test_translation_cache_v4_key_evicts_cjk_and_romaji_and_purges_on_init(tmp_path):
+    assert CACHE_KEY_VERSION == "v4-chunked-en"
     db_path = tmp_path / "translations.db"
     cache = TranslationCache(db_path, max_entries=20)
 
     img_bytes = b"fake-manga-page"
-    v3_key = cache.make_key(img_bytes, "ja", {})
-    v3_key_floating_true = cache.make_key(img_bytes, "ja", {}, include_floating=True)
-    v3_key_floating_false = cache.make_key(img_bytes, "ja", {}, include_floating=False)
-    assert v3_key == v3_key_floating_true
-    assert v3_key != v3_key_floating_false
+    v4_key = cache.make_key(img_bytes, "ja", {})
+    v4_key_floating_true = cache.make_key(img_bytes, "ja", {}, include_floating=True)
+    v4_key_floating_false = cache.make_key(img_bytes, "ja", {}, include_floating=False)
+    assert v4_key == v4_key_floating_true
+    assert v4_key != v4_key_floating_false
 
     legacy_hasher = hashlib.sha256()
     legacy_hasher.update(img_bytes)
     legacy_hasher.update(b"\x00ja\x00{}")
-    assert v3_key != legacy_hasher.hexdigest()
+    assert v4_key != legacy_hasher.hexdigest()
 
-    # Poisoned row is rejected and deleted on get()
+    # Poisoned CJK and Romaji rows are refused on put()
     poison_key = cache.make_key(b"poisoned-page", "ja")
     poison_resp = _make_cache_response("我们是从富人那里偷来的财物")
     cache.put(poison_key, poison_resp)
     assert cache.get(poison_key) is None
-    with closing(sqlite3.connect(db_path)) as conn:
-        row = conn.execute(
-            "SELECT payload FROM translations WHERE cache_key = ?", (poison_key,)
-        ).fetchone()
-        assert row is None
 
-    # Pre-seed DB directly with one CJK row and one clean English row, then re-open cache
-    good_key = cache.make_key(b"good-page", "ja")
-    good_resp = _make_cache_response("Phantom Troupe")
-    bad_key = "stale-v1-poisoned-row"
+    romaji_key = cache.make_key(b"romaji-page", "ja")
+    romaji_resp = _make_cache_response("Chotto chotto matte", original_text="ちょっとちょっと待って")
+    cache.put(romaji_key, romaji_resp)
+    assert cache.get(romaji_key) is None
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        rows = conn.execute("SELECT cache_key FROM translations").fetchall()
+        assert rows == []
+
+    # Direct DB-seeded Romaji row is evicted on get()
+    seeded_romaji_key = cache.make_key(b"seeded-romaji", "ja")
     with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
-            (bad_key, poison_resp.model_dump_json(), 1),
+            (seeded_romaji_key, romaji_resp.model_dump_json(), 1),
+        )
+        conn.commit()
+    assert cache.get(seeded_romaji_key) is None
+
+    # Pre-seed DB directly with CJK row, Romaji row, and clean English row, then re-open cache
+    good_key = cache.make_key(b"good-page", "ja")
+    good_resp = _make_cache_response("Phantom Troupe")
+    bad_cjk_key = "stale-v1-cjk-row"
+    bad_romaji_key = "stale-v3-romaji-row"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (bad_cjk_key, poison_resp.model_dump_json(), 1),
         )
         conn.execute(
             "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
-            (good_key, good_resp.model_dump_json(), 2),
+            (bad_romaji_key, romaji_resp.model_dump_json(), 2),
+        )
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (good_key, good_resp.model_dump_json(), 3),
         )
         conn.commit()
 
-    # Re-initializing TranslationCache automatically purges CJK row while preserving English row
+    # Re-initializing TranslationCache automatically purges CJK + Romaji rows while preserving English row
     reopened = TranslationCache(db_path, max_entries=20)
     with closing(sqlite3.connect(db_path)) as conn:
         keys = {
             r[0] for r in conn.execute("SELECT cache_key FROM translations").fetchall()
         }
-    assert bad_key not in keys
+    assert bad_cjk_key not in keys
+    assert bad_romaji_key not in keys
     assert good_key in keys
     hit = reopened.get(good_key)
     assert hit is not None
     assert hit.bubbles[0].translated == "Phantom Troupe"
 
 
-def test_pipeline_skips_caching_when_translation_contains_cjk(tmp_path):
+def test_pipeline_skips_caching_when_translation_contains_cjk_or_romaji(tmp_path):
     memory = ChapterMemoryStore()
     cache = TranslationCache(tmp_path / "translations.db", max_entries=20)
     pipeline = TranslationPipeline(
@@ -384,45 +426,116 @@ def test_pipeline_skips_caching_when_translation_contains_cjk(tmp_path):
     assert cache.get(bad_key) is None
     assert cache.get(cache.make_key(b"page-bad", "auto", {})) is None
 
+    romaji_key = cache.make_key(b"page-romaji", "ja", {})
+    romaji_resp = _make_cache_response("Koko ja yada", original_text="ここじゃやだ")
+    pipeline._store_cache(b"page-romaji", "auto", "ja", {}, romaji_key, romaji_resp)
+    assert cache.get(romaji_key) is None
+
     good_key = cache.make_key(b"page-good", "auto", {})
     good_resp = _make_cache_response("Phantom Troupe")
     pipeline._store_cache(b"page-good", "auto", "ja", {}, good_key, good_resp)
     assert cache.get(good_key) is not None
 
 
-def test_romanize_residual_kana_handles_names_digraphs_and_sentences():
-    assert romanize_residual_kana("ナナス") == "Nanasu"
-    assert romanize_residual_kana("ヘルメス") == "Herumesu"
-    assert romanize_residual_kana("カッパ") == "Kappa"
-    assert romanize_residual_kana("パーティー") == "Paatii"
-    assert romanize_residual_kana("シャウト") == "Shauto"
-    assert (
-        romanize_residual_kana("Currently they chose ナナス (ヘルメス's alias) as leader.")
-        == "Currently they chose Nanasu (Herumesu's alias) as leader."
-    )
+def test_looks_like_romaji_catches_leaks_and_preserves_valid_english_and_names():
+    # Must catch Japanese & Korean Romaji leaks
+    romaji_cases = [
+        ("ちょっとちょっと待って", "Chotto chotto matte"),
+        ("ちょっと待って", "Chotto matte"),
+        ("ここじゃやだ", "Koko ja yada"),
+        ("ベッド行こ？", "Bed ikko?"),
+        ("むしゃむじゃ", "Mushamu musha"),
+        ("やめてください", "Yamete kudasai"),
+        ("なにこれ", "Nani kore"),
+        ("大丈夫ですか", "Daijoubu desu ka"),
+        ("本当に？", "Hontou ni?"),
+        ("それはダメ", "Sore wa dame"),
+        ("コラーッ！", "Koraa!!"),
+        ("コラーッ！", "KORAA!!"),
+        ("一亀見てクロ…", "Ichigame Mite Kuro...coms"),
+        ("カサ・・・", "Kasa... ..."),
+        ("제발 하지마", "Jebal hajima"),
+        ("괜찮아?", "Gwaenchana?"),
+    ]
+    for orig, cand in romaji_cases:
+        assert looks_like_romaji(orig, cand) is True, f"Failed to detect Romaji: {orig!r} -> {cand!r}"
+        assert is_valid_english_translation(orig, cand) is False
+
+    # Must NEVER false-positive on valid English sentences, names, or loanwords
+    valid_cases = [
+        ("マサキ…！！", "Masaki...!!"),
+        ("七海！", "Nanami!"),
+        ("藍星……？", "Ranshin...?"),
+        ("ちょっと", "A little"),
+        ("ちょっと待って", "Wait a second!"),
+        ("ここじゃやだ", "Not here!"),
+        ("ベッド行こ？", "Wanna go to bed?"),
+        ("ベッド行こ？", "Let's go to bed?"),
+        ("健二、待って！", "Kenji, wait for me!"),
+        ("先生、大丈夫？", "Sensei, are you okay?"),
+        ("先生！", "Sensei!"),
+        ("東京", "Tokyo"),
+        ("ラーメン", "Ramen"),
+        ("うそ！", "No way!"),
+        ("何！？", "What?!"),
+        ("おい！", "Hey!"),
+        ("猪股大喜", "Taiki Inomata"),
+        ("七海ちゃんより好きって言って。", "Tell me you love me more than Nanami."),
+    ]
+    for orig, cand in valid_cases:
+        assert looks_like_romaji(orig, cand) is False, f"False positive on valid English/name: {orig!r} -> {cand!r}"
+        assert is_valid_english_translation(orig, cand) is True
 
 
 @pytest.mark.asyncio
-async def test_translator_plain_text_fourth_stage_fallback_and_kana_salvage():
+async def test_translator_rejects_romaji_and_residual_kana_without_auto_romanizing():
     memory = ChapterMemoryStore()
     calls: list[list[dict[str, str]]] = []
-    line = "現在は2人が勝手にナナス（ヘルメスの偽名）を団長に抜擢し"
 
-    async def fake_llm(messages):
+    async def romaji_then_english(messages):
         calls.append(messages)
-        if len(calls) <= 3:
-            # Primary, batch retry, and single-bubble JSON retry all fail with CJK parenthetical
-            return '{"0": "Currently the two made ナナス（ヘルメスの偽名）the leader."}'
-        # 4th-stage plain-text single-bubble retry succeeds (with stray katakana name salvaged)
-        return "Currently, those two arbitrarily made ナナス (Hermes's alias) the leader."
+        if len(calls) == 1:
+            return (
+                '{"0": "Chotto chotto matte", '
+                '"1": "Koko ja yada", '
+                '"2": "They chose ナナス as leader.", '
+                '"3": "Masaki...!!"}'
+            )
+        return (
+            '{"0": "Wait, hold on!", '
+            '"1": "Not here!", '
+            '"2": "They chose Nanasu as leader."}'
+        )
 
-    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm)
-    out = await tr.translate_page([(0, line)], lang="ja", chapter_id="ch-plain")
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=romaji_then_english)
+    out = await tr.translate_page(
+        [
+            (0, "ちょっとちょっと待って"),
+            (1, "ここじゃやだ"),
+            (2, "ナナスを団長に選んだ"),
+            (3, "マサキ…！！"),
+        ],
+        lang="ja",
+        chapter_id="ch-romaji",
+    )
 
-    assert len(calls) == 4
-    assert "Transliterate all character names" in calls[3][0]["content"]
-    assert out[0] == "Currently, those two arbitrarily made Nanasu (Hermes's alias) the leader."
-    assert not contains_non_english_cjk(out[0])
+    assert len(calls) == 2
+    assert out == {
+        0: "Wait, hold on!",
+        1: "Not here!",
+        2: "They chose Nanasu as leader.",
+        3: "Masaki...!!",
+    }
+    # Retry prompt should NOT include bubble 3 ("Masaki...!!" is a valid name)
+    assert '"3"' not in calls[1][1]["content"]
+    assert '"0"' in calls[1][1]["content"]
+    assert '"1"' in calls[1][1]["content"]
+    assert '"2"' in calls[1][1]["content"]
+    assert "romanize" not in calls[0][0]["content"].lower()
+    assert "romanize" not in calls[1][0]["content"].lower()
+    # Memory must never store Romaji pairs
+    memory.record_page("ch-romaji", [("ここじゃやだ", "Koko ja yada")])
+    assert all(t != "Koko ja yada" for _, t in memory.get_context("ch-romaji"))
 
 
 @pytest.mark.asyncio
@@ -541,17 +654,18 @@ def test_chapter_memory_multi_page_formatted_context_and_series_continuity():
 
 
 @pytest.mark.asyncio
-async def test_translator_prompt_includes_series_context_and_floating_hints():
+async def test_translator_prompt_omits_story_context_by_default_and_honors_opt_in():
     memory = ChapterMemoryStore()
     memory.set_glossary("ch1", {"藍星": "Ranshin"}, series_id="my-series")
     memory.record_page("ch1", [("どこだ？", "Where are you?")], series_id="my-series")
-    captured: list[list[dict[str, str]]] = []
+    captured_default: list[list[dict[str, str]]] = []
 
-    async def fake_llm(messages):
-        captured.append(messages)
+    async def fake_llm_default(messages):
+        captured_default.append(messages)
         return '{"0": "Right here, Ranshin.", "1": "*RUSTLE*"}'
 
-    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm)
+    # Default use_story_context=False: omits [Page -1] Story Context, keeps glossary & floating hints
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=fake_llm_default)
     out = await tr.translate_page(
         [(0, "ここだよ、藍星"), (1, "カサカサ")],
         lang="ja",
@@ -560,19 +674,125 @@ async def test_translator_prompt_includes_series_context_and_floating_hints():
         bubble_types={0: "bubble", 1: "floating"},
     )
     assert out == {0: "Right here, Ranshin.", 1: "*RUSTLE*"}
-    sys_prompt = captured[0][0]["content"]
-    usr_prompt = captured[0][1]["content"]
+    sys_prompt = captured_default[0][0]["content"]
+    usr_prompt = captured_default[0][1]["content"]
     assert "STRICTLY ENGLISH ONLY" in sys_prompt
     assert "[floating]" in sys_prompt
-    assert "[Page -1]" in usr_prompt
-    assert "Where are you?" in usr_prompt
+    assert "romanize" not in sys_prompt.lower()
+    assert "[Page -1]" not in usr_prompt
+    assert "Story Context" not in usr_prompt
     assert '"1": [floating]' in usr_prompt
     assert "Ranshin" in usr_prompt
-    assert len(memory.get_context("ch2", series_id="my-series")) == 3
+
+    # Opt-in use_story_context=True restores [Page -1] Story Context
+    captured_ctx: list[list[dict[str, str]]] = []
+
+    async def fake_llm_ctx(messages):
+        captured_ctx.append(messages)
+        return '{"0": "Right here, Ranshin.", "1": "*RUSTLE*"}'
+
+    tr_ctx = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_caller=fake_llm_ctx,
+        cfg=SimpleNamespace(use_story_context=True, llm_chunk_size=10),
+    )
+    await tr_ctx.translate_page(
+        [(0, "ここだよ、藍星"), (1, "カサカサ")],
+        lang="ja",
+        chapter_id="ch2",
+        series_id="my-series",
+        bubble_types={0: "bubble", 1: "floating"},
+    )
+    assert "[Page -1]" in captured_ctx[0][1]["content"]
+    assert "Where are you?" in captured_ctx[0][1]["content"]
 
 
 @pytest.mark.asyncio
-async def test_llama_http_payload_disables_thinking_and_raises_max_tokens(monkeypatch):
+async def test_translator_chunks_25_bubbles_with_sampling_params_and_thermal_guard(monkeypatch):
+    import httpx
+
+    seen_payloads: list[dict[str, object]] = []
+    guard_calls: list[int] = []
+
+    class _FakeGuard:
+        async def wait_if_hot(self, cancel_event=None, max_wait_s=45.0):
+            guard_calls.append(len(seen_payloads))
+            return "ok"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(body)
+        user_msg = body["messages"][1]["content"]
+        json_part = user_msg[user_msg.rfind("{") :]
+        in_map = json.loads(json_part)
+        out_map = {k: f"Line {k} translated!" for k in in_map}
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(out_map)}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", patched_client)
+
+    memory = ChapterMemoryStore()
+    memory.record_page("ch-chunk", [("前のページ", "Previous page line")])
+    cfg = SimpleNamespace(use_story_context=False, llm_chunk_size=10)
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, cfg=cfg)
+
+    bubbles = [(i, f"台詞{i}") for i in range(25)]
+    out = await tr.translate_page(bubbles, lang="ja", chapter_id="ch-chunk", gpu_guard=_FakeGuard())
+
+    assert len(out) == 25
+    assert len(seen_payloads) == 3  # 10 + 10 + 5
+    assert len(guard_calls) == 3
+
+    expected_max_tokens = [560, 560, 280]  # min(640, max(160, n * 56))
+    for payload, exp_max in zip(seen_payloads, expected_max_tokens):
+        assert payload["temperature"] == 0.2
+        assert payload["top_p"] == 0.85
+        assert payload["repeat_penalty"] == 1.12
+        assert payload["max_tokens"] == exp_max
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "[Page -1]" not in payload["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_translator_cancel_event_aborts_remaining_chunks():
+    memory = ChapterMemoryStore()
+    cancel_ev = asyncio.Event()
+    calls = 0
+
+    async def fake_llm(messages):
+        nonlocal calls
+        calls += 1
+        user_msg = messages[1]["content"]
+        in_map = json.loads(user_msg[user_msg.rfind("{") :])
+        if calls == 1:
+            cancel_ev.set()
+        return json.dumps({k: f"Done {k}" for k in in_map})
+
+    tr = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_caller=fake_llm,
+        cfg=SimpleNamespace(use_story_context=False, llm_chunk_size=10),
+    )
+    bubbles = [(i, f"台詞{i}") for i in range(25)]
+    out = await tr.translate_page(bubbles, lang="ja", chapter_id="ch-cancel", cancel_event=cancel_ev)
+
+    assert calls == 1
+    assert len(out) == 10
+
+
+@pytest.mark.asyncio
+async def test_llama_http_payload_disables_thinking_and_sends_sampling_params(monkeypatch):
     import httpx
 
     seen_payloads: list[dict[str, object]] = []
@@ -601,13 +821,16 @@ async def test_llama_http_payload_disables_thinking_and_raises_max_tokens(monkey
     monkeypatch.setattr(httpx, "AsyncClient", patched_client)
 
     tr = DialogueTranslator("http://127.0.0.1:8766", ChapterMemoryStore())
-    raw = await tr._call_llama([{"role": "user", "content": "hi"}])
+    raw = await tr._call_llama([{"role": "user", "content": "hi"}], max_tokens=280)
     assert raw == '{"0": "Hello"}'
 
-    chunks = [c async for c in tr._call_llama_stream([{"role": "user", "content": "hi"}])]
+    chunks = [c async for c in tr._call_llama_stream([{"role": "user", "content": "hi"}], max_tokens=280)]
     assert "".join(chunks) == '{"0": "Hello"}'
 
     assert len(seen_payloads) == 2
     for payload in seen_payloads:
-        assert payload["max_tokens"] == 1536
+        assert payload["max_tokens"] == 280
+        assert payload["temperature"] == 0.2
+        assert payload["top_p"] == 0.85
+        assert payload["repeat_penalty"] == 1.12
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}

@@ -789,3 +789,74 @@ test("9. TRANSLATE_IMAGE runs throttled (10s) post-translate health check and re
   assert.equal(reloads, 1);
   assert.equal(storage._data.knownExtensionBuildId, "build-updated");
 });
+
+test("10. ENSURE_CONTENT_SCRIPT injects dead/missing tabs, skips live tabs, and GET_HEALTH ready notifies tabs", async () => {
+  const storage = createMockStorage({
+    serverStartingAt: Date.now() - 5000,
+    knownExtensionBuildId: "b1",
+  });
+  const injectedScripts = [];
+  const injectedCss = [];
+  const sentMessages = [];
+  let pingAlive = false;
+
+  const tabsMock = {
+    async query() {
+      return [
+        { id: 101, url: "https://rawlazy.io/chapter-5" },
+        { id: 102, url: "https://example.org/page" },
+      ];
+    },
+    async sendMessage(tabId, msg) {
+      sentMessages.push({ tabId, msg });
+      if (msg.type === "PING_CONTENT_SCRIPT") {
+        if (pingAlive && tabId === 101) {
+          return { ok: true, enabled: true };
+        }
+        throw new Error("Could not establish connection. Receiving end does not exist.");
+      }
+      return { ok: true };
+    },
+  };
+  const scriptingMock = {
+    async insertCSS(arg) {
+      injectedCss.push(arg);
+    },
+    async executeScript(arg) {
+      injectedScripts.push(arg);
+    },
+  };
+
+  const deps = {
+    storage,
+    tabs: tabsMock,
+    scripting: scriptingMock,
+    fetch: async (url) => {
+      if (url.endsWith("/health")) {
+        return createJsonResponse({ ready: true, extension_build_id: "b1" });
+      }
+      return createJsonResponse({}, 404);
+    },
+  };
+
+  // Tab 101 has no live content script -> injects styles.css + overlay.js + content.js
+  const ensure1 = await background.handleMessage({ type: "ENSURE_CONTENT_SCRIPT", tabId: 101 }, {}, deps);
+  assert.equal(ensure1.ok, true);
+  assert.equal(ensure1.injected, true);
+  assert.equal(injectedCss.length, 1);
+  assert.deepEqual(injectedScripts[0].files, ["overlay.js", "content.js"]);
+
+  // Once live, ENSURE_CONTENT_SCRIPT is a no-op
+  pingAlive = true;
+  const ensure2 = await background.handleMessage({ type: "ENSURE_CONTENT_SCRIPT", tabId: 101 }, {}, deps);
+  assert.equal(ensure2.ok, true);
+  assert.equal(ensure2.alreadyActive, true);
+  assert.equal(injectedScripts.length, 1);
+
+  // GET_HEALTH transitioning from starting -> ready notifies open tabs with ENGINE_READY
+  const healthRes = await background.handleMessage({ type: "GET_HEALTH" }, {}, deps);
+  assert.equal(healthRes.ok, true);
+  await new Promise((r) => setTimeout(r, 10));
+  const readyMsgs = sentMessages.filter((m) => m.msg?.type === "ENGINE_READY");
+  assert.equal(readyMsgs.length, 2);
+});

@@ -6,11 +6,12 @@ import binascii
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import gc
+import inspect
 import json
 import logging
 import os
 from pathlib import Path
-import subprocess
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Literal
@@ -22,8 +23,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 import uvicorn
 
+from server import gpu_guard
 from server.cache import TranslationCache
 from server.config import AppConfig, enforce_d_drive_env, load_config
+from server.gpu_guard import GpuSafetyGuard
 from server.pipeline import PayloadTooLargeError, TranslationPipeline
 from server.schemas import (
     GlossaryLookupRequest,
@@ -58,33 +61,46 @@ class CancelRequest(BaseModel):
 
 
 def _query_gpu_stats_sync() -> tuple[str, int, int]:
-    """Query live GPU name and VRAM usage via nvidia-smi safely."""
-    try:
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-            check=False,
-            creationflags=creationflags,
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return ("Unavailable", 0, 0)
-        first_line = proc.stdout.strip().splitlines()[0]
-        parts = [p.strip() for p in first_line.split(",")]
-        if len(parts) < 3:
-            return ("Unavailable", 0, 0)
-        name = parts[0] or "Unknown GPU"
-        used = int(float(parts[1]))
-        total = int(float(parts[2]))
-        return (name, used, total)
-    except Exception:
+    """Query live GPU name and VRAM usage via nvidia-smi safely (cached briefly)."""
+    snap = gpu_guard.get_gpu_snapshot()
+    if not snap.available:
         return ("Unavailable", 0, 0)
+    return (snap.name, snap.vram_used_mb, snap.vram_total_mb)
+
+
+def _accepts_kwarg(fn: Any, kwarg_name: str) -> bool:
+    """Return True when fn accepts kwarg_name explicitly or via **kwargs."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg_name in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _configure_server_logging(cfg: AppConfig) -> None:
+    """Ensure server.* INFO logs emit to stderr (captured in cache/server.log) cleanly."""
+    server_logger = logging.getLogger("server")
+    server_logger.setLevel(logging.INFO)
+    if not server_logger.handlers:
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        server_logger.addHandler(stream_handler)
+        try:
+            is_tty = sys.stderr is None or sys.stderr.isatty()
+        except Exception:
+            is_tty = False
+        if is_tty and cfg.cache_dir is not None:
+            cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(cfg.cache_dir / "server.log", encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            server_logger.addHandler(file_handler)
+        server_logger.propagate = False
 
 
 def _decode_base64_image(raw_b64: str, max_image_bytes: int) -> bytes:
@@ -312,32 +328,62 @@ async def _load_production_models(app: FastAPI) -> None:
 
     try:
         device = _detect_torch_device()
+        gpu_guard: GpuSafetyGuard = getattr(app.state, "gpu_guard", None) or GpuSafetyGuard(cfg)
+        app.state.gpu_guard = gpu_guard
+        min_free_vram_mb = int(getattr(cfg, "gpu_min_free_vram_mb", 1024))
+
         app.state.loading_stage = "starting_llm"
-        llama_mgr = app.state.llama_manager or LlamaServerManager(cfg)
+        llama_mgr = app.state.llama_manager or LlamaServerManager(cfg, gpu_guard=gpu_guard)
         app.state.llama_manager = llama_mgr
         await asyncio.to_thread(llama_mgr.start)
         app.state.llm_idle_unloaded = False
 
         app.state.loading_stage = "loading_detector"
-        detector = BubbleDetector(model_id=cfg.detector_model_id, device=device)
+        detector = BubbleDetector(
+            model_id=cfg.detector_model_id,
+            device=device,
+            min_free_vram_mb=min_free_vram_mb,
+        )
         await asyncio.to_thread(detector.load)
 
         app.state.loading_stage = "loading_ocr"
-        ocr = OcrEngine(device=device, cache_dir=cfg.cache_dir)
+        ocr = OcrEngine(
+            device=device,
+            cache_dir=cfg.cache_dir,
+            min_free_vram_mb=min_free_vram_mb,
+        )
+        try:
+            await asyncio.to_thread(ocr.load_ja)
+        except Exception as exc:
+            logger.warning("Preloading Japanese OCR deferred to first request: %s", exc)
 
         app.state.loading_stage = "initializing_pipeline"
-        translator = DialogueTranslator(llama_base_url=llama_mgr.base_url, memory=memory)
-        pipeline = TranslationPipeline(
-            detector=detector,
-            ocr=ocr,
-            translator=translator,
-            memory=memory,
-            cache=cache,
-            max_image_bytes=max_image_bytes,
-            max_image_width=max_image_width,
-            max_queue_size=max_queue_size,
-            ensure_llm_ready=lambda: _ensure_llm_ready(app),
-        )
+        translator_kwargs: dict[str, Any] = {
+            "llama_base_url": llama_mgr.base_url,
+            "memory": memory,
+        }
+        if _accepts_kwarg(DialogueTranslator.__init__, "cfg"):
+            translator_kwargs["cfg"] = cfg
+        translator = DialogueTranslator(**translator_kwargs)
+
+        pipeline_kwargs: dict[str, Any] = {
+            "detector": detector,
+            "ocr": ocr,
+            "translator": translator,
+            "memory": memory,
+            "cache": cache,
+            "max_image_bytes": max_image_bytes,
+            "max_image_width": max_image_width,
+            "max_queue_size": max_queue_size,
+            "ensure_llm_ready": lambda: _ensure_llm_ready(app),
+        }
+        if _accepts_kwarg(TranslationPipeline.__init__, "gpu_guard"):
+            pipeline_kwargs["gpu_guard"] = gpu_guard
+        if _accepts_kwarg(TranslationPipeline.__init__, "cfg"):
+            pipeline_kwargs["cfg"] = cfg
+        pipeline = TranslationPipeline(**pipeline_kwargs)
+        if getattr(pipeline, "gpu_guard", None) is None:
+            pipeline.gpu_guard = gpu_guard
         await pipeline.start()
 
         app.state.pipeline = pipeline
@@ -381,6 +427,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI):
+        if auto_load_models and "PYTEST_CURRENT_TEST" not in os.environ:
+            _configure_server_logging(app_instance.state.cfg)
         if auto_load_models and app_instance.state.pipeline is None:
             enforce_d_drive_env(app_instance.state.cfg)
             app_instance.state.load_task = asyncio.create_task(
@@ -441,6 +489,7 @@ def create_app(
     )
 
     app.state.cfg = resolved_cfg
+    app.state.gpu_guard = GpuSafetyGuard(resolved_cfg)
     app.state.memory = resolved_memory
     app.state.cache = resolved_cache
     app.state.llama_manager = llama_manager
@@ -470,7 +519,9 @@ def create_app(
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
+        gpu_guard_obj: GpuSafetyGuard = app.state.gpu_guard
         gpu_name, vram_used, vram_total = await asyncio.to_thread(_query_gpu_stats_sync)
+        gpu_guard_status = await asyncio.to_thread(gpu_guard_obj.status)
         mgr: LlamaServerManager | None = app.state.llama_manager
         if mgr is not None:
             llm_model = getattr(mgr, "model_name", resolved_cfg.llm_repo_id)
@@ -494,6 +545,7 @@ def create_app(
             extension_build_id=str(health_update["extension_build_id"]),
             has_remote=bool(health_update["has_remote"]),
             update_available=bool(health_update["update_available"]),
+            gpu_guard=gpu_guard_status,
         )
 
     @app.get("/update/status", response_model=UpdateStatusResponse)
@@ -723,6 +775,7 @@ def create_app(
 def main() -> None:
     cfg = load_config()
     enforce_d_drive_env(cfg)
+    _configure_server_logging(cfg)
     app = create_app(cfg=cfg, auto_load_models=True)
     bind_host = "0.0.0.0" if getattr(cfg, "allow_lan", False) else cfg.host
     uvicorn.run(app, host=bind_host, port=cfg.port, log_level="info")

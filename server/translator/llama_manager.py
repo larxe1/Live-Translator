@@ -12,13 +12,15 @@ from typing import IO
 import httpx
 
 from server.config import AppConfig
+from server.gpu_guard import GpuSafetyGuard
 
 
 class LlamaServerManager:
     """Starts, health-checks, and cleanly stops the local llama-server child process."""
 
-    def __init__(self, cfg: AppConfig) -> None:
+    def __init__(self, cfg: AppConfig, gpu_guard: GpuSafetyGuard | None = None) -> None:
         self.cfg = cfg
+        self.gpu_guard = gpu_guard if gpu_guard is not None else GpuSafetyGuard(cfg)
         self.base_url: str = f"http://127.0.0.1:{cfg.llama_port}"
         self._process: subprocess.Popen[bytes] | None = None
         self._log_file: IO[bytes] | None = None
@@ -73,10 +75,13 @@ class LlamaServerManager:
         )
 
     def build_command(self, exe_path: Path, model_path: Path) -> list[str]:
-        """Build the llama-server CLI invocation with VRAM-safe context/batch caps."""
-        ctx_size = min(int(self.cfg.llm_ctx_size), 6144) if self.cfg.llm_ctx_size > 0 else 4096
-        gpu_layers = int(self.cfg.llm_gpu_layers)
-        return [
+        """Build the llama-server CLI invocation with VRAM-safe context, KV, and layer caps."""
+        raw_ctx = int(getattr(self.cfg, "llm_ctx_size", 2048))
+        ctx_size = min(raw_ctx, 4096) if raw_ctx > 0 else 2048
+        batch_size = max(1, int(getattr(self.cfg, "llm_batch_size", 256)))
+        requested_layers = int(getattr(self.cfg, "llm_gpu_layers", 99))
+        gpu_layers = self.gpu_guard.choose_safe_gpu_layers(requested_layers)
+        cmd = [
             str(exe_path),
             "--model",
             str(model_path),
@@ -89,14 +94,21 @@ class LlamaServerManager:
             "--ctx-size",
             str(ctx_size),
             "--batch-size",
-            "512",
+            str(batch_size),
+            "--ubatch-size",
+            str(batch_size),
             "--parallel",
             "1",
             "--reasoning",
             "off",
             "--flash-attn",
             "on",
+            "--cache-prompt",
         ]
+        kv_type = str(getattr(self.cfg, "llm_kv_cache_type", "") or "").strip()
+        if kv_type:
+            cmd.extend(["-ctk", kv_type, "-ctv", kv_type])
+        return cmd
 
     def is_healthy(self) -> bool:
         """Return True when llama-server responds HTTP 200 on /health."""

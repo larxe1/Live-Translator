@@ -717,3 +717,111 @@ def test_api_region_type_floating_toggle_series_glossary_and_lookup(
         r_clear = client.post("/memory/clear", json={"chapter_id": "ch1", "series_id": "series-1"})
         assert r_clear.status_code == 200
         assert r_clear.json()["series_id"] == "series-1"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cancel_request_aborts_inflight_chunked_translation_and_skips_cache(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=20)
+    dets = [
+        RawDetection(Box(x1=10 + (i % 5) * 40, y1=10 + (i // 5) * 40, x2=40 + (i % 5) * 40, y2=40 + (i // 5) * 40), "bubble", 0.95)
+        for i in range(25)
+    ]
+    detector = _FakeDetector(detections=dets)
+    ocr = _FakeOcr(texts=[f"台詞{i}" for i in range(25)])
+
+    chunk_calls = 0
+    started_chunk1 = asyncio.Event()
+    proceed_chunk1 = asyncio.Event()
+
+    async def slow_chunk_llm(messages):
+        nonlocal chunk_calls
+        chunk_calls += 1
+        user_msg = messages[1]["content"]
+        in_map = json.loads(user_msg[user_msg.rfind("{") :])
+        if chunk_calls == 1:
+            started_chunk1.set()
+            await proceed_chunk1.wait()
+        return json.dumps({k: f"Translated {k}" for k in in_map})
+
+    translator = DialogueTranslator(
+        "http://127.0.0.1:8766",
+        memory,
+        llm_caller=slow_chunk_llm,
+        cfg=SimpleNamespace(use_story_context=False, llm_chunk_size=10),
+    )
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=translator,
+        memory=memory,
+        cache=cache,
+    )
+    await pipeline.start()
+
+    img_bytes = _make_sample_png_bytes()
+    task = asyncio.create_task(
+        pipeline.translate_image(img_bytes, lang="ja", chapter_id="ch-cancel", request_id="req-inflight")
+    )
+    await asyncio.wait_for(started_chunk1.wait(), timeout=2.0)
+    # Cancel WHILE request is actively in-flight in chunk 1
+    pipeline.cancel_request("req-inflight")
+    proceed_chunk1.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await pipeline.stop()
+    assert chunk_calls == 1
+    assert cache.get(cache.make_key(img_bytes, "ja", {})) is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_wires_gpu_guard_into_stages_and_translator(tmp_path: Path) -> None:
+    memory = ChapterMemoryStore()
+    cache = TranslationCache(tmp_path / "translations.db", max_entries=20)
+    detector = _FakeDetector()
+    ocr = _FakeOcr()
+
+    guard_calls: list[bool] = []
+    seen_guard_in_translator: list[object] = []
+
+    class _FakeGpuGuard:
+        async def wait_if_hot(self, cancel_event=None, max_wait_s=45.0) -> str:
+            guard_calls.append(cancel_event is not None)
+            return "ok"
+
+    class _GuardObservingTranslator:
+        async def translate_page(
+            self,
+            bubbles,
+            lang,
+            chapter_id,
+            extra_glossary=None,
+            cancel_event=None,
+            gpu_guard=None,
+        ):
+            seen_guard_in_translator.append(gpu_guard)
+            return {bid: "Valid English line." for bid, _ in bubbles}
+
+    fake_guard = _FakeGpuGuard()
+    pipeline = TranslationPipeline(
+        detector=detector,
+        ocr=ocr,
+        translator=_GuardObservingTranslator(),
+        memory=memory,
+        cache=cache,
+        gpu_guard=fake_guard,
+    )
+    await pipeline.start()
+    resp = await pipeline.translate_image(_make_sample_png_bytes(), lang="ja", chapter_id="ch-guard")
+    await pipeline.stop()
+
+    assert len(resp.bubbles) == 2
+    assert len(guard_calls) >= 3
+    assert all(guard_calls)
+    assert seen_guard_in_translator == [fake_guard]

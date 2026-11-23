@@ -1,36 +1,41 @@
 "use strict";
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765";
+const DEFAULT_PRELOAD_WHOLE_CHAPTER = false;
+const hasDom = typeof document !== "undefined";
 
-const statusDot = document.getElementById("statusDot");
-const statusText = document.getElementById("statusText");
-const statusVram = document.getElementById("statusVram");
-const versionBadge = document.getElementById("versionBadge");
-const siteHostEl = document.getElementById("siteHost");
-const siteToggle = document.getElementById("siteToggle");
-const floatingToggle = document.getElementById("floatingToggle");
-const langButtons = Array.from(document.querySelectorAll(".lang-btn"));
-const glossaryLookupForm = document.getElementById("glossaryLookupForm");
-const glossaryLookupInput = document.getElementById("glossaryLookupInput");
-const glossaryLookupBtn = document.getElementById("glossaryLookupBtn");
-const glossaryClearBtn = document.getElementById("glossaryClearBtn");
-const glossaryForm = document.getElementById("glossaryForm");
-const glossaryOrigInput = document.getElementById("glossaryOrig");
-const glossaryEngInput = document.getElementById("glossaryEng");
-const glossaryList = document.getElementById("glossaryList");
-const clearMemoryBtn = document.getElementById("clearMemoryBtn");
-const openTestBtn = document.getElementById("openTestBtn");
-const shutdownBtn = document.getElementById("shutdownBtn");
-const startEngineBtn = document.getElementById("startEngineBtn");
-const autoUpdateToggle = document.getElementById("autoUpdateToggle");
-const updateStatusText = document.getElementById("updateStatusText");
-const checkUpdatesBtn = document.getElementById("checkUpdatesBtn");
-const installUpdateBtn = document.getElementById("installUpdateBtn");
-const serverUrlInput = document.getElementById("serverUrlInput");
-const saveServerUrlBtn = document.getElementById("saveServerUrlBtn");
-const feedbackEl = document.getElementById("feedback");
+const statusDot = hasDom ? document.getElementById("statusDot") : null;
+const statusText = hasDom ? document.getElementById("statusText") : null;
+const statusVram = hasDom ? document.getElementById("statusVram") : null;
+const gpuGuardNotice = hasDom ? document.getElementById("gpuGuardNotice") : null;
+const versionBadge = hasDom ? document.getElementById("versionBadge") : null;
+const siteHostEl = hasDom ? document.getElementById("siteHost") : null;
+const siteToggle = hasDom ? document.getElementById("siteToggle") : null;
+const floatingToggle = hasDom ? document.getElementById("floatingToggle") : null;
+const preloadToggle = hasDom ? document.getElementById("preloadToggle") : null;
+const langButtons = hasDom ? Array.from(document.querySelectorAll(".lang-btn")) : [];
+const glossaryLookupForm = hasDom ? document.getElementById("glossaryLookupForm") : null;
+const glossaryLookupInput = hasDom ? document.getElementById("glossaryLookupInput") : null;
+const glossaryLookupBtn = hasDom ? document.getElementById("glossaryLookupBtn") : null;
+const glossaryClearBtn = hasDom ? document.getElementById("glossaryClearBtn") : null;
+const glossaryForm = hasDom ? document.getElementById("glossaryForm") : null;
+const glossaryOrigInput = hasDom ? document.getElementById("glossaryOrig") : null;
+const glossaryEngInput = hasDom ? document.getElementById("glossaryEng") : null;
+const glossaryList = hasDom ? document.getElementById("glossaryList") : null;
+const clearMemoryBtn = hasDom ? document.getElementById("clearMemoryBtn") : null;
+const openTestBtn = hasDom ? document.getElementById("openTestBtn") : null;
+const shutdownBtn = hasDom ? document.getElementById("shutdownBtn") : null;
+const startEngineBtn = hasDom ? document.getElementById("startEngineBtn") : null;
+const autoUpdateToggle = hasDom ? document.getElementById("autoUpdateToggle") : null;
+const updateStatusText = hasDom ? document.getElementById("updateStatusText") : null;
+const checkUpdatesBtn = hasDom ? document.getElementById("checkUpdatesBtn") : null;
+const installUpdateBtn = hasDom ? document.getElementById("installUpdateBtn") : null;
+const serverUrlInput = hasDom ? document.getElementById("serverUrlInput") : null;
+const saveServerUrlBtn = hasDom ? document.getElementById("saveServerUrlBtn") : null;
+const feedbackEl = hasDom ? document.getElementById("feedback") : null;
 
 let currentHostname = "";
+let currentTabId = null;
 let currentChapterId = "default";
 let currentSeriesId = "default";
 let currentServerUrl = DEFAULT_SERVER_URL;
@@ -253,18 +258,120 @@ function setEngineControls(state) {
   }
 }
 
+function formatGpuTelemetry(health) {
+  if (!health || typeof health !== "object") return "";
+  const guard = health.gpu_guard && typeof health.gpu_guard === "object" ? health.gpu_guard : null;
+
+  const rawTotal = Number(health.vram_total_mb || guard?.vram_total_mb || 0);
+  const rawUsed = Number(
+    health.vram_total_mb > 0 ? health.vram_used_mb : guard?.vram_used_mb ?? health.vram_used_mb ?? 0
+  );
+  const vramStr =
+    Number.isFinite(rawTotal) && rawTotal > 0
+      ? `${Math.max(0, Math.round(rawUsed))}/${Math.round(rawTotal)} MB`
+      : "";
+
+  const rawTemp = guard && guard.temp_c !== undefined && guard.temp_c !== null ? Number(guard.temp_c) : NaN;
+  const tempStr = Number.isFinite(rawTemp) && rawTemp > 0 ? `${Math.round(rawTemp)}°C` : "";
+
+  if (vramStr && tempStr) return `${vramStr} · ${tempStr}`;
+  return vramStr || tempStr;
+}
+
+function formatGpuGuardNotice(gpuGuard) {
+  if (!gpuGuard || typeof gpuGuard !== "object") {
+    return { visible: false, state: "ok", text: "", title: "" };
+  }
+  const state = String(gpuGuard.state || "").trim().toLowerCase();
+  const rawTemp =
+    gpuGuard.temp_c !== undefined && gpuGuard.temp_c !== null ? Number(gpuGuard.temp_c) : NaN;
+  const tempC = Number.isFinite(rawTemp) && rawTemp > 0 ? Math.round(rawTemp) : null;
+  const msg = String(gpuGuard.message || "").trim();
+
+  if (state === "throttled") {
+    return {
+      visible: true,
+      state: "throttled",
+      text: tempC !== null ? `Cooling GPU (${tempC}°C)...` : msg || "Cooling GPU...",
+      title: msg,
+    };
+  }
+  if (state === "paused") {
+    return {
+      visible: true,
+      state: "paused",
+      text: tempC !== null ? `Paused: GPU hot (${tempC}°C)` : msg || "Paused: GPU hot",
+      title: msg,
+    };
+  }
+  return { visible: false, state: state || "ok", text: "", title: "" };
+}
+
+function applyGpuGuardNotice(gpuGuard, noticeEl = gpuGuardNotice) {
+  const info = formatGpuGuardNotice(gpuGuard);
+  if (!noticeEl) return info;
+  noticeEl.hidden = !info.visible;
+  noticeEl.textContent = info.text;
+  noticeEl.title = info.title || "";
+  noticeEl.className =
+    info.state === "paused" ? "gpu-guard-notice paused" : "gpu-guard-notice";
+  return info;
+}
+
+function applyHealthUI(h, dom = { statusDot, statusText, statusVram, gpuGuardNotice }) {
+  if (!h || typeof h !== "object") return { ready: false, notice: formatGpuGuardNotice(null) };
+  const notice = applyGpuGuardNotice(h.gpu_guard, dom.gpuGuardNotice);
+  const telemetry = formatGpuTelemetry(h);
+  if (h.ready) {
+    if (dom.statusDot) {
+      dom.statusDot.className =
+        notice.state === "paused" ? "status-dot loading" : "status-dot ready";
+    }
+    if (dom.statusText) {
+      dom.statusText.textContent = `Ready — ${h.gpu_name || "Local GPU"}`;
+    }
+    if (dom.statusVram) {
+      dom.statusVram.textContent = telemetry;
+    }
+    return { ready: true, notice };
+  }
+  if (dom.statusDot) {
+    dom.statusDot.className = "status-dot loading";
+  }
+  if (dom.statusText) {
+    dom.statusText.textContent = formatLoadingStage(h.loading_stage);
+  }
+  if (dom.statusVram) {
+    dom.statusVram.textContent = telemetry;
+  }
+  return { ready: false, notice };
+}
+
 function renderOffline(message = OFFLINE_TEXT) {
-  statusDot.className = "status-dot";
-  statusText.textContent = message;
-  statusVram.textContent = "";
+  if (statusDot) statusDot.className = "status-dot";
+  if (statusText) statusText.textContent = message;
+  if (statusVram) statusVram.textContent = "";
+  applyGpuGuardNotice(null);
   setEngineControls("offline");
 }
 
 function renderStarting(message = "Starting local engine...") {
-  statusDot.className = "status-dot loading";
-  statusText.textContent = message;
-  statusVram.textContent = "";
+  if (statusDot) statusDot.className = "status-dot loading";
+  if (statusText) statusText.textContent = message;
+  if (statusVram) statusVram.textContent = "";
+  applyGpuGuardNotice(null);
   setEngineControls("starting");
+}
+
+async function notifyActiveTabEngineReady() {
+  if (!currentTabId || !siteToggle?.checked || typeof chrome?.tabs?.sendMessage !== "function") {
+    return;
+  }
+  try {
+    await chrome.tabs.sendMessage(currentTabId, { type: "ENGINE_READY" });
+  } catch (_err) {
+    // Ignore tabs without an active content script.
+  }
 }
 
 /**
@@ -288,16 +395,12 @@ async function refreshHealth() {
   }
   if (h.ready) {
     engineStarting = false;
-    statusDot.className = "status-dot ready";
-    statusText.textContent = `Ready — ${h.gpu_name || "Local GPU"}`;
-    statusVram.textContent =
-      h.vram_total_mb > 0 ? `${h.vram_used_mb}/${h.vram_total_mb} MB` : "";
+    applyHealthUI(h);
     setEngineControls("online");
+    void notifyActiveTabEngineReady();
     return { online: true, ready: true, starting: false };
   }
-  statusDot.className = "status-dot loading";
-  statusText.textContent = formatLoadingStage(h.loading_stage);
-  statusVram.textContent = "";
+  applyHealthUI(h);
   setEngineControls("loading");
   const failed = String(h.loading_stage || "").startsWith("error");
   return { online: true, ready: false, starting: !failed, failed };
@@ -466,6 +569,7 @@ async function initPopup() {
     if (tab && tab.url) {
       const u = new URL(tab.url);
       if (u.protocol === "http:" || u.protocol === "https:") {
+        currentTabId = tab.id ?? null;
         currentHostname = u.hostname;
         currentChapterId = `${u.hostname}${u.pathname}`;
         currentSeriesId = deriveSeriesId(u.hostname, u.pathname);
@@ -482,6 +586,7 @@ async function initPopup() {
         "enabledDomains",
         "langMode",
         "includeFloating",
+        "preloadWholeChapter",
         "glossary",
         "glossariesBySeries",
         "serverUrl",
@@ -505,6 +610,9 @@ async function initPopup() {
   if (floatingToggle) {
     floatingToggle.checked = stored.includeFloating !== false;
   }
+  if (preloadToggle) {
+    preloadToggle.checked = stored.preloadWholeChapter === true;
+  }
 
   renderLangButtons(stored.langMode || "auto");
   const bySeries = stored.glossariesBySeries;
@@ -523,29 +631,40 @@ async function initPopup() {
     autoUpdateToggle.checked = stored.autoUpdateEnabled !== false;
   }
 
+  if (currentHostname && currentTabId) {
+    void sendBgMessage({ type: "ENSURE_CONTENT_SCRIPT", tabId: currentTabId });
+  }
   await Promise.all([refreshHealthAndPoll(), refreshUpdateStatus()]);
 }
 
-siteToggle.addEventListener("change", async () => {
-  if (!currentHostname) return;
-  const stored = await chrome.storage.local.get(["enabledDomains"]);
-  const next = { ...(stored.enabledDomains || {}), [currentHostname]: siteToggle.checked };
-  await chrome.storage.local.set({ enabledDomains: next });
-  showFeedback(
-    siteToggle.checked
-      ? `Enabled on ${currentHostname}`
-      : `Disabled on ${currentHostname}`
-  );
-  if (!siteToggle.checked) return;
+if (siteToggle) {
+  siteToggle.addEventListener("change", async () => {
+    if (!currentHostname) return;
+    const stored = await chrome.storage.local.get(["enabledDomains"]);
+    const next = { ...(stored.enabledDomains || {}), [currentHostname]: siteToggle.checked };
+    await chrome.storage.local.set({ enabledDomains: next });
+    if (siteToggle.checked && currentTabId) {
+      await sendBgMessage({ type: "ENSURE_CONTENT_SCRIPT", tabId: currentTabId });
+    }
+    showFeedback(
+      siteToggle.checked
+        ? `Enabled on ${currentHostname}`
+        : `Disabled on ${currentHostname}`
+    );
+    if (!siteToggle.checked) return;
 
-  const state = await refreshHealth();
-  if (state.ready) return;
-  if (!state.online && !state.starting) {
-    await startEngine();
-  } else if (!state.failed) {
-    startHealthPolling();
-  }
-});
+    const state = await refreshHealth();
+    if (state.ready) {
+      void notifyActiveTabEngineReady();
+      return;
+    }
+    if (!state.online && !state.starting) {
+      await startEngine();
+    } else if (!state.failed) {
+      startHealthPolling();
+    }
+  });
+}
 
 if (startEngineBtn) {
   startEngineBtn.addEventListener("click", async () => {
@@ -572,6 +691,22 @@ if (floatingToggle) {
     }
     showFeedback(
       includeFloating ? "Floating dialogue & SFX enabled" : "Floating dialogue & SFX hidden"
+    );
+  });
+}
+
+if (preloadToggle) {
+  preloadToggle.addEventListener("change", async () => {
+    const preloadWholeChapter = Boolean(preloadToggle.checked);
+    try {
+      await chrome.storage.local.set({ preloadWholeChapter });
+    } catch (_err) {
+      // Ignore storage write failures.
+    }
+    showFeedback(
+      preloadWholeChapter
+        ? "Background chapter preloading enabled"
+        : "Background chapter preloading disabled"
     );
   });
 }
@@ -657,45 +792,53 @@ if (glossaryClearBtn) {
   });
 }
 
-glossaryForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const orig = glossaryOrigInput.value.trim();
-  const eng = glossaryEngInput.value.trim();
-  if (!orig || !eng) return;
-  currentGlossary[orig] = eng;
-  glossaryOrigInput.value = "";
-  glossaryEngInput.value = "";
-  await syncGlossary();
-  showFeedback(`Saved ${orig} → ${eng}`);
-});
-
-clearMemoryBtn.addEventListener("click", async () => {
-  const res = await sendBgMessage({
-    type: "CLEAR_MEMORY",
-    chapterId: currentChapterId,
-    seriesId: currentSeriesId,
+if (glossaryForm) {
+  glossaryForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const orig = glossaryOrigInput.value.trim();
+    const eng = glossaryEngInput.value.trim();
+    if (!orig || !eng) return;
+    currentGlossary[orig] = eng;
+    glossaryOrigInput.value = "";
+    glossaryEngInput.value = "";
+    await syncGlossary();
+    showFeedback(`Saved ${orig} → ${eng}`);
   });
-  showFeedback(res?.ok ? "Chapter memory cleared" : "Server offline");
-});
+}
 
-openTestBtn.addEventListener("click", () => {
-  const base = (currentServerUrl || DEFAULT_SERVER_URL).replace(/\/+$/, "");
-  chrome.tabs.create({ url: `${base}/test` });
-});
+if (clearMemoryBtn) {
+  clearMemoryBtn.addEventListener("click", async () => {
+    const res = await sendBgMessage({
+      type: "CLEAR_MEMORY",
+      chapterId: currentChapterId,
+      seriesId: currentSeriesId,
+    });
+    showFeedback(res?.ok ? "Chapter memory cleared" : "Server offline");
+  });
+}
 
-shutdownBtn.addEventListener("click", async () => {
-  stopHealthPolling();
-  engineStarting = false;
-  const res = await sendBgMessage({ type: "SHUTDOWN_SERVER" });
-  if (res?.ok) {
-    renderOffline("Offline — VRAM Freed");
-    if (updateStatusText) updateStatusText.textContent = "Server offline";
-    showFeedback("Local GPU engine stopped");
-  } else {
-    renderOffline();
-    showFeedback("Server already offline");
-  }
-});
+if (openTestBtn) {
+  openTestBtn.addEventListener("click", () => {
+    const base = (currentServerUrl || DEFAULT_SERVER_URL).replace(/\/+$/, "");
+    chrome.tabs.create({ url: `${base}/test` });
+  });
+}
+
+if (shutdownBtn) {
+  shutdownBtn.addEventListener("click", async () => {
+    stopHealthPolling();
+    engineStarting = false;
+    const res = await sendBgMessage({ type: "SHUTDOWN_SERVER" });
+    if (res?.ok) {
+      renderOffline("Offline — VRAM Freed");
+      if (updateStatusText) updateStatusText.textContent = "Server offline";
+      showFeedback("Local GPU engine stopped");
+    } else {
+      renderOffline();
+      showFeedback("Server already offline");
+    }
+  });
+}
 
 if (autoUpdateToggle) {
   autoUpdateToggle.addEventListener("change", async () => {
@@ -764,30 +907,47 @@ if (installUpdateBtn) {
   });
 }
 
-saveServerUrlBtn.addEventListener("click", async () => {
-  const raw = serverUrlInput.value.trim().replace(/\/+$/, "");
-  const clean = raw || DEFAULT_SERVER_URL;
-  if (!/^https?:\/\/[^/\s]+/i.test(clean)) {
-    showFeedback("Enter a valid http:// or https:// URL");
-    return;
-  }
-  currentServerUrl = clean;
-  serverUrlInput.value = clean;
-  try {
-    await chrome.storage.local.set({ serverUrl: clean });
-  } catch (_err) {
-    // Ignore storage failures.
-  }
-  showFeedback("Server URL saved");
-  await Promise.all([refreshHealthAndPoll(), refreshUpdateStatus()]);
-});
+if (saveServerUrlBtn) {
+  saveServerUrlBtn.addEventListener("click", async () => {
+    const raw = serverUrlInput.value.trim().replace(/\/+$/, "");
+    const clean = raw || DEFAULT_SERVER_URL;
+    if (!/^https?:\/\/[^/\s]+/i.test(clean)) {
+      showFeedback("Enter a valid http:// or https:// URL");
+      return;
+    }
+    currentServerUrl = clean;
+    serverUrlInput.value = clean;
+    try {
+      await chrome.storage.local.set({ serverUrl: clean });
+    } catch (_err) {
+      // Ignore storage failures.
+    }
+    showFeedback("Server URL saved");
+    await Promise.all([refreshHealthAndPoll(), refreshUpdateStatus()]);
+  });
+}
 
-window.addEventListener("pagehide", stopHealthPolling);
-
-void (async () => {
-  try {
-    await initPopup();
-  } catch (_err) {
-    // Ignore popup init errors when closed mid-load.
+if (typeof module === "undefined" && typeof document !== "undefined") {
+  if (typeof window !== "undefined") {
+    window.addEventListener("pagehide", stopHealthPolling);
   }
-})();
+
+  void (async () => {
+    try {
+      await initPopup();
+    } catch (_err) {
+      // Ignore popup init errors when closed mid-load.
+    }
+  })();
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    DEFAULT_PRELOAD_WHOLE_CHAPTER,
+    deriveSeriesId,
+    formatGpuTelemetry,
+    formatGpuGuardNotice,
+    applyGpuGuardNotice,
+    applyHealthUI,
+  };
+}

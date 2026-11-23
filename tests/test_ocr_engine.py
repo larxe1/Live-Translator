@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 from PIL import Image
 
+from server import gpu_guard
 from server.ocr.engine import (
     OcrEngine,
     classify_script,
@@ -89,3 +94,104 @@ def test_ocr_engine_auto_probing_routes_tall_korean_strip_and_switches_when_need
     assert lang2 == "ko"
     assert len(texts2) == 3
     assert ja_calls["count"] == 2  # probed only the 2 largest crops before switching
+
+
+def test_load_ja_converts_model_to_fp16_on_cuda_and_preserves_offline_fallback(monkeypatch):
+    class FakeTensor:
+        def __init__(self, dtype: str = "fp32") -> None:
+            self.dtype = dtype
+
+        def half(self) -> FakeTensor:
+            return FakeTensor("fp16")
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.dtype = "fp32"
+
+        def half(self) -> FakeModel:
+            self.dtype = "fp16"
+            return self
+
+        def float(self) -> FakeModel:
+            self.dtype = "fp32"
+            return self
+
+    attempts: list[tuple[bool, str | None]] = []
+
+    class FakeMangaOcr:
+        def __init__(self, force_cpu: bool = False) -> None:
+            attempts.append((force_cpu, os.environ.get("HF_HUB_OFFLINE")))
+            if len(attempts) == 1:
+                raise OSError("missing offline snapshot")
+            self.model = FakeModel()
+            self.last_input_dtype: str | None = None
+
+        def _preprocess(self, img: Image.Image) -> FakeTensor:
+            return FakeTensor("fp32")
+
+        def __call__(self, img: Image.Image) -> str:
+            t = self._preprocess(img)
+            self.last_input_dtype = t.dtype
+            return "テスト"
+
+    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: True)
+
+    engine = OcrEngine(device="cuda", min_free_vram_mb=1024)
+    engine.load_ja()
+
+    assert attempts == [(False, "1"), (False, None)]
+    assert engine._ja_fp16 is True
+    assert engine._ja_ocr.model.dtype == "fp16"
+    assert engine._ja_ocr.last_input_dtype == "fp16"
+
+
+def test_load_ja_falls_back_to_fp32_when_fp16_fails(monkeypatch):
+    class BrokenHalfModel:
+        def __init__(self) -> None:
+            self.dtype = "fp32"
+
+        def half(self) -> BrokenHalfModel:
+            self.dtype = "fp16"
+            raise RuntimeError("half unsupported")
+
+        def float(self) -> BrokenHalfModel:
+            self.dtype = "fp32"
+            return self
+
+    class FakeMangaOcr:
+        def __init__(self, force_cpu: bool = False) -> None:
+            self.force_cpu = force_cpu
+            self.model = BrokenHalfModel()
+
+        def _preprocess(self, img: Image.Image) -> str:
+            return "fp32"
+
+        def __call__(self, img: Image.Image) -> str:
+            return "ok"
+
+    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: True)
+
+    engine = OcrEngine(device="cuda", min_free_vram_mb=1024)
+    engine.load_ja()
+
+    assert engine._ja_fp16 is False
+    assert engine._ja_ocr.model.dtype == "fp32"
+
+
+def test_load_ja_uses_cpu_when_vram_headroom_insufficient(monkeypatch):
+    seen: list[bool] = []
+
+    class FakeMangaOcr:
+        def __init__(self, force_cpu: bool = False) -> None:
+            seen.append(force_cpu)
+            self.model = None
+
+    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: False)
+
+    engine = OcrEngine(device="cuda", min_free_vram_mb=1024)
+    engine.load_ja()
+    assert seen == [True]
+    assert engine._ja_fp16 is False

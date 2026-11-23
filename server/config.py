@@ -21,8 +21,18 @@ class AppConfig:
     llm_repo_id: str = "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
     llm_filename_pattern: str = "*Qwen3-8B*Q4_K_M*.gguf"
     llm_model_path: Path | None = None
-    llm_ctx_size: int = 4096
-    llm_gpu_layers: int = 30
+    llm_ctx_size: int = 2048
+    llm_gpu_layers: int = 99
+    llm_kv_cache_type: str = "q8_0"
+    llm_batch_size: int = 256
+    llm_chunk_size: int = 10
+    use_story_context: bool = False
+    gpu_min_free_vram_mb: int = 1024
+    gpu_llama_headroom_mb: int = 600
+    gpu_temp_soft_c: int = 78
+    gpu_temp_hard_c: int = 84
+    gpu_temp_resume_c: int = 76
+    gpu_cooldown_seconds: float = 1.5
     max_cache_entries: int = 2000
     allow_lan: bool = False
     max_image_bytes: int = 25_000_000
@@ -95,8 +105,22 @@ def load_config(
         ),
         llm_filename_pattern=str(raw.get("llm_filename_pattern", "*Qwen3-8B*Q4_K_M*.gguf")),
         llm_model_path=raw.get("llm_model_path"),
-        llm_ctx_size=int(raw.get("llm_ctx_size", 4096)),
-        llm_gpu_layers=int(raw.get("llm_gpu_layers", 30)),
+        llm_ctx_size=int(raw.get("llm_ctx_size", 2048)),
+        llm_gpu_layers=int(raw.get("llm_gpu_layers", 99)),
+        llm_kv_cache_type=str(
+            raw.get("llm_kv_cache_type", "q8_0")
+            if raw.get("llm_kv_cache_type") is not None
+            else "q8_0"
+        ).strip(),
+        llm_batch_size=int(raw.get("llm_batch_size", 256)),
+        llm_chunk_size=int(raw.get("llm_chunk_size", 10)),
+        use_story_context=bool(raw.get("use_story_context", False)),
+        gpu_min_free_vram_mb=int(raw.get("gpu_min_free_vram_mb", 1024)),
+        gpu_llama_headroom_mb=int(raw.get("gpu_llama_headroom_mb", 600)),
+        gpu_temp_soft_c=int(raw.get("gpu_temp_soft_c", 78)),
+        gpu_temp_hard_c=int(raw.get("gpu_temp_hard_c", 84)),
+        gpu_temp_resume_c=int(raw.get("gpu_temp_resume_c", 76)),
+        gpu_cooldown_seconds=float(raw.get("gpu_cooldown_seconds", 1.5)),
         max_cache_entries=int(raw.get("max_cache_entries", 2000)),
         allow_lan=bool(raw.get("allow_lan", False)),
         max_image_bytes=int(raw.get("max_image_bytes", 25_000_000)),

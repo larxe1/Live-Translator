@@ -59,8 +59,18 @@ def test_enforce_d_drive_env_sets_all_caches_under_project_root(tmp_path: Path, 
     assert cfg.llama_port == 8766
     assert cfg.llm_repo_id == "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
     assert cfg.llm_filename_pattern == "*Qwen3-8B*Q4_K_M*.gguf"
-    assert cfg.llm_gpu_layers == 30
-    assert cfg.llm_ctx_size == 4096
+    assert cfg.llm_gpu_layers == 99
+    assert cfg.llm_ctx_size == 2048
+    assert cfg.llm_kv_cache_type == "q8_0"
+    assert cfg.llm_batch_size == 256
+    assert cfg.llm_chunk_size == 10
+    assert cfg.use_story_context is False
+    assert cfg.gpu_min_free_vram_mb == 1024
+    assert cfg.gpu_llama_headroom_mb == 600
+    assert cfg.gpu_temp_soft_c == 78
+    assert cfg.gpu_temp_hard_c == 84
+    assert cfg.gpu_temp_resume_c == 76
+    assert cfg.gpu_cooldown_seconds == 1.5
     assert cfg.allow_lan is False
     assert cfg.bind_host == "127.0.0.1"
     assert cfg.max_image_bytes == 25_000_000
@@ -73,8 +83,13 @@ def test_repo_config_json_has_qwen3_defaults() -> None:
     cfg = load_config()
     assert cfg.llm_repo_id == "bartowski/mlabonne_Qwen3-8B-abliterated-GGUF"
     assert cfg.llm_filename_pattern == "*Qwen3-8B*Q4_K_M*.gguf"
-    assert cfg.llm_gpu_layers == 30
-    assert cfg.llm_ctx_size == 4096
+    assert cfg.llm_gpu_layers == 99
+    assert cfg.llm_ctx_size == 2048
+    assert cfg.llm_kv_cache_type == "q8_0"
+    assert cfg.llm_batch_size == 256
+    assert cfg.llm_chunk_size == 10
+    assert cfg.use_story_context is False
+    assert cfg.idle_unload_minutes == 3
 
 
 def test_load_config_reads_custom_json_overrides(tmp_path: Path) -> None:
@@ -149,7 +164,26 @@ def test_cache_lru_eviction_and_clear(tmp_path: Path) -> None:
     assert cache.get(k3) is None
 
 
-def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path) -> None:
+def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path, monkeypatch) -> None:
+    from server import gpu_guard
+
+    monkeypatch.setattr(
+        gpu_guard,
+        "get_gpu_snapshot",
+        lambda force_refresh=False: gpu_guard.GpuSnapshot(
+            available=True,
+            name="RTX 3070",
+            vram_used_mb=2000,
+            vram_total_mb=8192,
+            vram_free_mb=6000,
+            temp_c=50,
+            utilization_pct=0,
+            power_w=30.0,
+            power_limit_w=240.0,
+            sampled_at=0.0,
+        ),
+    )
+
     exe = tmp_path / "bin" / "llama-cpp" / "llama-server.exe"
     gguf = tmp_path / "models" / "mlabonne_Qwen3-8B-abliterated-Q4_K_M.gguf"
 
@@ -160,23 +194,29 @@ def test_llama_manager_build_command_flags_and_ctx_cap(tmp_path: Path) -> None:
     for flag, val in [
         ("--host", "127.0.0.1"),
         ("--port", "8766"),
-        ("-ngl", "30"),
-        ("--ctx-size", "4096"),
-        ("--batch-size", "512"),
+        ("-ngl", "99"),
+        ("--ctx-size", "2048"),
+        ("--batch-size", "256"),
+        ("--ubatch-size", "256"),
+        ("-ctk", "q8_0"),
+        ("-ctv", "q8_0"),
         ("--parallel", "1"),
         ("--reasoning", "off"),
         ("--flash-attn", "on"),
     ]:
         idx = cmd_default.index(flag)
         assert cmd_default[idx + 1] == val
+    assert "--cache-prompt" in cmd_default
 
-    cfg_6144 = AppConfig(project_root=tmp_path, llm_ctx_size=6144)
-    cmd_6144 = LlamaServerManager(cfg_6144).build_command(exe, gguf)
-    assert cmd_6144[cmd_6144.index("--ctx-size") + 1] == "6144"
+    cfg_4096 = AppConfig(project_root=tmp_path, llm_ctx_size=4096)
+    cmd_4096 = LlamaServerManager(cfg_4096).build_command(exe, gguf)
+    assert cmd_4096[cmd_4096.index("--ctx-size") + 1] == "4096"
 
-    cfg_8192 = AppConfig(project_root=tmp_path, llm_ctx_size=8192)
+    cfg_8192 = AppConfig(project_root=tmp_path, llm_ctx_size=8192, llm_kv_cache_type="")
     cmd_8192 = LlamaServerManager(cfg_8192).build_command(exe, gguf)
-    assert cmd_8192[cmd_8192.index("--ctx-size") + 1] == "6144"
+    assert cmd_8192[cmd_8192.index("--ctx-size") + 1] == "4096"
+    assert "-ctk" not in cmd_8192
+    assert "-ctv" not in cmd_8192
 
 
 def test_llama_manager_resolve_model_path_pattern_priority_and_fallback(tmp_path: Path) -> None:

@@ -11,16 +11,20 @@ from contextlib import closing
 from pathlib import Path
 
 from server.schemas import TranslateResponse
-from server.translator.memory import contains_non_english_cjk
+from server.translator.memory import contains_non_english_cjk, looks_like_romaji
 
 logger = logging.getLogger(__name__)
 
-CACHE_KEY_VERSION = "v3-floating-ctx"
+CACHE_KEY_VERSION = "v4-chunked-en"
 
 
 def _response_has_non_english_cjk(response: TranslateResponse) -> bool:
-    """Return True if any cached bubble translation still contains CJK/Kana/Hangul characters."""
-    return any(contains_non_english_cjk(bubble.translated) for bubble in response.bubbles)
+    """Return True if any cached bubble contains CJK/Kana/Hangul characters or untranslated Romaji."""
+    return any(
+        contains_non_english_cjk(bubble.translated)
+        or looks_like_romaji(bubble.original, bubble.translated)
+        for bubble in response.bubbles
+    )
 
 
 class TranslationCache:
@@ -144,8 +148,11 @@ class TranslationCache:
         return response.model_copy(update={"cached": True})
 
     def put(self, key: str, response: TranslateResponse) -> None:
-        """Store response in SQLite and prune least-recently-used entries if over limit."""
+        """Store valid English response in SQLite and prune least-recently-used entries if over limit."""
         if self.max_entries == 0:
+            return
+        if _response_has_non_english_cjk(response):
+            logger.warning("Refusing to cache non-English/Romaji translation row %s", key)
             return
 
         payload = response.model_dump_json()

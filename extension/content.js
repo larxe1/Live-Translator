@@ -1,7 +1,8 @@
 (function (root) {
   "use strict";
 
-  const MAX_LOOKAHEAD = 3;
+  const MAX_LOOKAHEAD = 1;
+  const DEFAULT_PRELOAD_WHOLE_CHAPTER = false;
   const MAX_PAGE_CACHE = 50;
 
   function isDomainEnabled(hostname, enabledDomains) {
@@ -65,7 +66,7 @@
   }
 
   /**
-   * Computes priority 0 (currently visible) and priority 1 (next 2-3 pages
+   * Computes priority 0 (currently visible) and priority 1 (next adjacent page
    * below in DOM order) targets, deferring distant pages until scrolled closer.
    */
   function computeLookaheadTargets(candidates, visibleSet, maxLookahead = MAX_LOOKAHEAD) {
@@ -241,7 +242,10 @@
     const storage = deps.storage;
     const sendMessage = deps.sendMessage;
     const connectPort = deps.connectPort;
-    const preloadWholeChapter = deps.preloadWholeChapter !== false;
+    const hasExplicitPreloadDep = typeof deps.preloadWholeChapter === "boolean";
+    let preloadWholeChapter = hasExplicitPreloadDep
+      ? deps.preloadWholeChapter
+      : DEFAULT_PRELOAD_WHOLE_CHAPTER;
     const overlayApi = deps.overlayApi || root.MangaOverlay;
     const MutationObserverCtor =
       deps.MutationObserver !== undefined ? deps.MutationObserver : win.MutationObserver;
@@ -278,7 +282,7 @@
     let preloadTimer = null;
     let startRequestInFlight = false;
     const healthPollIntervalMs = deps.healthPollIntervalMs ?? 2000;
-    const healthPollMaxTries = deps.healthPollMaxTries ?? 45;
+    const healthPollMaxTries = deps.healthPollMaxTries ?? 90;
     const setTimeoutImpl =
       deps.setTimeout || (typeof win?.setTimeout === "function" ? win.setTimeout.bind(win) : setTimeout);
     const clearTimeoutImpl =
@@ -381,7 +385,9 @@
       if (vh <= 0 || vw <= 0) return false;
       const rect = el.getBoundingClientRect();
       if (!rect || rect.width <= 0 || rect.height <= 0) return false;
-      return rect.bottom > -250 && rect.top < vh + 250 && rect.right > 0 && rect.left < vw;
+      const bottom = rect.bottom !== undefined ? rect.bottom : rect.top + rect.height;
+      const right = rect.right !== undefined ? rect.right : rect.left + rect.width;
+      return bottom > -250 && rect.top < vh + 250 && right > 0 && rect.left < vw;
     }
 
     function resolveActiveGlossary(bySeries, flat) {
@@ -804,7 +810,9 @@
       removePageLoadingBadge(el);
       if (!active) return;
       inFlightByEl.delete(el);
-      if (active.port) {
+      if (typeof active.cancelPort === "function") {
+        active.cancelPort();
+      } else if (active.port) {
         try {
           active.port.disconnect();
         } catch (_err) {
@@ -976,6 +984,9 @@
           } catch (_err) {
             return null;
           }
+          if ((!enabled && !force) || (generations.get(el) || 1) !== gen || getElementSourceKey(el) !== srcKey) {
+            return null;
+          }
         } else {
           imageUrl = srcKey;
         }
@@ -990,7 +1001,7 @@
       }
 
       const requestId = `mlt-${++reqCounter}-${Date.now()}`;
-      const entry = { gen, srcKey, requestId, priority, port: null, session: null };
+      const entry = { gen, srcKey, requestId, priority, port: null, session: null, cancelPort: null };
       inFlightByEl.set(el, entry);
       failedByEl.delete(el);
       showPageLoadingBadge(el, "Translating...");
@@ -1057,12 +1068,17 @@
           const settle = (value, fallbackToMessage = false) => {
             if (settled) return;
             settled = true;
+            entry.cancelPort = null;
             try {
               port.disconnect();
             } catch (_err) {
               // Ignore already disconnected port.
             }
             resolve({ handled: !fallbackToMessage, value });
+          };
+          entry.cancelPort = () => {
+            session?.destroy?.();
+            settle(null, false);
           };
 
           port.onMessage?.addListener((evt) => {
@@ -1319,7 +1335,7 @@
       }
 
       // Cancel off-screen lookahead requests scrolled far away, keeping active chapter preload (priority 1) if still a candidate.
-      for (const [el, active] of inFlightByEl.entries()) {
+      for (const [el, active] of [...inFlightByEl.entries()]) {
         if (!activeTargets.has(el) && !(preloadWholeChapter && active.priority === 1 && candidateSet.has(el))) {
           cancelElementInFlight(el);
         }
@@ -1471,9 +1487,13 @@
         "glossary",
         "glossariesBySeries",
         "includeFloating",
+        "preloadWholeChapter",
       ]);
       langMode = data?.langMode || "auto";
       includeFloating = data?.includeFloating !== false;
+      if (!hasExplicitPreloadDep) {
+        preloadWholeChapter = data?.preloadWholeChapter === true;
+      }
       glossariesBySeries = data?.glossariesBySeries ?? null;
       flatGlossary = data?.glossary || {};
       glossary = resolveActiveGlossary(glossariesBySeries, flatGlossary);
@@ -1517,6 +1537,21 @@
       if (shouldRetranslate && enabled) {
         retranslateAllActive();
       }
+      if (!hasExplicitPreloadDep && changes.preloadWholeChapter) {
+        const nextPreload = changes.preloadWholeChapter.newValue === true;
+        if (nextPreload !== preloadWholeChapter) {
+          preloadWholeChapter = nextPreload;
+          if (!preloadWholeChapter) {
+            stopPreloadTimer();
+          }
+          if (enabled) {
+            refreshVisibleAndLookahead();
+            if (preloadWholeChapter && serverState === "ok") {
+              scheduleBackgroundPreload();
+            }
+          }
+        }
+      }
       if (changes.enabledDomains) {
         const shouldEnable = isDomainEnabled(hostname, changes.enabledDomains.newValue);
         if (shouldEnable && !enabled) {
@@ -1539,11 +1574,30 @@
       return null;
     }
 
+    function notifyEngineReady() {
+      if (!enabled || contextInvalidated) return;
+      if (serverState !== "ok" || lastErrorLabel || inFlightByEl.size === 0) {
+        handleEngineReady();
+      }
+    }
+
+    function teardown() {
+      disable();
+      if (typeof win?.removeEventListener === "function") {
+        win.removeEventListener("pagehide", onUnload);
+        win.removeEventListener("beforeunload", onUnload);
+        win.removeEventListener("scroll", onViewportMove);
+        win.removeEventListener("resize", onViewportMove);
+      }
+    }
+
+    let onUnload = null;
+    let onViewportMove = null;
     if (typeof win?.addEventListener === "function") {
-      const onUnload = () => {
+      onUnload = () => {
         cancelAllActive();
       };
-      const onViewportMove = () => {
+      onViewportMove = () => {
         if (pageLoadingBadges.size > 0) {
           repositionAllLoadingBadges();
         }
@@ -1558,6 +1612,8 @@
       init,
       enable,
       disable,
+      teardown,
+      notifyEngineReady,
       cancelAllActive,
       isEnabled: () => enabled,
       isContextInvalidated: () => contextInvalidated,
@@ -1574,6 +1630,27 @@
     };
   }
 
+  function cleanupOrphanedMltDom(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") return;
+    const selectors = [
+      "[data-mlt-pill]",
+      "[data-mlt-overlay]",
+      "[data-mlt-loading]",
+      ".mlt-tooltip-portal",
+    ];
+    for (const sel of selectors) {
+      try {
+        for (const node of doc.querySelectorAll(sel)) {
+          if (node && node.parentNode) {
+            node.parentNode.removeChild(node);
+          }
+        }
+      } catch (_err) {
+        // Ignore DOM cleanup errors.
+      }
+    }
+  }
+
   function bootstrapExtensionContent() {
     if (
       typeof window === "undefined" ||
@@ -1584,6 +1661,15 @@
     ) {
       return null;
     }
+
+    if (typeof window.__mltCleanup === "function") {
+      try {
+        window.__mltCleanup();
+      } catch (_err) {
+        // Ignore cleanup errors from prior instance.
+      }
+    }
+    cleanupOrphanedMltDom(document);
 
     const controller = createPageController({
       document,
@@ -1607,6 +1693,57 @@
       overlayApi: root.MangaOverlay,
     });
 
+    let tornDown = false;
+    const storageListener = (changes, areaName) => {
+      if (tornDown) return;
+      if (!chrome?.runtime?.id) {
+        controller.handleContextInvalidated();
+        return;
+      }
+      if (areaName === "local") {
+        controller.handleStorageChanges(changes);
+      }
+    };
+
+    const messageListener = (msg, _sender, sendResponse) => {
+      if (tornDown) return false;
+      if (!chrome?.runtime?.id) {
+        controller.handleContextInvalidated();
+        return false;
+      }
+      if (msg?.type === "PING_CONTENT_SCRIPT") {
+        if (typeof sendResponse === "function") {
+          sendResponse({
+            ok: true,
+            enabled: controller.isEnabled(),
+            contextInvalidated: controller.isContextInvalidated(),
+          });
+        }
+        return false;
+      }
+      if (msg?.type === "ENGINE_READY") {
+        controller.notifyEngineReady();
+        return false;
+      }
+      if (msg?.type === "MANUAL_TRANSLATE_IMAGE") {
+        void controller.handleManualTranslate(msg.srcUrl);
+      }
+      return false;
+    };
+
+    window.__mltCleanup = () => {
+      if (tornDown) return;
+      tornDown = true;
+      try {
+        chrome.storage.onChanged?.removeListener?.(storageListener);
+        chrome.runtime.onMessage?.removeListener?.(messageListener);
+      } catch (_err) {
+        // Ignore listener removal errors on invalidated context.
+      }
+      controller.teardown();
+      cleanupOrphanedMltDom(document);
+    };
+
     void (async () => {
       try {
         await controller.init();
@@ -1618,25 +1755,8 @@
     })();
 
     try {
-      chrome.storage.onChanged.addListener((changes, areaName) => {
-        if (!chrome?.runtime?.id) {
-          controller.handleContextInvalidated();
-          return;
-        }
-        if (areaName === "local") {
-          controller.handleStorageChanges(changes);
-        }
-      });
-
-      chrome.runtime.onMessage.addListener((msg) => {
-        if (!chrome?.runtime?.id) {
-          controller.handleContextInvalidated();
-          return;
-        }
-        if (msg?.type === "MANUAL_TRANSLATE_IMAGE") {
-          void controller.handleManualTranslate(msg.srcUrl);
-        }
-      });
+      chrome.storage.onChanged.addListener(storageListener);
+      chrome.runtime.onMessage.addListener(messageListener);
     } catch (err) {
       if (isContextInvalidatedError(err)) {
         controller.handleContextInvalidated();
@@ -1652,6 +1772,7 @@
 
   const exportsApi = {
     MAX_LOOKAHEAD,
+    DEFAULT_PRELOAD_WHOLE_CHAPTER,
     MAX_PAGE_CACHE,
     isDomainEnabled,
     deriveSeriesId,
