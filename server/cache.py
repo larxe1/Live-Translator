@@ -15,7 +15,7 @@ from server.translator.memory import contains_non_english_cjk, looks_like_romaji
 
 logger = logging.getLogger(__name__)
 
-CACHE_KEY_VERSION = "v5-qwen25-natural"
+CACHE_KEY_VERSION = "v6-hybrid-multi"
 
 
 def _response_has_non_english_cjk(response: TranslateResponse) -> bool:
@@ -94,14 +94,16 @@ class TranslationCache:
         lang: str,
         glossary: dict[str, str] | None = None,
         include_floating: bool = True,
+        mode: str = "",
     ) -> str:
-        """Compute versioned deterministic SHA-256 key over image bytes, language, glossary, and floating mode."""
+        """Compute versioned deterministic SHA-256 key over image bytes, language, glossary, floating, and mode."""
         normalized_glossary = json.dumps(
             glossary or {},
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        normalized_mode = str(mode or "").strip().lower()
         hasher = hashlib.sha256()
         hasher.update(CACHE_KEY_VERSION.encode("utf-8"))
         hasher.update(b"\x00")
@@ -112,6 +114,8 @@ class TranslationCache:
         hasher.update(normalized_glossary.encode("utf-8"))
         hasher.update(b"\x00")
         hasher.update(b"1" if include_floating else b"0")
+        hasher.update(b"\x00")
+        hasher.update(normalized_mode.encode("utf-8"))
         return hasher.hexdigest()
 
     def _next_seq(self, conn: sqlite3.Connection) -> int:

@@ -1516,3 +1516,308 @@ test("15. stream OCR status events update per-image loading badge before meta ar
   ]);
   assert.equal(getBadgeText(), "");
 });
+
+test("16. popup hybrid engineModeSelect & geminiKeyStatus render from /health while preserving GPU telemetry", () => {
+  const popupHtml = fs.readFileSync(path.join(EXT_DIR, "popup.html"), "utf8");
+  assert.match(popupHtml, /id="engineModeSelect"/);
+  assert.match(popupHtml, /<option value="hybrid">Hybrid \(Gemini Vision \+ Local\)<\/option>/);
+  assert.match(popupHtml, /<option value="local">Local Only \(Shisa JP \/ EXAONE KR\)<\/option>/);
+  assert.match(popupHtml, /<option value="gemini">Gemini Vision Only<\/option>/);
+  assert.match(popupHtml, /id="geminiKeyInput"[^>]*type="password"/);
+  assert.match(popupHtml, /id="geminiKeyInput"[^>]*autocomplete="off"/);
+  assert.match(popupHtml, /id="saveGeminiKeyBtn"/);
+  assert.match(popupHtml, /id="clearGeminiKeyBtn"/);
+  assert.match(popupHtml, /id="geminiKeyStatus"/);
+
+  const popupJs = fs.readFileSync(path.join(EXT_DIR, "popup.js"), "utf8");
+  assert.equal(/storage\.local\.set\([^)]*gemini/i.test(popupJs), false);
+
+  const makeDom = () => ({
+    statusDot: { className: "" },
+    statusText: { textContent: "" },
+    statusVram: { textContent: "" },
+    gpuGuardNotice: { hidden: true, textContent: "", title: "", className: "gpu-guard-notice" },
+    engineModeSelect: { value: "hybrid" },
+    geminiKeyStatus: { textContent: "", className: "key-status" },
+  });
+
+  // 1) Hybrid mode with Gemini configured and lazy local LLM
+  const domHybrid = makeDom();
+  popup.applyHealthUI(
+    {
+      ready: true,
+      gpu_name: "RTX 3070",
+      vram_used_mb: 1200,
+      vram_total_mb: 8192,
+      translation_mode: "hybrid",
+      gemini_configured: true,
+      gemini_key_hint: "TEST...1234",
+      llm_ready: false,
+      active_local_model: "",
+      gpu_guard: { state: "ok", temp_c: 52 },
+    },
+    domHybrid
+  );
+  assert.equal(domHybrid.statusDot.className, "status-dot ready");
+  assert.equal(domHybrid.statusText.textContent, "Hybrid · Gemini + Shisa/EXAONE");
+  assert.equal(domHybrid.statusVram.textContent, "1200/8192 MB · 52°C");
+  assert.equal(domHybrid.engineModeSelect.value, "hybrid");
+  assert.equal(domHybrid.geminiKeyStatus.textContent, "Saved (TEST...1234)");
+  assert.equal(domHybrid.geminiKeyStatus.className, "key-status configured");
+
+  // 2) Local mode with EXAONE KR active and thermal throttle preserved
+  const domLocalKo = makeDom();
+  popup.applyHealthUI(
+    {
+      ready: true,
+      gpu_name: "RTX 3070",
+      vram_used_mb: 5800,
+      vram_total_mb: 8192,
+      translation_mode: "local",
+      gemini_configured: false,
+      gemini_key_hint: "",
+      llm_ready: true,
+      active_local_model: "EXAONE-3.5-7.8B-Instruct-abliterated.i1-IQ4_XS.gguf",
+      gpu_guard: { state: "throttled", temp_c: 79, message: "Cooling" },
+    },
+    domLocalKo
+  );
+  assert.equal(domLocalKo.statusText.textContent, "Local · EXAONE KR");
+  assert.equal(domLocalKo.statusVram.textContent, "5800/8192 MB · 79°C");
+  assert.equal(domLocalKo.gpuGuardNotice.hidden, false);
+  assert.equal(domLocalKo.gpuGuardNotice.textContent, "Cooling GPU (79°C)...");
+  assert.equal(domLocalKo.engineModeSelect.value, "local");
+  assert.equal(domLocalKo.geminiKeyStatus.textContent, "Not configured");
+  assert.equal(domLocalKo.geminiKeyStatus.className, "key-status");
+
+  // 3) Gemini-only mode
+  const domGemini = makeDom();
+  popup.applyHealthUI(
+    {
+      ready: true,
+      gpu_name: "RTX 3070",
+      vram_used_mb: 900,
+      vram_total_mb: 8192,
+      translation_mode: "gemini",
+      gemini_configured: true,
+      gemini_key_hint: "TEST...9999",
+    },
+    domGemini
+  );
+  assert.equal(domGemini.statusText.textContent, "Gemini Vision Only");
+  assert.equal(domGemini.engineModeSelect.value, "gemini");
+  assert.equal(domGemini.geminiKeyStatus.textContent, "Saved (TEST...9999)");
+});
+
+test("17. background SAVE_SETTINGS proxies POST /settings without storing key and handles errors", async () => {
+  const requests = [];
+  const sb = loadBackgroundSandbox({
+    fetchImpl: async (url, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      requests.push({ url, method: opts.method || "GET", body });
+      if (url.endsWith("/settings")) {
+        if (body?.translation_mode === "invalid") {
+          return {
+            ok: false,
+            status: 400,
+            async text() {
+              return JSON.stringify({ detail: "Unsupported translation_mode" });
+            },
+          };
+        }
+        if (body?.clear_gemini_api_key) {
+          return {
+            ok: true,
+            status: 200,
+            async text() {
+              return JSON.stringify({
+                ok: true,
+                translation_mode: body.translation_mode || "hybrid",
+                gemini_configured: false,
+                gemini_key_hint: "",
+              });
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              ok: true,
+              translation_mode: body.translation_mode || "hybrid",
+              gemini_configured: Boolean(body.gemini_api_key),
+              gemini_key_hint: body.gemini_api_key ? "TEST...5678" : "",
+            });
+          },
+        };
+      }
+      return { ok: false, status: 404, async text() { return "{}"; } };
+    },
+  });
+
+  const saveRes = await sb.sendMessage({
+    type: "SAVE_SETTINGS",
+    translation_mode: "gemini",
+    gemini_api_key: "TEST-DUMMY-API-KEY-5678",
+  });
+  assert.equal(saveRes.ok, true);
+  assert.equal(saveRes.translation_mode, "gemini");
+  assert.equal(saveRes.gemini_configured, true);
+  assert.equal(saveRes.gemini_key_hint, "TEST...5678");
+  assert.deepEqual(requests[0], {
+    url: "http://127.0.0.1:8765/settings",
+    method: "POST",
+    body: {
+      translation_mode: "gemini",
+      gemini_api_key: "TEST-DUMMY-API-KEY-5678",
+    },
+  });
+  assert.equal(sb.storage._data.gemini_api_key, undefined);
+  assert.equal(sb.storage._data.geminiApiKey, undefined);
+
+  const clearRes = await sb.sendMessage({
+    type: "SAVE_SETTINGS",
+    clear_gemini_api_key: true,
+  });
+  assert.equal(clearRes.ok, true);
+  assert.equal(clearRes.gemini_configured, false);
+  assert.equal(clearRes.gemini_key_hint, "");
+
+  const errRes = await sb.sendMessage({
+    type: "SAVE_SETTINGS",
+    translation_mode: "invalid",
+  });
+  assert.equal(errRes.ok, false);
+  assert.match(errRes.error, /Unsupported translation_mode/);
+});
+
+test("18. stream translate status updates badge for Gemini/Local and forwards translationMode to /translate/stream", async () => {
+  const { doc, win } = createMinimalDom("https://mangadex.org/chapter/101");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/hybrid-page.jpg";
+  doc.body.appendChild(img);
+
+  const badgeLabels = [];
+  const getBadgeText = () => {
+    const badges = doc.body.children.filter((c) => c.className === "mlt-page-loading");
+    return badges.length > 0 ? badges[0].children[1].textContent : "";
+  };
+
+  const seenStreamBodies = [];
+  const sb = loadBackgroundSandbox({
+    fetchImpl: async (url, opts = {}) => {
+      if (url.includes("cdn.example.org/hybrid-page.jpg")) {
+        return {
+          ok: true,
+          status: 200,
+          async arrayBuffer() {
+            return Uint8Array.from([137, 80, 78, 71]).buffer;
+          },
+        };
+      }
+      if (url.endsWith("/translate/stream")) {
+        seenStreamBodies.push(JSON.parse(opts.body));
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return (
+              JSON.stringify({ type: "status", stage: "translate", provider: "gemini:gemini-3.5-flash-lite" }) + "\n" +
+              JSON.stringify({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } }) + "\n"
+            );
+          },
+        };
+      }
+      if (url.endsWith("/health")) {
+        return { ok: true, status: 200, async text() { return JSON.stringify({ ready: true }); } };
+      }
+      return { ok: false, status: 404, async text() { return "{}"; } };
+    },
+  });
+
+  let emitCustomEvents = null;
+  let useBackgroundPort = false;
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return {
+          enabledDomains: { "mangadex.org": true },
+          langMode: "ja",
+          translationMode: "hybrid",
+          glossary: {},
+        };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: (name) => {
+      if (useBackgroundPort) {
+        return sb.connectPort(name).clientPort;
+      }
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          assert.equal(msg.translationMode, "hybrid");
+          emitCustomEvents = () => {
+            for (const fn of listeners) fn({ type: "status", stage: "translate", provider: "gemini:gemini-3.5-flash-lite" });
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) fn({ type: "status", stage: "translate", provider: "local:ja" });
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [{ id: 0, bbox: [0, 0, 100, 100] }] });
+            }
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) fn({ type: "bubble", id: 0, translated: "Hello!", final: true });
+            badgeLabels.push(getBadgeText());
+            for (const fn of listeners) {
+              fn({
+                type: "done",
+                response: {
+                  lang: "ja",
+                  width: 800,
+                  height: 1200,
+                  bubbles: [{ id: 0, bbox: [0, 0, 100, 100], translated: "Hello!" }],
+                },
+              });
+            }
+          };
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  assert.equal(typeof emitCustomEvents, "function");
+  emitCustomEvents();
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.deepEqual(badgeLabels, [
+    "Translating (Gemini)...",
+    "Translating (Local)...",
+    "Translating 0/1...",
+    "Translating 1/1...",
+  ]);
+  assert.equal(getBadgeText(), "");
+
+  // Switching translationMode via storage change triggers retranslation and sends translation_mode to /translate/stream
+  useBackgroundPort = true;
+  controller.handleStorageChanges({
+    translationMode: { oldValue: "hybrid", newValue: "local" },
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(seenStreamBodies.length, 1);
+  assert.equal(seenStreamBodies[0].translation_mode, "local");
+});

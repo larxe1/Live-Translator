@@ -343,7 +343,7 @@ def _make_cache_response(translated_text: str, original_text: str = "夢幻団")
 
 
 def test_translation_cache_v5_key_evicts_cjk_and_romaji_and_purges_on_init(tmp_path):
-    assert CACHE_KEY_VERSION == "v5-qwen25-natural"
+    assert CACHE_KEY_VERSION == "v6-hybrid-multi"
     db_path = tmp_path / "translations.db"
     cache = TranslationCache(db_path, max_entries=20)
 
@@ -353,6 +353,9 @@ def test_translation_cache_v5_key_evicts_cjk_and_romaji_and_purges_on_init(tmp_p
     v4_key_floating_false = cache.make_key(img_bytes, "ja", {}, include_floating=False)
     assert v4_key == v4_key_floating_true
     assert v4_key != v4_key_floating_false
+    assert cache.make_key(img_bytes, "ja", {}, mode="hybrid") != cache.make_key(
+        img_bytes, "ja", {}, mode="local"
+    )
 
     legacy_hasher = hashlib.sha256()
     legacy_hasher.update(img_bytes)

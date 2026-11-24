@@ -1183,3 +1183,64 @@ test("18. content controller defaults includeFloating to false and honors explic
   assert.equal(optInPayloads.length, 1);
   assert.equal(optInPayloads[0].includeFloating, true);
 });
+
+test("19. content controller honors translationMode in TRANSLATE_IMAGE fallback and background SAVE_SETTINGS handles network error", async () => {
+  const doc = createMockDocument();
+  const win = createMockWindow(doc, "https://mangadex.org/chapter/77");
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/p77.jpg";
+  img.width = 800;
+  img.height = 1200;
+  img.naturalWidth = 800;
+  img.naturalHeight = 1200;
+  doc.body.appendChild(img);
+
+  const payloads = [];
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return {
+          enabledDomains: { "mangadex.org": true },
+          langMode: "ko",
+          translationMode: "gemini",
+          glossary: {},
+        };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "TRANSLATE_IMAGE") {
+        payloads.push(msg);
+        return { ok: true, data: { lang: "ko", width: 800, height: 1200, bubbles: [] } };
+      }
+      return { ok: true };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  controller.setVisibility(img, true);
+  await controller.refreshVisibleAndLookahead();
+  assert.equal(payloads.length, 1);
+  assert.equal(payloads[0].translationMode, "gemini");
+
+  assert.equal(content.formatTranslateProviderLabel("gemini:gemini-3.5-flash-lite"), "Translating (Gemini)...");
+  assert.equal(content.formatTranslateProviderLabel("local:ko"), "Translating (Local)...");
+
+  const netErr = await background.handleMessage(
+    { type: "SAVE_SETTINGS", translation_mode: "hybrid" },
+    {},
+    {
+      serverBaseUrl: "http://127.0.0.1:8765",
+      fetch: async () => {
+        throw new TypeError("Failed to fetch");
+      },
+    }
+  );
+  assert.equal(netErr.ok, false);
+  assert.match(netErr.error, /Failed to fetch/);
+});

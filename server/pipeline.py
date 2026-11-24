@@ -397,6 +397,40 @@ class TranslationPipeline:
         else:
             self.memory.record_page(chapter_id, pairs)
 
+    def _resolve_cache_mode(self, translation_mode: str | None) -> str:
+        raw = str(translation_mode or getattr(self.cfg, "translation_mode", "") or "").strip().lower()
+        if raw in ("hybrid", "local", "gemini"):
+            return raw
+        return ""
+
+    def _should_eager_start_llm(self, translation_mode: str | None) -> bool:
+        """Keep llama-server lazy when Gemini Vision can handle the request in hybrid/gemini mode."""
+        can_use_gemini = getattr(self.translator, "_can_use_gemini_now", None)
+        if callable(can_use_gemini):
+            try:
+                if can_use_gemini(translation_mode):
+                    return False
+            except Exception:
+                pass
+        mode = self._resolve_cache_mode(translation_mode)
+        if mode == "gemini":
+            return False
+        if mode == "hybrid":
+            try:
+                from server.config import get_gemini_api_key
+
+                project_root = getattr(self.cfg, "project_root", None)
+                key = (
+                    get_gemini_api_key(env_path=project_root / ".env")
+                    if project_root is not None
+                    else get_gemini_api_key()
+                )
+                if key:
+                    return False
+            except Exception:
+                pass
+        return True
+
     def _prepare_request_context(
         self,
         image_bytes: bytes,
@@ -406,6 +440,7 @@ class TranslationPipeline:
         *,
         include_floating: bool = True,
         series_id: str | None = None,
+        translation_mode: str | None = None,
     ) -> tuple[dict[str, str], str]:
         if len(image_bytes) > self.max_image_bytes:
             raise PayloadTooLargeError(
@@ -416,15 +451,13 @@ class TranslationPipeline:
         else:
             chapter_glossary = self.memory.get_glossary(chapter_id)
         merged_glossary = {**chapter_glossary, **(glossary or {})}
+        cache_mode = self._resolve_cache_mode(translation_mode)
+        key_kwargs: dict[str, Any] = {}
         if _accepts_kwarg(self.cache.make_key, "include_floating"):
-            cache_key = self.cache.make_key(
-                image_bytes,
-                lang,
-                merged_glossary,
-                include_floating=include_floating,
-            )
-        else:
-            cache_key = self.cache.make_key(image_bytes, lang, merged_glossary)
+            key_kwargs["include_floating"] = include_floating
+        if _accepts_kwarg(self.cache.make_key, "mode"):
+            key_kwargs["mode"] = cache_mode
+        cache_key = self.cache.make_key(image_bytes, lang, merged_glossary, **key_kwargs)
         return merged_glossary, cache_key
 
     async def _wait_gpu_guard(self, cancel_event: asyncio.Event) -> None:
@@ -523,11 +556,14 @@ class TranslationPipeline:
         *,
         include_floating: bool = True,
         series_id: str | None = None,
+        translation_mode: str | None = None,
         cancel_event: asyncio.Event | None = None,
     ) -> TranslateResponse:
         cancel_ev = cancel_event if cancel_event is not None else asyncio.Event()
         if cancel_ev.is_set():
             raise asyncio.CancelledError("Translation request cancelled")
+
+        cache_mode = self._resolve_cache_mode(translation_mode)
 
         # Re-check cache in case an identical image finished while we waited in queue.
         cached_inner = self.cache.get(cache_key)
@@ -547,7 +583,7 @@ class TranslationPipeline:
                 await emit({"type": "done", "response": cached_inner.model_dump()})
             return cached_inner
 
-        if self.ensure_llm_ready is not None:
+        if self.ensure_llm_ready is not None and self._should_eager_start_llm(translation_mode):
             await self.ensure_llm_ready()
 
         await self._wait_gpu_guard(cancel_ev)
@@ -614,6 +650,7 @@ class TranslationPipeline:
                     cache_key,
                     empty_resp,
                     include_floating=include_floating,
+                    mode=cache_mode,
                 )
                 if emit is not None:
                     await emit({"type": "done", "response": empty_resp.model_dump()})
@@ -704,6 +741,7 @@ class TranslationPipeline:
                     cache_key,
                     empty_resp,
                     include_floating=include_floating,
+                    mode=cache_mode,
                 )
                 if emit is not None:
                     await emit({"type": "done", "response": empty_resp.model_dump()})
@@ -771,7 +809,12 @@ class TranslationPipeline:
                 idx: region_type
                 for idx, _bbox, _safe_box, _style, _text, region_type in scaled_geometries
             }
+            bubble_boxes = {
+                idx: bbox
+                for idx, bbox, _safe_box, _style, _text, _region_type in scaled_geometries
+            }
             emitted_ids: set[int] = set()
+            active_provider = ""
 
             async def _on_bubble(bid: int, translated_text: str, final: bool) -> None:
                 nonlocal first_bubble_ms
@@ -785,6 +828,18 @@ class TranslationPipeline:
                             "id": bid,
                             "translated": translated_text,
                             "final": final,
+                        }
+                    )
+
+            async def _on_provider(provider_name: str) -> None:
+                nonlocal active_provider
+                active_provider = str(provider_name or "")
+                if emit is not None and active_provider:
+                    await emit(
+                        {
+                            "type": "status",
+                            "stage": "translate",
+                            "provider": active_provider,
                         }
                     )
 
@@ -803,6 +858,14 @@ class TranslationPipeline:
                 tr_kwargs["cancel_event"] = cancel_ev
             if _accepts_kwarg(self.translator.translate_page, "gpu_guard"):
                 tr_kwargs["gpu_guard"] = self.gpu_guard
+            if _accepts_kwarg(self.translator.translate_page, "image"):
+                tr_kwargs["image"] = pil_img
+            if _accepts_kwarg(self.translator.translate_page, "bubble_boxes"):
+                tr_kwargs["bubble_boxes"] = bubble_boxes
+            if _accepts_kwarg(self.translator.translate_page, "translation_mode"):
+                tr_kwargs["translation_mode"] = translation_mode
+            if _accepts_kwarg(self.translator.translate_page, "on_provider"):
+                tr_kwargs["on_provider"] = _on_provider
 
             await self._wait_gpu_guard(cancel_ev)
             translations: dict[int, str] = await self.translator.translate_page(
@@ -832,10 +895,14 @@ class TranslationPipeline:
                 for idx, bbox, safe_box, style, text, region_type in scaled_geometries
             ]
 
+            final_provider = str(
+                getattr(self.translator, "last_provider", "") or active_provider or ""
+            )
             total_ms = int((time.perf_counter() - t0) * 1000)
             logger.info(
-                "Pipeline stage timings: lang=%s bubbles=%d detector_ms=%d ocr_ms=%d first_bubble_ms=%s total_ms=%d",
+                "Pipeline stage timings: lang=%s provider=%s bubbles=%d detector_ms=%d ocr_ms=%d first_bubble_ms=%s total_ms=%d",
                 resolved_lang,
+                final_provider or "default",
                 len(bubbles),
                 detector_ms,
                 ocr_ms,
@@ -843,14 +910,17 @@ class TranslationPipeline:
                 total_ms,
             )
 
-            response = TranslateResponse(
-                lang=resolved_lang,
-                width=orig_w,
-                height=orig_h,
-                elapsed_ms=total_ms,
-                cached=False,
-                bubbles=bubbles,
-            )
+            resp_kwargs: dict[str, Any] = {
+                "lang": resolved_lang,
+                "width": orig_w,
+                "height": orig_h,
+                "elapsed_ms": total_ms,
+                "cached": False,
+                "bubbles": bubbles,
+            }
+            if "provider" in TranslateResponse.model_fields:
+                resp_kwargs["provider"] = final_provider
+            response = TranslateResponse(**resp_kwargs)
             self._store_cache(
                 image_bytes,
                 lang,
@@ -859,6 +929,7 @@ class TranslationPipeline:
                 cache_key,
                 response,
                 include_floating=include_floating,
+                mode=cache_mode,
             )
             if emit is not None:
                 await emit({"type": "done", "response": response.model_dump()})
@@ -877,6 +948,7 @@ class TranslationPipeline:
         request_id: str | None = None,
         include_floating: bool = True,
         series_id: str | None = None,
+        translation_mode: str | None = None,
     ) -> TranslateResponse:
         """Translate all dialogue bubbles in an image, checking cache before GPU queueing."""
         merged_glossary, cache_key = self._prepare_request_context(
@@ -886,6 +958,7 @@ class TranslationPipeline:
             glossary,
             include_floating=include_floating,
             series_id=series_id,
+            translation_mode=translation_mode,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -905,6 +978,7 @@ class TranslationPipeline:
                 emit=None,
                 include_floating=include_floating,
                 series_id=series_id,
+                translation_mode=translation_mode,
                 cancel_event=cancel_ev,
             ),
             request_id=request_id,
@@ -921,6 +995,7 @@ class TranslationPipeline:
         request_id: str | None = None,
         include_floating: bool = True,
         series_id: str | None = None,
+        translation_mode: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream translation events (status* -> meta -> bubble* -> done | error) for an image."""
         merged_glossary, cache_key = self._prepare_request_context(
@@ -930,6 +1005,7 @@ class TranslationPipeline:
             glossary,
             include_floating=include_floating,
             series_id=series_id,
+            translation_mode=translation_mode,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -966,6 +1042,7 @@ class TranslationPipeline:
                         emit=_emit,
                         include_floating=include_floating,
                         series_id=series_id,
+                        translation_mode=translation_mode,
                         cancel_event=cancel_ev,
                     ),
                     request_id=request_id,
@@ -1008,6 +1085,7 @@ class TranslationPipeline:
         primary_key: str,
         response: TranslateResponse,
         include_floating: bool = True,
+        mode: str = "",
     ) -> None:
         bad_bubbles = [
             b.id
@@ -1024,13 +1102,15 @@ class TranslationPipeline:
 
         self.cache.put(primary_key, response)
         if requested_lang != resolved_lang:
+            key_kwargs: dict[str, Any] = {}
             if _accepts_kwarg(self.cache.make_key, "include_floating"):
-                resolved_key = self.cache.make_key(
-                    image_bytes,
-                    resolved_lang,
-                    merged_glossary,
-                    include_floating=include_floating,
-                )
-            else:
-                resolved_key = self.cache.make_key(image_bytes, resolved_lang, merged_glossary)
+                key_kwargs["include_floating"] = include_floating
+            if _accepts_kwarg(self.cache.make_key, "mode"):
+                key_kwargs["mode"] = mode
+            resolved_key = self.cache.make_key(
+                image_bytes,
+                resolved_lang,
+                merged_glossary,
+                **key_kwargs,
+            )
             self.cache.put(resolved_key, response)

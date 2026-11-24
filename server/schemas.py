@@ -44,6 +44,7 @@ class TranslateRequest(BaseModel):
     request_id: str | None = None
     include_floating: bool = False
     series_id: str | None = None
+    translation_mode: str | None = None
 
 
 class TranslateResponse(BaseModel):
@@ -54,6 +55,7 @@ class TranslateResponse(BaseModel):
     height: int
     elapsed_ms: int
     cached: bool = False
+    provider: str = ""
     bubbles: list[BubbleResult]
 
 
@@ -72,7 +74,29 @@ class HealthResponse(BaseModel):
     extension_build_id: str = ""
     has_remote: bool = False
     update_available: bool = False
+    translation_mode: str = "hybrid"
+    gemini_configured: bool = False
+    gemini_key_hint: str = ""
+    active_local_model: str = ""
+    available_local_models: dict[str, bool] = Field(default_factory=dict)
     gpu_guard: dict[str, Any] = Field(default_factory=dict)
+
+
+class SettingsUpdateRequest(BaseModel):
+    """Request payload to update translation mode or Gemini API key safely."""
+
+    translation_mode: str | None = None
+    gemini_api_key: str | None = None
+    clear_gemini_api_key: bool = False
+
+
+class SettingsUpdateResponse(BaseModel):
+    """Sanitized settings response (never returns raw API keys)."""
+
+    ok: bool = True
+    translation_mode: str = "hybrid"
+    gemini_configured: bool = False
+    gemini_key_hint: str = ""
 
 
 class UpdateStatusResponse(BaseModel):

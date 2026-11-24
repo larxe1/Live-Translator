@@ -721,6 +721,10 @@ function buildTranslatePayload(msg, imageBase64, requestId) {
   if (msg?.seriesId) {
     payload.series_id = msg.seriesId;
   }
+  const translationMode = String(msg?.translation_mode || msg?.translationMode || "").trim();
+  if (translationMode) {
+    payload.translation_mode = translationMode;
+  }
   return payload;
 }
 
@@ -841,6 +845,39 @@ async function handleMessage(message, sender = {}, deps = {}) {
       const storage = getStorageLocal(deps);
       await safeStorageSet(storage, { autoUpdateEnabled: enabled });
       return { ok: true, autoUpdateEnabled: enabled };
+    }
+
+    case "SAVE_SETTINGS": {
+      try {
+        const payload = {};
+        const mode = message?.translation_mode ?? message?.translationMode;
+        if (mode !== undefined && mode !== null && String(mode).trim() !== "") {
+          payload.translation_mode = String(mode).trim();
+        }
+        const apiKey = message?.gemini_api_key ?? message?.geminiApiKey;
+        if (apiKey !== undefined && apiKey !== null) {
+          payload.gemini_api_key = String(apiKey);
+        }
+        const clearKey = message?.clear_gemini_api_key ?? message?.clearGeminiApiKey;
+        if (clearKey !== undefined) {
+          payload.clear_gemini_api_key = Boolean(clearKey);
+        }
+        const data = await fetchJson(
+          `${serverBase}/settings`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          },
+          fetchImpl
+        );
+        if (data && typeof data === "object" && !Array.isArray(data)) {
+          return { ok: data.ok !== false, ...data };
+        }
+        return { ok: true, data };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
     }
 
     case "GET_GLOSSARY": {

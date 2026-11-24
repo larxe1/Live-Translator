@@ -25,7 +25,16 @@ import uvicorn
 
 from server import gpu_guard
 from server.cache import TranslationCache
-from server.config import AppConfig, enforce_d_drive_env, load_config
+from server.config import (
+    AppConfig,
+    VALID_TRANSLATION_MODES,
+    enforce_d_drive_env,
+    get_gemini_api_key,
+    load_config,
+    mask_api_key,
+    save_config_updates,
+    save_gemini_api_key,
+)
 from server.gpu_guard import GpuSafetyGuard
 from server.pipeline import PayloadTooLargeError, TranslationPipeline
 from server.schemas import (
@@ -34,6 +43,8 @@ from server.schemas import (
     GlossaryUpdateRequest,
     HealthResponse,
     MemoryClearRequest,
+    SettingsUpdateRequest,
+    SettingsUpdateResponse,
     TranslateRequest,
     TranslateResponse,
     UpdateApplyResponse,
@@ -137,10 +148,41 @@ def _parse_bool_form(raw: Any, default: bool = True) -> bool:
     raise HTTPException(status_code=422, detail=f"Invalid boolean value: {raw!r}")
 
 
+def _scan_available_local_models(cfg: AppConfig) -> dict[str, bool]:
+    """Return {role: is_downloaded} by checking configured local_models in cfg.models_dir."""
+    models_dir = cfg.models_dir or (cfg.project_root / "models")
+    present_names = (
+        {p.name.lower() for p in models_dir.rglob("*.gguf") if p.is_file()}
+        if models_dir.is_dir()
+        else set()
+    )
+    local_models = getattr(cfg, "local_models", None) or {}
+    result: dict[str, bool] = {}
+    for role, entry in local_models.items():
+        if isinstance(entry, dict):
+            fname = str(entry.get("filename", "") or "").strip().lower()
+            result[str(role)] = bool(fname and fname in present_names)
+    return result
+
+
+def _normalize_optional_mode(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    mode = str(raw).strip().lower()
+    if not mode:
+        return None
+    if mode not in VALID_TRANSLATION_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"translation_mode must be one of {VALID_TRANSLATION_MODES}",
+        )
+    return mode
+
+
 async def _parse_translate_request(
     request: Request,
     max_image_bytes: int,
-) -> tuple[bytes, Literal["auto", "ja", "ko"], str, int, dict[str, str], str | None, bool, str | None]:
+) -> tuple[bytes, Literal["auto", "ja", "ko"], str, int, dict[str, str], str | None, bool, str | None, str | None]:
     """Parse multipart or JSON translation request and enforce payload limits."""
     content_length_hdr = request.headers.get("content-length")
     if content_length_hdr:
@@ -162,6 +204,7 @@ async def _parse_translate_request(
     request_id: str | None = None
     include_floating = True
     series_id: str | None = None
+    translation_mode: str | None = None
     image_bytes: bytes = b""
 
     if "multipart/form-data" in content_type:
@@ -189,6 +232,7 @@ async def _parse_translate_request(
         include_floating = _parse_bool_form(form.get("include_floating"), default=True)
         series_raw = form.get("series_id")
         series_id = str(series_raw).strip() or None if series_raw is not None else None
+        translation_mode = _normalize_optional_mode(form.get("translation_mode"))
         glossary_raw = form.get("glossary")
         if glossary_raw:
             try:
@@ -219,11 +263,22 @@ async def _parse_translate_request(
         request_id = req.request_id
         include_floating = req.include_floating
         series_id = req.series_id.strip() or None if req.series_id is not None else None
+        translation_mode = _normalize_optional_mode(req.translation_mode)
 
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty image payload")
 
-    return image_bytes, lang, chapter_id, priority, glossary, request_id, include_floating, series_id
+    return (
+        image_bytes,
+        lang,
+        chapter_id,
+        priority,
+        glossary,
+        request_id,
+        include_floating,
+        series_id,
+        translation_mode,
+    )
 
 
 def _detect_torch_device() -> str:
@@ -247,20 +302,30 @@ def _release_torch_cache() -> None:
 
 
 async def _ensure_llm_ready(app: FastAPI) -> None:
-    """Transparently restart llama-server if it was unloaded due to inactivity."""
+    """Transparently start or restart llama-server when local inference is active."""
     app.state.last_activity = time.monotonic()
     mgr: LlamaServerManager | None = app.state.llama_manager
-    if mgr is None or not app.state.llm_idle_unloaded:
+    if mgr is None or getattr(app.state, "llm_lazy", False):
+        return
+    if not app.state.llm_idle_unloaded and await asyncio.to_thread(mgr.is_healthy):
         return
 
     lock: asyncio.Lock = app.state.llm_restart_lock
     async with lock:
-        if app.state.llm_idle_unloaded and app.state.llama_manager is not None:
+        if app.state.llama_manager is None or getattr(app.state, "llm_lazy", False):
+            return
+        if app.state.llm_idle_unloaded or not await asyncio.to_thread(app.state.llama_manager.is_healthy):
             app.state.loading_stage = "restarting_llm"
             await asyncio.to_thread(app.state.llama_manager.start)
             app.state.llm_idle_unloaded = False
             app.state.loading_stage = "ready"
             app.state.last_activity = time.monotonic()
+
+
+def _is_llama_proc_alive(mgr: LlamaServerManager) -> bool:
+    """Return True when llama-server manager holds a live child process."""
+    proc = getattr(mgr, "_process", None)
+    return proc is not None and proc.poll() is None
 
 
 async def _idle_watchdog_loop(app: FastAPI, idle_unload_minutes: int) -> None:
@@ -271,10 +336,13 @@ async def _idle_watchdog_loop(app: FastAPI, idle_unload_minutes: int) -> None:
         while True:
             await asyncio.sleep(check_interval)
             mgr: LlamaServerManager | None = app.state.llama_manager
+            if mgr is not None and _is_llama_proc_alive(mgr):
+                app.state.llm_idle_unloaded = False
             if (
                 mgr is None
                 or not app.state.ready
                 or app.state.llm_idle_unloaded
+                or (getattr(mgr, "_process", None) is None and not await asyncio.to_thread(mgr.is_healthy))
             ):
                 continue
             elapsed_idle = time.monotonic() - float(app.state.last_activity)
@@ -283,16 +351,25 @@ async def _idle_watchdog_loop(app: FastAPI, idle_unload_minutes: int) -> None:
 
             lock: asyncio.Lock = app.state.llm_restart_lock
             async with lock:
+                if app.state.llama_manager is not None and _is_llama_proc_alive(app.state.llama_manager):
+                    app.state.llm_idle_unloaded = False
                 if (
                     app.state.llama_manager is not None
                     and not app.state.llm_idle_unloaded
                     and (time.monotonic() - float(app.state.last_activity)) >= idle_seconds
+                    and (
+                        getattr(app.state.llama_manager, "_process", None) is not None
+                        or await asyncio.to_thread(app.state.llama_manager.is_healthy)
+                    )
                 ):
                     logger.info("Unloading llama-server after %.1f minutes idle", elapsed_idle / 60.0)
                     await asyncio.to_thread(app.state.llama_manager.stop)
                     await asyncio.to_thread(_release_torch_cache)
-                    app.state.llm_idle_unloaded = True
-                    app.state.loading_stage = "idle_unloaded"
+                    if not getattr(app.state, "llm_lazy", False):
+                        app.state.llm_idle_unloaded = True
+                        app.state.loading_stage = "idle_unloaded"
+                    else:
+                        app.state.llm_idle_unloaded = False
     except asyncio.CancelledError:
         return
 
@@ -332,11 +409,21 @@ async def _load_production_models(app: FastAPI) -> None:
         app.state.gpu_guard = gpu_guard
         min_free_vram_mb = int(getattr(cfg, "gpu_min_free_vram_mb", 1024))
 
-        app.state.loading_stage = "starting_llm"
         llama_mgr = app.state.llama_manager or LlamaServerManager(cfg, gpu_guard=gpu_guard)
         app.state.llama_manager = llama_mgr
-        await asyncio.to_thread(llama_mgr.start)
-        app.state.llm_idle_unloaded = False
+
+        mode = str(getattr(cfg, "translation_mode", "hybrid") or "hybrid").strip().lower()
+        has_gemini_key = bool(get_gemini_api_key(env_path=cfg.project_root / ".env"))
+        lazy_llm = mode in ("hybrid", "gemini") and has_gemini_key
+        app.state.llm_lazy = lazy_llm
+
+        if not lazy_llm:
+            app.state.loading_stage = "starting_llm"
+            await asyncio.to_thread(llama_mgr.start)
+            app.state.llm_idle_unloaded = False
+        else:
+            logger.info("Deferring local llama-server startup in %s mode (Gemini key configured)", mode)
+            app.state.llm_idle_unloaded = False
 
         app.state.loading_stage = "loading_detector"
         detector = BubbleDetector(
@@ -358,12 +445,31 @@ async def _load_production_models(app: FastAPI) -> None:
             logger.warning("Preloading Japanese OCR deferred to first request: %s", exc)
 
         app.state.loading_stage = "initializing_pipeline"
+        gemini_translator: Any = None
+        try:
+            from server.translator.gemini_translator import GeminiVisionTranslator
+
+            if _accepts_kwarg(GeminiVisionTranslator.__init__, "cfg"):
+                gemini_translator = GeminiVisionTranslator(cfg=cfg)
+            else:
+                gemini_translator = GeminiVisionTranslator()
+        except ImportError:
+            logger.info("GeminiVisionTranslator unavailable; local translator active")
+        except Exception as exc:
+            logger.warning("GeminiVisionTranslator initialization skipped: %s", exc)
+
         translator_kwargs: dict[str, Any] = {
             "llama_base_url": llama_mgr.base_url,
             "memory": memory,
         }
         if _accepts_kwarg(DialogueTranslator.__init__, "cfg"):
             translator_kwargs["cfg"] = cfg
+        if _accepts_kwarg(DialogueTranslator.__init__, "llama_mgr"):
+            translator_kwargs["llama_mgr"] = llama_mgr
+        if gemini_translator is not None and _accepts_kwarg(
+            DialogueTranslator.__init__, "gemini_translator"
+        ):
+            translator_kwargs["gemini_translator"] = gemini_translator
         translator = DialogueTranslator(**translator_kwargs)
 
         pipeline_kwargs: dict[str, Any] = {
@@ -503,6 +609,11 @@ def create_app(
     app.state.update_task = None
     app.state.last_activity = time.monotonic()
     app.state.llm_idle_unloaded = False
+    app.state.llm_lazy = (
+        str(getattr(resolved_cfg, "translation_mode", "hybrid") or "hybrid").strip().lower()
+        in ("hybrid", "gemini")
+        and bool(get_gemini_api_key(env_path=resolved_cfg.project_root / ".env"))
+    )
     app.state.llm_restart_lock = asyncio.Lock()
 
     app.add_middleware(
@@ -519,17 +630,25 @@ def create_app(
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
+        live_cfg: AppConfig = app.state.cfg
         gpu_guard_obj: GpuSafetyGuard = app.state.gpu_guard
         gpu_name, vram_used, vram_total = await asyncio.to_thread(_query_gpu_stats_sync)
         gpu_guard_status = await asyncio.to_thread(gpu_guard_obj.status)
         mgr: LlamaServerManager | None = app.state.llama_manager
         if mgr is not None:
-            llm_model = getattr(mgr, "model_name", resolved_cfg.llm_repo_id)
+            if _is_llama_proc_alive(mgr):
+                app.state.llm_idle_unloaded = False
             llm_ready = False if app.state.llm_idle_unloaded else await asyncio.to_thread(mgr.is_healthy)
+            active_local_model = str(getattr(mgr, "active_model_filename", "") or "") if llm_ready else ""
+            llm_model = active_local_model or getattr(mgr, "model_name", live_cfg.llm_repo_id)
+            available_local_models = await asyncio.to_thread(mgr.available_local_models)
         else:
-            llm_model = resolved_cfg.llm_repo_id
+            llm_model = live_cfg.llm_repo_id
             llm_ready = bool(app.state.ready)
+            active_local_model = ""
+            available_local_models = await asyncio.to_thread(_scan_available_local_models, live_cfg)
 
+        gemini_key = get_gemini_api_key(env_path=live_cfg.project_root / ".env")
         health_update = await asyncio.to_thread(updater.get_health_fields)
         status = "ok" if app.state.ready else ("error" if app.state.loading_error else "loading")
         return HealthResponse(
@@ -545,7 +664,51 @@ def create_app(
             extension_build_id=str(health_update["extension_build_id"]),
             has_remote=bool(health_update["has_remote"]),
             update_available=bool(health_update["update_available"]),
+            translation_mode=str(getattr(live_cfg, "translation_mode", "hybrid") or "hybrid"),
+            gemini_configured=bool(gemini_key),
+            gemini_key_hint=mask_api_key(gemini_key),
+            active_local_model=active_local_model,
+            available_local_models=available_local_models,
             gpu_guard=gpu_guard_status,
+        )
+
+    @app.post("/settings", response_model=SettingsUpdateResponse)
+    async def update_settings(req: SettingsUpdateRequest) -> SettingsUpdateResponse:
+        live_cfg: AppConfig = app.state.cfg
+        env_path = live_cfg.project_root / ".env"
+        cfg_path = live_cfg.project_root / "config.json"
+
+        if req.translation_mode is not None:
+            mode = req.translation_mode.strip().lower()
+            if mode not in VALID_TRANSLATION_MODES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"translation_mode must be one of {VALID_TRANSLATION_MODES}",
+                )
+            await asyncio.to_thread(
+                save_config_updates,
+                {"translation_mode": mode},
+                cfg_path,
+            )
+            live_cfg.translation_mode = mode
+
+        if req.clear_gemini_api_key:
+            await asyncio.to_thread(save_gemini_api_key, "", env_path)
+        elif req.gemini_api_key is not None:
+            await asyncio.to_thread(save_gemini_api_key, req.gemini_api_key, env_path)
+
+        current_key = get_gemini_api_key(env_path=env_path)
+        active_mode = str(getattr(live_cfg, "translation_mode", "hybrid") or "hybrid").strip().lower()
+        app.state.llm_lazy = active_mode in ("hybrid", "gemini") and bool(current_key)
+        if app.state.llm_lazy:
+            app.state.llm_idle_unloaded = False
+            if app.state.loading_stage == "idle_unloaded":
+                app.state.loading_stage = "ready"
+        return SettingsUpdateResponse(
+            ok=True,
+            translation_mode=active_mode,
+            gemini_configured=bool(current_key),
+            gemini_key_hint=mask_api_key(current_key),
         )
 
     @app.get("/update/status", response_model=UpdateStatusResponse)
@@ -589,22 +752,29 @@ def create_app(
             request_id,
             include_floating,
             series_id,
+            translation_mode,
         ) = await _parse_translate_request(
             request, max_image_bytes=max_image_bytes
         )
         app.state.last_activity = time.monotonic()
 
+        translate_kwargs: dict[str, Any] = {
+            "image_bytes": image_bytes,
+            "lang": lang,
+            "chapter_id": chapter_id,
+            "priority": priority,
+            "glossary": glossary,
+            "request_id": request_id,
+            "include_floating": include_floating,
+            "series_id": series_id,
+        }
+        if translation_mode is not None and _accepts_kwarg(
+            active_pipeline.translate_image, "translation_mode"
+        ):
+            translate_kwargs["translation_mode"] = translation_mode
+
         try:
-            return await active_pipeline.translate_image(
-                image_bytes=image_bytes,
-                lang=lang,
-                chapter_id=chapter_id,
-                priority=priority,
-                glossary=glossary,
-                request_id=request_id,
-                include_floating=include_floating,
-                series_id=series_id,
-            )
+            return await active_pipeline.translate_image(**translate_kwargs)
         except PayloadTooLargeError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except asyncio.CancelledError as exc:
@@ -628,6 +798,7 @@ def create_app(
             request_id,
             include_floating,
             series_id,
+            translation_mode,
         ) = await _parse_translate_request(
             request, max_image_bytes=max_image_bytes
         )
@@ -641,17 +812,23 @@ def create_app(
             )
         app.state.last_activity = time.monotonic()
 
+        stream_kwargs: dict[str, Any] = {
+            "image_bytes": image_bytes,
+            "lang": lang,
+            "chapter_id": chapter_id,
+            "priority": priority,
+            "glossary": glossary,
+            "request_id": request_id,
+            "include_floating": include_floating,
+            "series_id": series_id,
+        }
+        if translation_mode is not None and _accepts_kwarg(
+            active_pipeline.translate_image_stream, "translation_mode"
+        ):
+            stream_kwargs["translation_mode"] = translation_mode
+
         async def _event_stream() -> AsyncIterator[bytes]:
-            stream_iter = active_pipeline.translate_image_stream(
-                image_bytes=image_bytes,
-                lang=lang,
-                chapter_id=chapter_id,
-                priority=priority,
-                glossary=glossary,
-                request_id=request_id,
-                include_floating=include_floating,
-                series_id=series_id,
-            )
+            stream_iter = active_pipeline.translate_image_stream(**stream_kwargs)
             try:
                 async for event in stream_iter:
                     if await request.is_disconnected():

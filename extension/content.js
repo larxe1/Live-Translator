@@ -5,6 +5,20 @@
   const DEFAULT_PRELOAD_WHOLE_CHAPTER = false;
   const DEFAULT_INCLUDE_FLOATING = false;
   const MAX_PAGE_CACHE = 50;
+  const VALID_TRANSLATION_MODES = new Set(["hybrid", "local", "gemini"]);
+
+  function normalizeTranslationMode(val) {
+    const mode = String(val || "").trim().toLowerCase();
+    return VALID_TRANSLATION_MODES.has(mode) ? mode : "";
+  }
+
+  function formatTranslateProviderLabel(provider) {
+    const raw = String(provider || "").trim().toLowerCase();
+    if (!raw) return "Translating...";
+    if (raw.startsWith("gemini")) return "Translating (Gemini)...";
+    if (raw.startsWith("local")) return "Translating (Local)...";
+    return "Translating...";
+  }
 
   function isDomainEnabled(hostname, enabledDomains) {
     if (!hostname || !enabledDomains) return false;
@@ -258,6 +272,7 @@
     let enabled = false;
     let contextInvalidated = false;
     let langMode = "auto";
+    let translationMode = "";
     let includeFloating = DEFAULT_INCLUDE_FLOATING;
     let glossariesBySeries = null;
     let flatGlossary = {};
@@ -404,7 +419,7 @@
       if (!srcKey || srcKey.startsWith("data:") || srcKey.startsWith("canvas:")) {
         return null;
       }
-      return `${srcKey}::${langMode}::${includeFloating ? "f1" : "f0"}::${stableGlossaryKey(glossary)}`;
+      return `${srcKey}::${langMode}::${translationMode || "default"}::${includeFloating ? "f1" : "f0"}::${stableGlossaryKey(glossary)}`;
     }
 
     function setCachedResponse(cacheKey, response) {
@@ -1105,6 +1120,8 @@
                 } else {
                   showPageLoadingBadge(el, "Reading text...");
                 }
+              } else if (evt.stage === "translate" && bubblesById.size === 0) {
+                showPageLoadingBadge(el, formatTranslateProviderLabel(evt.provider));
               }
               return;
             }
@@ -1188,7 +1205,7 @@
           });
 
           try {
-            port.postMessage({
+            const startMsg = {
               type: "START",
               imageUrl,
               imageBase64,
@@ -1200,7 +1217,11 @@
               priority,
               glossary,
               requestId,
-            });
+            };
+            if (translationMode) {
+              startMsg.translationMode = translationMode;
+            }
+            port.postMessage(startMsg);
           } catch (err) {
             if (isContextInvalidatedError(err)) {
               handleContextInvalidated();
@@ -1223,7 +1244,7 @@
 
         if (isStale() || typeof sendMessage !== "function") return null;
 
-        const result = await sendMessage({
+        const msgPayload = {
           type: "TRANSLATE_IMAGE",
           imageUrl,
           imageBase64,
@@ -1235,7 +1256,11 @@
           priority,
           glossary,
           requestId,
-        });
+        };
+        if (translationMode) {
+          msgPayload.translationMode = translationMode;
+        }
+        const result = await sendMessage(msgPayload);
 
         // Stale-response guard: discard if disabled, invalidated, generation changed, or src mutated.
         if (isStale()) return null;
@@ -1503,12 +1528,14 @@
       const data = await storage.get([
         "enabledDomains",
         "langMode",
+        "translationMode",
         "glossary",
         "glossariesBySeries",
         "includeFloating",
         "preloadWholeChapter",
       ]);
       langMode = data?.langMode || "auto";
+      translationMode = normalizeTranslationMode(data?.translationMode);
       includeFloating = data?.includeFloating === true;
       if (!hasExplicitPreloadDep) {
         preloadWholeChapter = data?.preloadWholeChapter === true;
@@ -1530,6 +1557,13 @@
         langMode = changes.langMode.newValue || "auto";
         if (pillLangSelect) pillLangSelect.value = langMode;
         shouldRetranslate = true;
+      }
+      if (changes.translationMode) {
+        const nextMode = normalizeTranslationMode(changes.translationMode.newValue);
+        if (nextMode !== translationMode) {
+          translationMode = nextMode;
+          shouldRetranslate = true;
+        }
       }
       if (changes.includeFloating) {
         const nextFloating = changes.includeFloating.newValue === true;
@@ -1800,6 +1834,7 @@
     getElementSourceKey,
     computeLookaheadTargets,
     isContextInvalidatedError,
+    formatTranslateProviderLabel,
     createPageController,
   };
 

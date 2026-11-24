@@ -3,10 +3,38 @@
   "port": 8765,
   "llama_port": 8766,
   "detector_model_id": "ogkalu/comic-text-and-bubble-detector",
-  "llm_repo_id": "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF",
-  "llm_filename": "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf",
-  "llm_filename_pattern": "*Qwen2.5-7B*Q4_K_M*.gguf",
+  "llm_repo_id": "mradermacher/shisa-v2-qwen2.5-7b-i1-GGUF",
+  "llm_filename": "shisa-v2-qwen2.5-7b.i1-Q4_K_M.gguf",
+  "llm_filename_pattern": "*shisa-v2*Q4_K_M*.gguf",
   "llm_model_path": null,
+  "translation_mode": "hybrid",
+  "gemini_models": [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen"
+  ],
+  "gemini_use_vision": true,
+  "gemini_chunk_size": 20,
+  "gemini_timeout_s": 25.0,
+  "gemini_cooldown_s": 60.0,
+  "local_models": {
+    "ja": {
+      "repo_id": "mradermacher/shisa-v2-qwen2.5-7b-i1-GGUF",
+      "filename": "shisa-v2-qwen2.5-7b.i1-Q4_K_M.gguf"
+    },
+    "ja_uncensored": {
+      "repo_id": "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF",
+      "filename": "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    },
+    "ko": {
+      "repo_id": "mradermacher/EXAONE-3.5-7.8B-Instruct-abliterated-i1-GGUF",
+      "filename": "EXAONE-3.5-7.8B-Instruct-abliterated.i1-IQ4_XS.gguf"
+    },
+    "default": {
+      "repo_id": "richardyoung/Qwen2.5-7B-Instruct-abliterated-GGUF",
+      "filename": "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf"
+    }
+  },
   "llm_ctx_size": 2048,
   "llm_gpu_layers": 99,
   "llm_kv_cache_type": "q8_0",

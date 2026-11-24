@@ -408,13 +408,19 @@ def test_api_translate_stream_ndjson_miss_and_cache_hit(tmp_path: Path) -> None:
             assert resp1.headers["content-type"].startswith("application/x-ndjson")
             events1 = [json.loads(line) for line in resp1.iter_lines() if line.strip()]
 
-        status_events1 = [e for e in events1 if e["type"] == "status"]
-        assert status_events1 == [
+        ocr_status_events1 = [e for e in events1 if e["type"] == "status" and e.get("stage") == "ocr"]
+        assert ocr_status_events1 == [
             {"type": "status", "stage": "ocr", "done": 0, "total": 3},
             {"type": "status", "stage": "ocr", "done": 3, "total": 3},
         ]
+        translate_status_events1 = [
+            e for e in events1 if e["type"] == "status" and e.get("stage") == "translate"
+        ]
+        assert translate_status_events1 == [
+            {"type": "status", "stage": "translate", "provider": "local:ja"},
+        ]
         meta_idx1 = next(i for i, e in enumerate(events1) if e["type"] == "meta")
-        assert meta_idx1 == len(status_events1)
+        assert meta_idx1 == len(ocr_status_events1)
         meta_ev1 = events1[meta_idx1]
         assert meta_ev1["lang"] == "ja"
         assert len(meta_ev1["bubbles"]) == 2

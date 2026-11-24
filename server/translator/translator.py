@@ -7,11 +7,18 @@ import inspect
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal
 
 import httpx
 
+from server.translator.gemini_translator import (
+    GeminiBlockedError,
+    GeminiRateLimitError,
+    GeminiUnavailableError,
+    GeminiVisionTranslator,
+)
 from server.translator.memory import (
     ChapterMemoryStore,
     contains_non_english_cjk,
@@ -24,6 +31,7 @@ logger = logging.getLogger(__name__)
 LlmCaller = Callable[[list[dict[str, str]]], Awaitable[str]]
 LlmStreamCaller = Callable[[list[dict[str, str]]], AsyncIterator[str]]
 BubbleCallback = Callable[[int, str, bool], Awaitable[None]]
+ProviderCallback = Callable[[str], Awaitable[None] | None]
 
 # Targeted refusal patterns: catch AI safety/policy boilerplate while never false-positiving
 # on genuine manga dialogue like "Get the fuck off me!" or "I can't move!" or "I cannot forgive you!".
@@ -188,7 +196,7 @@ def _parse_translation_json(raw: str) -> dict[int, str]:
 
 
 class DialogueTranslator:
-    """Chunked streaming manga/manhwa translator backed by local llama-server."""
+    """Chunked streaming manga/manhwa translator with Dynamic Hybrid Gemini Vision <-> Local routing."""
 
     def __init__(
         self,
@@ -198,6 +206,8 @@ class DialogueTranslator:
         timeout_s: float = 45.0,
         llm_stream_caller: LlmStreamCaller | None = None,
         cfg: Any = None,
+        llama_mgr: Any = None,
+        gemini_translator: GeminiVisionTranslator | None = None,
     ) -> None:
         self.llama_base_url = llama_base_url.rstrip("/")
         self.memory = memory
@@ -205,9 +215,19 @@ class DialogueTranslator:
         self._llm_stream_caller = llm_stream_caller
         self.timeout_s = timeout_s
         self.cfg = cfg
+        self.llama_mgr = llama_mgr
+        self.gemini_translator = gemini_translator
+        self._gemini_cooldown_until: float = 0.0
+        self.last_provider: str = ""
 
     def _is_qwen3_model(self) -> bool:
-        """Return True only when the configured LLM filename/model targets Qwen3."""
+        """Return True only when the active/configured local LLM filename targets Qwen3."""
+        if self.llama_mgr is not None:
+            active_file = getattr(self.llama_mgr, "active_model_filename", "") or getattr(
+                self.llama_mgr, "model_name", ""
+            )
+            if active_file:
+                return "qwen3" in str(active_file).lower()
         if self.cfg is None:
             return False
         filename = getattr(self.cfg, "llm_filename", None)
@@ -459,22 +479,24 @@ class DialogueTranslator:
         else:
             subject_rule = (
                 "Supply natural omitted English subjects and objects from dialogue flow "
-                "(e.g., '좋아해' -> 'I like you.', '나도' -> 'Me too.')."
+                "(e.g., '좋아해' -> 'I like you.', '나도' -> 'Me too.', "
+                "'괜찮아' -> \"It's okay.\" / \"I'm fine.\")."
             )
             idiom_rule = (
-                "Translate idioms and colloquialisms into natural English "
+                "Translate Korean webtoon idioms, slang, laughter, and honorific nuance into natural English "
                 "(e.g., '이런 거 오랜만이네...' -> \"It's been a while since we did this...\", "
-                "'ㅋㅋ'/'ㅎㅎ' -> 'lol'/'haha' or natural tone)."
+                "'ㅋㅋ'/'ㅎㅎ' -> 'haha'/'lol' or natural tone, adapt '오빠'/'형'/'언니'/'누나'/'선배' naturally "
+                "for English dialogue rather than awkward literal glosses)."
             )
             sigh_example = "'잠깐만 기다려' -> 'W-Wait a second!', '으음…' -> 'Mmh...'"
             name_rule = (
-                "Keep character names consistent across bubbles and pages using the glossary "
-                "and recent dialogue."
+                "Keep Korean character names consistent across bubbles and pages using the glossary "
+                "and recent dialogue (e.g., 'Minji', 'Jiwon', 'Seojun')."
             )
             anti_romaji = (
-                'Translate ALL spoken words into English—never phonetic Korean '
-                '(e.g., "Jamkkanman gidaryeo", "Yeogin silheo") or Hangul/CJK characters; '
-                "keep only proper character names in Latin letters."
+                'Translate ALL spoken words into English—never phonetic Korean romanization '
+                '(e.g., "Jamkkanman gidaryeo", "Gwaenchana", "Jebal", "Hajima", "Yeogin silheo") '
+                "or Hangul/CJK characters; keep only proper character names in Latin letters."
             )
             examples = (
                 'Example input: {"0": "환영여단", "1": "...좋아해", "2": "나도", '
@@ -548,9 +570,16 @@ class DialogueTranslator:
         max_context_pairs: int = 6,
     ) -> list[dict[str, str]]:
         src_name = "Japanese" if lang == "ja" else "Korean"
+        romaji_examples = (
+            "'ちょっ ちょっと待って' -> 'W-Wait a second!', NEVER 'Chotto matte'; "
+            "'ここじゃやだ' -> 'Not here!', NEVER 'Koko ja yada'"
+            if lang == "ja"
+            else "'잠깐만 기다려' -> 'W-Wait a second!', NEVER 'Jamkkanman gidaryeo'; "
+            "'제발 하지마' -> \"Please, don't!\", NEVER 'Jebal hajima'"
+        )
         non_english_notice = (
             " CRITICAL: Your previous output contained Chinese, Japanese, or Korean characters, "
-            "Japanese/Korean Romaji (e.g. 'Chotto matte', 'Koko ja yada'), or spelled-out ellipses ('Dot dot'). "
+            "Japanese/Korean Romaji (e.g. 'Chotto matte', 'Koko ja yada', 'Jamkkanman'), or spelled-out ellipses ('Dot dot'). "
             "You MUST translate the MEANING of every entry into natural English ONLY."
             if reason == "non_english"
             else ""
@@ -558,9 +587,9 @@ class DialogueTranslator:
         system_prompt = (
             f"You are an expert {src_name}-to-English localization translator for comic scripts. "
             "Translate the MEANING into natural, idiomatic English comic dialogue using Latin letters ONLY. "
-            "NEVER output Chinese, Japanese, or Korean characters, NEVER output Japanese Romaji "
-            "or phonetic spelling of spoken words (e.g. 'ちょっ ちょっと待って' -> 'W-Wait a second!', NEVER 'Chotto matte'; "
-            "'ここじゃやだ' -> 'Not here!', NEVER 'Koko ja yada'), and NEVER spell ellipses as 'Dot dot' (use '...'). "
+            f"NEVER output Chinese, Japanese, or Korean characters, NEVER output {src_name} Romaji "
+            f"or phonetic spelling of spoken words (e.g. {romaji_examples}), "
+            "and NEVER spell ellipses as 'Dot dot' (use '...'). "
             "Keep proper character names consistent in Latin letters, while translating all spoken words, titles, and SFX "
             "into natural English without omission, commentary, or refusal."
             f"{non_english_notice} "
@@ -585,7 +614,7 @@ class DialogueTranslator:
             {"role": "user", "content": "\n\n".join(parts)},
         ]
 
-    async def _translate_single_bubble_english(
+    async def _translate_single_bubble_english_checked(
         self,
         bid: int,
         orig_text: str,
@@ -595,18 +624,28 @@ class DialogueTranslator:
         context: list[tuple[str, str]] | None = None,
         known_names: list[str] | None = None,
         max_context_pairs: int = 6,
-    ) -> str | None:
-        """Compact single-bubble natural English retry (max_tokens=96, zero Romaji)."""
+    ) -> tuple[str | None, bool]:
+        """Compact single-bubble natural English retry returning (translation_or_none, was_refusal)."""
         if cancel_event is not None and cancel_event.is_set():
-            return None
+            return None, False
         src_name = "Japanese" if lang == "ja" else "Korean"
+        sigh_ex = (
+            "'ちょっ ちょっと待って' -> 'W-Wait a second!'"
+            if lang == "ja"
+            else "'잠깐만 기다려' -> 'W-Wait a second!'"
+        )
+        anti_ex = (
+            "NEVER 'Chotto matte' or 'Koko ja yada'"
+            if lang == "ja"
+            else "NEVER 'Jamkkanman' or 'Gwaenchana'"
+        )
         system_prompt = (
             f"You are an expert {src_name}-to-English manga localization translator. "
             "Translate the MEANING of this single comic line into natural, fluent, idiomatic English. "
             "Supply omitted subjects/objects naturally from context, keep ellipses as '...' (NEVER 'Dot dot'), "
-            "and preserve stutters/sighs naturally (e.g. 'ちょっ ちょっと待って' -> 'W-Wait a second!'). "
-            "NEVER output Chinese, Japanese, or Korean characters, and NEVER output Japanese Romaji "
-            "(NEVER 'Chotto matte' or 'Koko ja yada'). "
+            f"and preserve stutters/sighs naturally (e.g. {sigh_ex}). "
+            f"NEVER output Chinese, Japanese, or Korean characters, and NEVER output {src_name} Romaji "
+            f"({anti_ex}). "
             "Keep character names consistent in Latin letters, and translate all dialogue, titles, and SFX into English. "
             f'Return ONLY a valid JSON object with key "{bid}".'
         )
@@ -636,21 +675,47 @@ class DialogueTranslator:
             cancel_event=cancel_event,
         )
         if cancel_event is not None and cancel_event.is_set():
-            return None
+            return None, False
         parsed = _parse_translation_json(raw)
         candidate = parsed.get(bid, "").strip()
         if not candidate and len(parsed) == 1:
             candidate = next(iter(parsed.values())).strip()
         sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
         if ok:
-            return sanitized
+            return sanitized, False
+        was_refusal = is_refusal(candidate) or is_refusal(raw)
         logger.warning(
-            "Single-bubble English retry failed for bubble %s (orig=%r, raw=%r)",
+            "Single-bubble English retry failed for bubble %s (orig=%r, refused=%s, raw=%r)",
             bid,
             orig_text,
+            was_refusal,
             raw,
         )
-        return None
+        return None, was_refusal
+
+    async def _translate_single_bubble_english(
+        self,
+        bid: int,
+        orig_text: str,
+        lang: Literal["ja", "ko"],
+        glossary: dict[str, str],
+        cancel_event: asyncio.Event | None = None,
+        context: list[tuple[str, str]] | None = None,
+        known_names: list[str] | None = None,
+        max_context_pairs: int = 6,
+    ) -> str | None:
+        """Compact single-bubble natural English retry (max_tokens=96, zero Romaji)."""
+        candidate, _ = await self._translate_single_bubble_english_checked(
+            bid,
+            orig_text,
+            lang,
+            glossary,
+            cancel_event=cancel_event,
+            context=context,
+            known_names=known_names,
+            max_context_pairs=max_context_pairs,
+        )
+        return candidate
 
     async def _run_primary_stream(
         self,
@@ -660,7 +725,7 @@ class DialogueTranslator:
         *,
         max_tokens: int = 640,
         cancel_event: asyncio.Event | None = None,
-    ) -> tuple[dict[int, str], list[tuple[int, str]], bool]:
+    ) -> tuple[dict[int, str], list[tuple[int, str]], bool, set[int]]:
         """Stream primary JSON response for a chunk and emit each valid bubble immediately."""
         orig_by_id = dict(bubbles)
         resolved: dict[int, str] = {}
@@ -712,7 +777,7 @@ class DialogueTranslator:
                     )
 
         if cancel_event is not None and cancel_event.is_set():
-            return resolved, [], False
+            return resolved, [], False, set()
 
         # Sweep complete buffer for any valid pairs missed by incremental regex
         if len(seen_ids) < len(bubbles):
@@ -733,10 +798,14 @@ class DialogueTranslator:
 
         failed: list[tuple[int, str]] = []
         any_non_english = False
+        refused_ids: set[int] = set()
+        raw_refusal = is_refusal(buffer) and not resolved
         for bid, orig_text in bubbles:
             if bid not in resolved:
                 cand = rejected_candidates.get(bid, "")
-                if cand and not is_refusal(cand):
+                if is_refusal(cand) or raw_refusal:
+                    refused_ids.add(bid)
+                elif cand:
                     any_non_english = True
                 failed.append((bid, orig_text))
 
@@ -748,7 +817,7 @@ class DialogueTranslator:
                 buffer,
             )
 
-        return resolved, failed, any_non_english
+        return resolved, failed, any_non_english, refused_ids
 
     def _get_memory_glossary(self, chapter_id: str, series_id: str | None) -> dict[str, str]:
         fn = self.memory.get_glossary
@@ -792,6 +861,359 @@ class DialogueTranslator:
         else:
             fn(chapter_id, pairs)
 
+    async def _notify_provider(
+        self,
+        provider: str,
+        on_provider: ProviderCallback | None,
+        provider_tracker: list[str],
+    ) -> None:
+        """Record active provider and notify callback whenever provider starts or shifts."""
+        if not provider:
+            return
+        self.last_provider = provider
+        if provider_tracker and provider_tracker[0] == provider:
+            return
+        if provider_tracker:
+            provider_tracker[0] = provider
+        else:
+            provider_tracker.append(provider)
+        if on_provider is not None:
+            res = on_provider(provider)
+            if inspect.isawaitable(res):
+                await res
+
+    async def _ensure_local_model(
+        self,
+        lang: Literal["ja", "ko"],
+        *,
+        uncensored: bool = False,
+    ) -> str:
+        """Ensure the language-appropriate local GGUF model is running and return provider label."""
+        default_role = "ja_uncensored" if (lang == "ja" and uncensored) else lang
+        if self.llama_mgr is None:
+            return f"local:{default_role}"
+
+        ensure_fn = getattr(self.llama_mgr, "ensure_model", None)
+        if callable(ensure_fn):
+            if inspect.iscoroutinefunction(ensure_fn):
+                role = await ensure_fn(lang, uncensored=uncensored)
+            else:
+                role = await asyncio.to_thread(ensure_fn, lang, uncensored=uncensored)
+                if inspect.isawaitable(role):
+                    role = await role
+            role_str = str(role or default_role).strip() or default_role
+            return f"local:{role_str}"
+
+        start_fn = getattr(self.llama_mgr, "start", None)
+        if callable(start_fn):
+            if inspect.iscoroutinefunction(start_fn):
+                await start_fn()
+            else:
+                await asyncio.to_thread(start_fn)
+        return f"local:{default_role}"
+
+    def _resolve_effective_mode(
+        self,
+        translation_mode: str | None,
+    ) -> tuple[Literal["hybrid", "local", "gemini"], GeminiVisionTranslator | None]:
+        """Determine effective routing mode honoring per-request override, API key presence, and 429 cooldown."""
+        explicit_cfg_mode = getattr(self.cfg, "translation_mode", None)
+        raw_mode = str(translation_mode or explicit_cfg_mode or "").strip().lower()
+        if not raw_mode:
+            raw_mode = "hybrid" if self.gemini_translator is not None else "local"
+        if raw_mode not in ("hybrid", "local", "gemini"):
+            raw_mode = "hybrid"
+
+        if raw_mode == "local":
+            return "local", None
+
+        gem = self.gemini_translator
+        if gem is None and (
+            raw_mode == "gemini"
+            or (self._llm_caller is None and self._llm_stream_caller is None)
+        ):
+            gem = GeminiVisionTranslator(self.cfg)
+            self.gemini_translator = gem
+
+        if raw_mode == "gemini":
+            return "gemini", gem
+
+        if gem is None or not gem.is_configured():
+            return "local", None
+        if time.monotonic() < self._gemini_cooldown_until:
+            return "local", None
+        return "hybrid", gem
+
+    def _can_use_gemini_now(self, translation_mode: str | None = None) -> bool:
+        """Helper used by pipeline.py to decide whether llama-server startup should stay lazy."""
+        eff_mode, gem = self._resolve_effective_mode(translation_mode)
+        if eff_mode == "hybrid":
+            return gem is not None and gem.is_configured()
+        if eff_mode == "gemini":
+            return True
+        return False
+
+    async def _translate_chunk_local(
+        self,
+        chunk: list[tuple[int, str]],
+        lang: Literal["ja", "ko"],
+        merged_glossary: dict[str, str],
+        rolling_context: list[tuple[str, str]],
+        known_names: list[str],
+        *,
+        bubble_types: dict[int, str] | None = None,
+        use_story_context: bool = True,
+        max_context_pairs: int = 6,
+        on_bubble: BubbleCallback | None = None,
+        cancel_event: asyncio.Event | None = None,
+        gpu_guard: Any = None,
+        on_provider: ProviderCallback | None = None,
+        provider_tracker: list[str],
+        chunk_label: str = "1/1",
+        allow_uncensored_escalation: bool = True,
+    ) -> dict[int, str]:
+        """Translate a chunk on local llama-server with Shisa -> ja_uncensored safety net on refusals."""
+        if not chunk or (cancel_event is not None and cancel_event.is_set()):
+            return {}
+
+        local_provider = await self._ensure_local_model(lang, uncensored=False)
+        await self._notify_provider(local_provider, on_provider, provider_tracker)
+
+        if gpu_guard is not None:
+            guard_state = await gpu_guard.wait_if_hot(cancel_event=cancel_event)
+            if guard_state == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+                logger.info("Translation cancelled during thermal guard before local chunk %s", chunk_label)
+                return {}
+
+        chunk_max_tokens = _chunk_max_tokens(len(chunk))
+        primary_messages = self._build_primary_messages(
+            chunk,
+            lang,
+            merged_glossary,
+            rolling_context if use_story_context else [],
+            bubble_types=bubble_types,
+            known_names=known_names if use_story_context else None,
+            max_context_pairs=max_context_pairs,
+        )
+
+        chunk_resolved: dict[int, str] = {}
+        failed: list[tuple[int, str]] = []
+        any_non_english = False
+        refused_ids: set[int] = set()
+
+        if on_bubble is not None and (self._llm_stream_caller is not None or self._llm_caller is None):
+            chunk_resolved, failed, any_non_english, refused_ids = await self._run_primary_stream(
+                chunk,
+                primary_messages,
+                on_bubble,
+                max_tokens=chunk_max_tokens,
+                cancel_event=cancel_event,
+            )
+        else:
+            raw_primary = await self._invoke_llm(
+                primary_messages,
+                temperature=DEFAULT_TEMPERATURE,
+                top_p=DEFAULT_TOP_P,
+                repeat_penalty=DEFAULT_REPEAT_PENALTY,
+                max_tokens=chunk_max_tokens,
+                json_mode=True,
+                cancel_event=cancel_event,
+            )
+            parsed = _parse_translation_json(raw_primary)
+            raw_refusal = is_refusal(raw_primary) and not parsed
+            for bid, orig_text in chunk:
+                candidate = parsed.get(bid, "").strip()
+                sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
+                if ok:
+                    chunk_resolved[bid] = sanitized
+                    if on_bubble is not None and (cancel_event is None or not cancel_event.is_set()):
+                        await on_bubble(bid, sanitized, False)
+                else:
+                    if is_refusal(candidate) or raw_refusal:
+                        refused_ids.add(bid)
+                    elif candidate:
+                        any_non_english = True
+                    failed.append((bid, orig_text))
+            if failed and (cancel_event is None or not cancel_event.is_set()):
+                logger.warning(
+                    "Primary chunk %s had %d failed/missing bubble(s) %s; raw=%r",
+                    chunk_label,
+                    len(failed),
+                    [b for b, _ in failed],
+                    raw_primary,
+                )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return chunk_resolved
+
+        uncensored_active = local_provider.endswith(":ja_uncensored")
+
+        async def _escalate_ja_uncensored() -> bool:
+            nonlocal uncensored_active
+            if (
+                uncensored_active
+                or not allow_uncensored_escalation
+                or lang != "ja"
+                or self.llama_mgr is None
+            ):
+                return False
+            logger.warning(
+                "Local ja model refused explicit dialogue on chunk %s; switching to ja_uncensored safety net",
+                chunk_label,
+            )
+            unc_provider = await self._ensure_local_model("ja", uncensored=True)
+            uncensored_active = True
+            await self._notify_provider(unc_provider, on_provider, provider_tracker)
+            return True
+
+        # Double-safety net: if local ja (Shisa) refused on primary pass, immediately escalate to ja_uncensored before retrying!
+        if failed and refused_ids:
+            await _escalate_ja_uncensored()
+
+        retry_context: list[tuple[str, str]] = []
+        retry_names: list[str] = []
+        if use_story_context:
+            chunk_so_far = [
+                (orig_text, chunk_resolved[bid])
+                for bid, orig_text in chunk
+                if bid in chunk_resolved
+            ]
+            if max_context_pairs > 0:
+                retry_context = (rolling_context + chunk_so_far)[-max_context_pairs:]
+            retry_names = extract_character_names(chunk_so_far, existing=known_names)
+
+        if len(failed) >= 2:
+            retry_reason = "non_english" if any_non_english else "missing_or_refusal"
+            logger.warning(
+                "Triggering compact batch retry (%s) for chunk %s bubble(s) %s",
+                retry_reason,
+                chunk_label,
+                [b for b, _ in failed],
+            )
+            retry_messages = self._build_retry_messages(
+                failed,
+                lang,
+                merged_glossary,
+                reason=retry_reason,
+                context=retry_context if use_story_context else None,
+                known_names=retry_names if use_story_context else None,
+                max_context_pairs=max_context_pairs,
+            )
+            raw_retry = await self._invoke_llm(
+                retry_messages,
+                temperature=0.2,
+                top_p=DEFAULT_TOP_P,
+                repeat_penalty=DEFAULT_REPEAT_PENALTY,
+                max_tokens=_chunk_max_tokens(len(failed)),
+                json_mode=True,
+                cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return chunk_resolved
+            retry_parsed = _parse_translation_json(raw_retry)
+            still_failed: list[tuple[int, str]] = []
+            batch_saw_refusal = is_refusal(raw_retry) and not retry_parsed
+            for bid, orig_text in failed:
+                candidate = retry_parsed.get(bid, "").strip()
+                sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
+                if ok:
+                    chunk_resolved[bid] = sanitized
+                    if on_bubble is not None:
+                        await on_bubble(bid, sanitized, True)
+                else:
+                    if is_refusal(candidate):
+                        batch_saw_refusal = True
+                    still_failed.append((bid, orig_text))
+
+            if still_failed and batch_saw_refusal:
+                await _escalate_ja_uncensored()
+
+            for bid, orig_text in still_failed:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                single_candidate, single_refused = await self._translate_single_bubble_english_checked(
+                    bid,
+                    orig_text,
+                    lang,
+                    merged_glossary,
+                    cancel_event=cancel_event,
+                    context=retry_context if use_story_context else None,
+                    known_names=retry_names if use_story_context else None,
+                    max_context_pairs=max_context_pairs,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if single_candidate is None and single_refused:
+                    if await _escalate_ja_uncensored():
+                        single_candidate, _ = await self._translate_single_bubble_english_checked(
+                            bid,
+                            orig_text,
+                            lang,
+                            merged_glossary,
+                            cancel_event=cancel_event,
+                            context=retry_context if use_story_context else None,
+                            known_names=retry_names if use_story_context else None,
+                            max_context_pairs=max_context_pairs,
+                        )
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if single_candidate is not None:
+                    chunk_resolved[bid] = single_candidate
+                    if on_bubble is not None:
+                        await on_bubble(bid, single_candidate, True)
+                else:
+                    logger.warning(
+                        "Single-bubble fallback after batch retry failed for bubble %s (orig=%r); emitting empty string",
+                        bid,
+                        orig_text,
+                    )
+                    chunk_resolved[bid] = ""
+                    if on_bubble is not None:
+                        await on_bubble(bid, "", True)
+        elif len(failed) == 1:
+            bid, orig_text = failed[0]
+            single_candidate, single_refused = await self._translate_single_bubble_english_checked(
+                bid,
+                orig_text,
+                lang,
+                merged_glossary,
+                cancel_event=cancel_event,
+                context=retry_context if use_story_context else None,
+                known_names=retry_names if use_story_context else None,
+                max_context_pairs=max_context_pairs,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return chunk_resolved
+            if single_candidate is None and single_refused:
+                if await _escalate_ja_uncensored():
+                    single_candidate, _ = await self._translate_single_bubble_english_checked(
+                        bid,
+                        orig_text,
+                        lang,
+                        merged_glossary,
+                        cancel_event=cancel_event,
+                        context=retry_context if use_story_context else None,
+                        known_names=retry_names if use_story_context else None,
+                        max_context_pairs=max_context_pairs,
+                    )
+            if cancel_event is not None and cancel_event.is_set():
+                return chunk_resolved
+            if single_candidate is not None:
+                chunk_resolved[bid] = single_candidate
+                if on_bubble is not None:
+                    await on_bubble(bid, single_candidate, True)
+            else:
+                logger.warning(
+                    "Single-bubble retry failed for bubble %s (orig=%r); emitting empty string",
+                    bid,
+                    orig_text,
+                )
+                chunk_resolved[bid] = ""
+                if on_bubble is not None:
+                    await on_bubble(bid, "", True)
+
+        return chunk_resolved
+
     async def translate_page(
         self,
         bubbles: list[tuple[int, str]],
@@ -803,8 +1225,12 @@ class DialogueTranslator:
         bubble_types: dict[int, str] | None = None,
         cancel_event: asyncio.Event | None = None,
         gpu_guard: Any = None,
+        image: Any = None,
+        bubble_boxes: dict[int, Any] | None = None,
+        translation_mode: str | None = None,
+        on_provider: ProviderCallback | None = None,
     ) -> dict[int, str]:
-        """Translate page bubbles in fast sequential chunks with sliding context, intra-page carry-over, and cancellation."""
+        """Translate page bubbles with Dynamic Hybrid Gemini Vision <-> Local routing and shared sliding context."""
         if not bubbles:
             return {}
 
@@ -818,7 +1244,8 @@ class DialogueTranslator:
 
         use_story_context = bool(getattr(self.cfg, "use_story_context", True))
         max_context_pairs = max(0, int(getattr(self.cfg, "max_context_pairs", 6)))
-        chunk_size = max(1, int(getattr(self.cfg, "llm_chunk_size", 12)))
+        local_chunk_size = max(1, int(getattr(self.cfg, "llm_chunk_size", 12)))
+        gemini_chunk_size = max(1, int(getattr(self.cfg, "gemini_chunk_size", 20)))
 
         rolling_context: list[tuple[str, str]] = []
         known_names: list[str] = []
@@ -829,212 +1256,254 @@ class DialogueTranslator:
                 if max_context_pairs > 0:
                     rolling_context = list(prior_pairs[-max_context_pairs:])
 
-        chunks = [bubbles[i : i + chunk_size] for i in range(0, len(bubbles), chunk_size)]
+        def _carry_over(items: list[tuple[int, str]], resolved_map: dict[int, str]) -> None:
+            nonlocal rolling_context, known_names
+            if not use_story_context:
+                return
+            valid_pairs = [
+                (orig_text, resolved_map[bid])
+                for bid, orig_text in items
+                if is_valid_english_translation(orig_text, resolved_map.get(bid, ""))
+            ]
+            if valid_pairs:
+                if max_context_pairs > 0:
+                    rolling_context = (rolling_context + valid_pairs)[-max_context_pairs:]
+                known_names = extract_character_names(valid_pairs, existing=known_names)
+
+        effective_mode, gem = self._resolve_effective_mode(translation_mode)
+        provider_tracker: list[str] = []
         resolved: dict[int, str] = {}
 
-        for chunk_idx, chunk in enumerate(chunks):
-            if cancel_event is not None and cancel_event.is_set():
-                logger.info("Translation cancelled before chunk %d/%d", chunk_idx + 1, len(chunks))
-                break
-
-            if gpu_guard is not None:
-                guard_state = await gpu_guard.wait_if_hot(cancel_event=cancel_event)
-                if guard_state == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
-                    logger.info(
-                        "Translation cancelled during thermal guard before chunk %d/%d",
-                        chunk_idx + 1,
-                        len(chunks),
-                    )
+        if effective_mode == "local":
+            chunks = [bubbles[i : i + local_chunk_size] for i in range(0, len(bubbles), local_chunk_size)]
+            for chunk_idx, chunk in enumerate(chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("Translation cancelled before chunk %d/%d", chunk_idx + 1, len(chunks))
                     break
-
-            chunk_max_tokens = _chunk_max_tokens(len(chunk))
-            primary_messages = self._build_primary_messages(
-                chunk,
-                lang,
-                merged_glossary,
-                rolling_context if use_story_context else [],
-                bubble_types=bubble_types,
-                known_names=known_names if use_story_context else None,
-                max_context_pairs=max_context_pairs,
-            )
-
-            chunk_resolved: dict[int, str] = {}
-            failed: list[tuple[int, str]] = []
-            any_non_english = False
-
-            if on_bubble is not None and (self._llm_stream_caller is not None or self._llm_caller is None):
-                chunk_resolved, failed, any_non_english = await self._run_primary_stream(
+                chunk_resolved = await self._translate_chunk_local(
                     chunk,
-                    primary_messages,
-                    on_bubble,
-                    max_tokens=chunk_max_tokens,
-                    cancel_event=cancel_event,
-                )
-            else:
-                raw_primary = await self._invoke_llm(
-                    primary_messages,
-                    temperature=DEFAULT_TEMPERATURE,
-                    top_p=DEFAULT_TOP_P,
-                    repeat_penalty=DEFAULT_REPEAT_PENALTY,
-                    max_tokens=chunk_max_tokens,
-                    json_mode=True,
-                    cancel_event=cancel_event,
-                )
-                parsed = _parse_translation_json(raw_primary)
-                for bid, orig_text in chunk:
-                    candidate = parsed.get(bid, "").strip()
-                    sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
-                    if ok:
-                        chunk_resolved[bid] = sanitized
-                        if on_bubble is not None and (cancel_event is None or not cancel_event.is_set()):
-                            await on_bubble(bid, sanitized, False)
-                    else:
-                        if candidate and not is_refusal(candidate):
-                            any_non_english = True
-                        failed.append((bid, orig_text))
-                if failed and (cancel_event is None or not cancel_event.is_set()):
-                    logger.warning(
-                        "Primary chunk %d/%d had %d failed/missing bubble(s) %s; raw=%r",
-                        chunk_idx + 1,
-                        len(chunks),
-                        len(failed),
-                        [b for b, _ in failed],
-                        raw_primary,
-                    )
-
-            resolved.update(chunk_resolved)
-
-            if cancel_event is not None and cancel_event.is_set():
-                break
-
-            # Build local rolling context for retries (prior rolling window + valid lines already resolved in this chunk)
-            retry_context: list[tuple[str, str]] = []
-            retry_names: list[str] = []
-            if use_story_context:
-                chunk_so_far = [
-                    (orig_text, chunk_resolved[bid])
-                    for bid, orig_text in chunk
-                    if bid in chunk_resolved
-                ]
-                if max_context_pairs > 0:
-                    retry_context = (rolling_context + chunk_so_far)[-max_context_pairs:]
-                retry_names = extract_character_names(chunk_so_far, existing=known_names)
-
-            if len(failed) >= 2:
-                retry_reason = "non_english" if any_non_english else "missing_or_refusal"
-                logger.warning(
-                    "Triggering compact batch retry (%s) for chunk %d/%d bubble(s) %s",
-                    retry_reason,
-                    chunk_idx + 1,
-                    len(chunks),
-                    [b for b, _ in failed],
-                )
-                retry_messages = self._build_retry_messages(
-                    failed,
                     lang,
                     merged_glossary,
-                    reason=retry_reason,
-                    context=retry_context if use_story_context else None,
-                    known_names=retry_names if use_story_context else None,
+                    rolling_context,
+                    known_names,
+                    bubble_types=bubble_types,
+                    use_story_context=use_story_context,
                     max_context_pairs=max_context_pairs,
-                )
-                raw_retry = await self._invoke_llm(
-                    retry_messages,
-                    temperature=0.2,
-                    top_p=DEFAULT_TOP_P,
-                    repeat_penalty=DEFAULT_REPEAT_PENALTY,
-                    max_tokens=_chunk_max_tokens(len(failed)),
-                    json_mode=True,
+                    on_bubble=on_bubble,
                     cancel_event=cancel_event,
+                    gpu_guard=gpu_guard,
+                    on_provider=on_provider,
+                    provider_tracker=provider_tracker,
+                    chunk_label=f"{chunk_idx + 1}/{len(chunks)}",
                 )
+                resolved.update(chunk_resolved)
                 if cancel_event is not None and cancel_event.is_set():
                     break
-                retry_parsed = _parse_translation_json(raw_retry)
-                still_failed: list[tuple[int, str]] = []
-                for bid, orig_text in failed:
-                    candidate = retry_parsed.get(bid, "").strip()
-                    sanitized, ok = _sanitize_translation_candidate(orig_text, candidate)
-                    if ok:
-                        resolved[bid] = sanitized
-                        chunk_resolved[bid] = sanitized
-                        if on_bubble is not None:
-                            await on_bubble(bid, sanitized, True)
-                    else:
-                        still_failed.append((bid, orig_text))
+                _carry_over(chunk, resolved)
+            if provider_tracker:
+                self.last_provider = provider_tracker[0]
+        elif effective_mode == "gemini":
+            if gem is None or not gem.is_configured():
+                raise GeminiUnavailableError("Gemini API key is not configured for gemini mode")
+            chunks = [bubbles[i : i + gemini_chunk_size] for i in range(0, len(bubbles), gemini_chunk_size)]
+            last_gem_provider = ""
+            for chunk_idx, chunk in enumerate(chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                active_models = gem._active_models() if hasattr(gem, "_active_models") else []
+                preview_model = active_models[0] if active_models else "gemini"
+                await self._notify_provider(f"gemini:{preview_model}", on_provider, provider_tracker)
 
-                # Fall back to single-bubble retry (max 1 attempt per remaining bubble) so real bubbles are never silently dropped.
-                for bid, orig_text in still_failed:
+                valid_gem: dict[int, str] = {}
+                used_model = ""
+                try:
+                    valid_gem, used_model = await gem.translate_chunk(
+                        chunk,
+                        lang,
+                        glossary=merged_glossary,
+                        context=rolling_context if use_story_context else [],
+                        known_names=known_names if use_story_context else None,
+                        bubble_types=bubble_types,
+                        max_context_pairs=max_context_pairs,
+                        image=image,
+                        bubble_boxes=bubble_boxes,
+                        cancel_event=cancel_event,
+                    )
+                except GeminiBlockedError:
+                    if image is not None:
+                        logger.warning(
+                            "Gemini Vision blocked chunk %d/%d in gemini-only mode; retrying text-only once",
+                            chunk_idx + 1,
+                            len(chunks),
+                        )
+                        try:
+                            valid_gem, used_model = await gem.translate_chunk(
+                                chunk,
+                                lang,
+                                glossary=merged_glossary,
+                                context=rolling_context if use_story_context else [],
+                                known_names=known_names if use_story_context else None,
+                                bubble_types=bubble_types,
+                                max_context_pairs=max_context_pairs,
+                                image=None,
+                                bubble_boxes=None,
+                                use_vision=False,
+                                cancel_event=cancel_event,
+                            )
+                        except GeminiBlockedError:
+                            valid_gem = {}
+                    else:
+                        valid_gem = {}
+
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if used_model:
+                    last_gem_provider = f"gemini:{used_model}"
+                    await self._notify_provider(last_gem_provider, on_provider, provider_tracker)
+                for bid, _orig_text in chunk:
+                    trans = valid_gem.get(bid, "")
+                    resolved[bid] = trans
+                    if on_bubble is not None:
+                        await on_bubble(bid, trans, trans == "")
+                _carry_over(chunk, resolved)
+            self.last_provider = last_gem_provider or (provider_tracker[0] if provider_tracker else "gemini")
+        else:
+            # Dynamic Hybrid Shifting: Gemini Vision primary <-> Local (Shisa JP / EXAONE KR / ja_uncensored) fallback
+            assert gem is not None
+            chunks = [bubbles[i : i + gemini_chunk_size] for i in range(0, len(bubbles), gemini_chunk_size)]
+            used_gemini = False
+            used_local = False
+            last_gem_provider = ""
+            shifted_page_to_local = False
+
+            async def _run_local_subchunks(sub_bubbles: list[tuple[int, str]], label_prefix: str) -> None:
+                nonlocal used_local
+                subchunks = [
+                    sub_bubbles[i : i + local_chunk_size]
+                    for i in range(0, len(sub_bubbles), local_chunk_size)
+                ]
+                for sub_idx, sub in enumerate(subchunks):
                     if cancel_event is not None and cancel_event.is_set():
                         break
-                    single_candidate = await self._translate_single_bubble_english(
-                        bid,
-                        orig_text,
+                    local_res = await self._translate_chunk_local(
+                        sub,
                         lang,
                         merged_glossary,
-                        cancel_event=cancel_event,
-                        context=retry_context if use_story_context else None,
-                        known_names=retry_names if use_story_context else None,
+                        rolling_context,
+                        known_names,
+                        bubble_types=bubble_types,
+                        use_story_context=use_story_context,
                         max_context_pairs=max_context_pairs,
+                        on_bubble=on_bubble,
+                        cancel_event=cancel_event,
+                        gpu_guard=gpu_guard,
+                        on_provider=on_provider,
+                        provider_tracker=provider_tracker,
+                        chunk_label=f"{label_prefix}.{sub_idx + 1}/{len(subchunks)}",
                     )
+                    used_local = True
+                    resolved.update(local_res)
                     if cancel_event is not None and cancel_event.is_set():
                         break
-                    if single_candidate is not None:
-                        resolved[bid] = single_candidate
-                        chunk_resolved[bid] = single_candidate
-                        if on_bubble is not None:
-                            await on_bubble(bid, single_candidate, True)
-                    else:
-                        logger.warning(
-                            "Single-bubble fallback after batch retry failed for bubble %s (orig=%r); emitting empty string",
-                            bid,
-                            orig_text,
-                        )
-                        resolved[bid] = ""
-                        if on_bubble is not None:
-                            await on_bubble(bid, "", True)
-            elif len(failed) == 1:
-                bid, orig_text = failed[0]
-                single_candidate = await self._translate_single_bubble_english(
-                    bid,
-                    orig_text,
-                    lang,
-                    merged_glossary,
-                    cancel_event=cancel_event,
-                    context=retry_context if use_story_context else None,
-                    known_names=retry_names if use_story_context else None,
-                    max_context_pairs=max_context_pairs,
-                )
+                    _carry_over(sub, resolved)
+
+            for chunk_idx, chunk in enumerate(chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("Translation cancelled before hybrid chunk %d/%d", chunk_idx + 1, len(chunks))
+                    break
+
+                if shifted_page_to_local:
+                    await _run_local_subchunks(chunk, f"fallback-{chunk_idx + 1}")
+                    continue
+
+                active_models = gem._active_models() if hasattr(gem, "_active_models") else []
+                if active_models:
+                    await self._notify_provider(f"gemini:{active_models[0]}", on_provider, provider_tracker)
+
+                try:
+                    valid_gem, used_model = await gem.translate_chunk(
+                        chunk,
+                        lang,
+                        glossary=merged_glossary,
+                        context=rolling_context if use_story_context else [],
+                        known_names=known_names if use_story_context else None,
+                        bubble_types=bubble_types,
+                        max_context_pairs=max_context_pairs,
+                        image=image,
+                        bubble_boxes=bubble_boxes,
+                        cancel_event=cancel_event,
+                    )
+                except GeminiBlockedError as exc:
+                    # Explicit/sensitive panel: shift ONLY this chunk to local WITHOUT setting 429 cooldown!
+                    logger.warning(
+                        "Gemini blocked chunk %d/%d (%s); dynamically shifting ONLY this chunk to local %s",
+                        chunk_idx + 1,
+                        len(chunks),
+                        exc,
+                        lang,
+                    )
+                    await _run_local_subchunks(chunk, f"blocked-{chunk_idx + 1}")
+                    continue
+                except GeminiRateLimitError as exc:
+                    cooldown_s = float(getattr(self.cfg, "gemini_cooldown_s", 60.0))
+                    self._gemini_cooldown_until = time.monotonic() + max(0.0, cooldown_s)
+                    shifted_page_to_local = True
+                    logger.warning(
+                        "Gemini rate-limited (%s); entering %.0fs cooldown and shifting page to local %s",
+                        exc,
+                        cooldown_s,
+                        lang,
+                    )
+                    await _run_local_subchunks(chunk, f"ratelimit-{chunk_idx + 1}")
+                    continue
+                except GeminiUnavailableError as exc:
+                    shifted_page_to_local = True
+                    logger.warning(
+                        "Gemini unavailable (%s); shifting remaining chunks on page to local %s",
+                        exc,
+                        lang,
+                    )
+                    await _run_local_subchunks(chunk, f"unavail-{chunk_idx + 1}")
+                    continue
+
                 if cancel_event is not None and cancel_event.is_set():
                     break
-                if single_candidate is not None:
-                    resolved[bid] = single_candidate
-                    chunk_resolved[bid] = single_candidate
-                    if on_bubble is not None:
-                        await on_bubble(bid, single_candidate, True)
-                else:
+
+                used_gemini = True
+                last_gem_provider = f"gemini:{used_model}" if used_model else "gemini"
+                await self._notify_provider(last_gem_provider, on_provider, provider_tracker)
+
+                missing_for_local: list[tuple[int, str]] = []
+                succeeded_in_chunk: list[tuple[int, str]] = []
+                for bid, orig_text in chunk:
+                    if bid in valid_gem:
+                        resolved[bid] = valid_gem[bid]
+                        succeeded_in_chunk.append((bid, orig_text))
+                        if on_bubble is not None and (cancel_event is None or not cancel_event.is_set()):
+                            await on_bubble(bid, valid_gem[bid], False)
+                    else:
+                        missing_for_local.append((bid, orig_text))
+
+                # Feed valid Gemini lines into rolling context before local fallback translates missing/refused bubbles
+                _carry_over(succeeded_in_chunk, resolved)
+
+                if missing_for_local:
                     logger.warning(
-                        "Single-bubble retry failed for bubble %s (orig=%r); emitting empty string",
-                        bid,
-                        orig_text,
+                        "Gemini chunk %d/%d left %d bubble(s) %s refused/missing; shifting ONLY those to local %s",
+                        chunk_idx + 1,
+                        len(chunks),
+                        len(missing_for_local),
+                        [b for b, _ in missing_for_local],
+                        lang,
                     )
-                    resolved[bid] = ""
-                    if on_bubble is not None:
-                        await on_bubble(bid, "", True)
+                    await _run_local_subchunks(missing_for_local, f"partial-{chunk_idx + 1}")
 
-            if cancel_event is not None and cancel_event.is_set():
-                break
-
-            # Intra-page chunk carry-over: feed this chunk's clean pairs and detected names into the next chunk.
-            if use_story_context:
-                chunk_valid_pairs = [
-                    (orig_text, resolved[bid])
-                    for bid, orig_text in chunk
-                    if is_valid_english_translation(orig_text, resolved.get(bid, ""))
-                ]
-                if chunk_valid_pairs:
-                    if max_context_pairs > 0:
-                        rolling_context = (rolling_context + chunk_valid_pairs)[-max_context_pairs:]
-                    known_names = extract_character_names(chunk_valid_pairs, existing=known_names)
+            if used_gemini and used_local:
+                self.last_provider = "hybrid"
+            elif used_gemini:
+                self.last_provider = last_gem_provider
+            elif used_local and provider_tracker:
+                self.last_provider = provider_tracker[0]
 
         recorded_pairs: list[tuple[str, str]] = []
         for bid, orig_text in bubbles:

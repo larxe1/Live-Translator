@@ -15,6 +15,11 @@ const siteToggle = hasDom ? document.getElementById("siteToggle") : null;
 const floatingToggle = hasDom ? document.getElementById("floatingToggle") : null;
 const preloadToggle = hasDom ? document.getElementById("preloadToggle") : null;
 const langButtons = hasDom ? Array.from(document.querySelectorAll(".lang-btn")) : [];
+const engineModeSelect = hasDom ? document.getElementById("engineModeSelect") : null;
+const geminiKeyInput = hasDom ? document.getElementById("geminiKeyInput") : null;
+const saveGeminiKeyBtn = hasDom ? document.getElementById("saveGeminiKeyBtn") : null;
+const clearGeminiKeyBtn = hasDom ? document.getElementById("clearGeminiKeyBtn") : null;
+const geminiKeyStatus = hasDom ? document.getElementById("geminiKeyStatus") : null;
 const glossaryLookupForm = hasDom ? document.getElementById("glossaryLookupForm") : null;
 const glossaryLookupInput = hasDom ? document.getElementById("glossaryLookupInput") : null;
 const glossaryLookupBtn = hasDom ? document.getElementById("glossaryLookupBtn") : null;
@@ -319,17 +324,93 @@ function applyGpuGuardNotice(gpuGuard, noticeEl = gpuGuardNotice) {
   return info;
 }
 
-function applyHealthUI(h, dom = { statusDot, statusText, statusVram, gpuGuardNotice }) {
+const VALID_TRANSLATION_MODES = new Set(["hybrid", "local", "gemini"]);
+
+function formatLocalModelLabel(modelName) {
+  const raw = String(modelName || "").trim();
+  if (!raw) return "";
+  if (/shisa/i.test(raw)) return "Shisa JP";
+  if (/exaone/i.test(raw)) return "EXAONE KR";
+  if (/qwen2\.5.*abliterated/i.test(raw)) return "Qwen2.5 Abliterated";
+  const base = raw.split(/[\\/]/).pop().replace(/\.gguf$/i, "");
+  return base.length > 22 ? `${base.slice(0, 19)}...` : base;
+}
+
+function formatEngineStatusLabel(h) {
+  if (!h || typeof h !== "object") return "Ready";
+  const mode = String(h.translation_mode || "").trim().toLowerCase();
+  if (!VALID_TRANSLATION_MODES.has(mode)) {
+    return `Ready — ${h.gpu_name || "Local GPU"}`;
+  }
+  const localModel = formatLocalModelLabel(h.active_local_model || h.llm_model);
+  if (mode === "gemini") {
+    return h.gemini_configured ? "Gemini Vision Only" : "Gemini (Key needed)";
+  }
+  if (mode === "local") {
+    return localModel ? `Local · ${localModel}` : "Local · Shisa/EXAONE";
+  }
+  if (h.gemini_configured) {
+    return h.llm_ready && localModel
+      ? `Hybrid · Gemini + ${localModel}`
+      : "Hybrid · Gemini + Shisa/EXAONE";
+  }
+  return localModel ? `Hybrid (No Key) · ${localModel}` : "Hybrid (No Key) · Local";
+}
+
+function formatGeminiKeyStatus(data) {
+  if (data && data.gemini_configured) {
+    const hint = String(data.gemini_key_hint || "").trim();
+    return {
+      configured: true,
+      text: hint ? `Saved (${hint})` : "Saved",
+      className: "key-status configured",
+    };
+  }
+  return {
+    configured: false,
+    text: "Not configured",
+    className: "key-status",
+  };
+}
+
+function applySettingsResponse(data, dom = { engineModeSelect, geminiKeyStatus }) {
+  if (!data || typeof data !== "object") return;
+  const mode = String(data.translation_mode || "").trim().toLowerCase();
+  if (dom.engineModeSelect && VALID_TRANSLATION_MODES.has(mode)) {
+    const isFocused = hasDom && document.activeElement === dom.engineModeSelect;
+    if (!isFocused) {
+      dom.engineModeSelect.value = mode;
+    }
+  }
+  if (dom.geminiKeyStatus && ("gemini_configured" in data || "gemini_key_hint" in data)) {
+    const keyInfo = formatGeminiKeyStatus(data);
+    dom.geminiKeyStatus.textContent = keyInfo.text;
+    dom.geminiKeyStatus.className = keyInfo.className;
+  }
+}
+
+function applyHealthUI(
+  h,
+  dom = {
+    statusDot,
+    statusText,
+    statusVram,
+    gpuGuardNotice,
+    engineModeSelect,
+    geminiKeyStatus,
+  }
+) {
   if (!h || typeof h !== "object") return { ready: false, notice: formatGpuGuardNotice(null) };
   const notice = applyGpuGuardNotice(h.gpu_guard, dom.gpuGuardNotice);
   const telemetry = formatGpuTelemetry(h);
+  applySettingsResponse(h, dom);
   if (h.ready) {
     if (dom.statusDot) {
       dom.statusDot.className =
         notice.state === "paused" ? "status-dot loading" : "status-dot ready";
     }
     if (dom.statusText) {
-      dom.statusText.textContent = `Ready — ${h.gpu_name || "Local GPU"}`;
+      dom.statusText.textContent = formatEngineStatusLabel(h);
     }
     if (dom.statusVram) {
       dom.statusVram.textContent = telemetry;
@@ -586,6 +667,7 @@ async function initPopup() {
       (await chrome.storage.local.get([
         "enabledDomains",
         "langMode",
+        "translationMode",
         "includeFloating",
         "preloadWholeChapter",
         "glossary",
@@ -616,6 +698,12 @@ async function initPopup() {
   }
 
   renderLangButtons(stored.langMode || "auto");
+  if (engineModeSelect) {
+    const storedMode = String(stored.translationMode || "").trim().toLowerCase();
+    if (VALID_TRANSLATION_MODES.has(storedMode)) {
+      engineModeSelect.value = storedMode;
+    }
+  }
   const bySeries = stored.glossariesBySeries;
   if (bySeries && Object.prototype.hasOwnProperty.call(bySeries, currentSeriesId)) {
     currentGlossary = { ...(bySeries[currentSeriesId] || {}) };
@@ -679,6 +767,83 @@ for (const btn of langButtons) {
     await chrome.storage.local.set({ langMode });
     renderLangButtons(langMode);
     showFeedback(`Language set to ${btn.textContent}`);
+  });
+}
+
+if (engineModeSelect) {
+  engineModeSelect.addEventListener("change", async () => {
+    const translationMode = String(engineModeSelect.value || "hybrid").trim().toLowerCase();
+    try {
+      await chrome.storage.local.set({ translationMode });
+    } catch (_err) {
+      // Ignore storage write failures.
+    }
+    const res = await sendBgMessage({
+      type: "SAVE_SETTINGS",
+      translation_mode: translationMode,
+    });
+    if (res?.ok) {
+      applySettingsResponse(res);
+      const selectedLabel =
+        engineModeSelect.options?.[engineModeSelect.selectedIndex]?.text || translationMode;
+      showFeedback(`Engine set to ${selectedLabel}`);
+      void refreshHealthAndPoll();
+    } else {
+      showFeedback("Engine mode saved locally (server offline)");
+    }
+  });
+}
+
+if (saveGeminiKeyBtn) {
+  saveGeminiKeyBtn.addEventListener("click", async () => {
+    const apiKey = (geminiKeyInput?.value || "").trim();
+    if (!apiKey) {
+      showFeedback("Paste a Google AI Studio key first");
+      return;
+    }
+    saveGeminiKeyBtn.disabled = true;
+    if (clearGeminiKeyBtn) clearGeminiKeyBtn.disabled = true;
+    try {
+      const res = await sendBgMessage({
+        type: "SAVE_SETTINGS",
+        gemini_api_key: apiKey,
+      });
+      if (!res?.ok) {
+        showFeedback(res?.error || "Failed to save key — is the server running?");
+        return;
+      }
+      if (geminiKeyInput) geminiKeyInput.value = "";
+      applySettingsResponse(res);
+      showFeedback("Gemini API key saved");
+      await refreshHealthAndPoll();
+    } finally {
+      saveGeminiKeyBtn.disabled = false;
+      if (clearGeminiKeyBtn) clearGeminiKeyBtn.disabled = false;
+    }
+  });
+}
+
+if (clearGeminiKeyBtn) {
+  clearGeminiKeyBtn.addEventListener("click", async () => {
+    if (saveGeminiKeyBtn) saveGeminiKeyBtn.disabled = true;
+    clearGeminiKeyBtn.disabled = true;
+    try {
+      const res = await sendBgMessage({
+        type: "SAVE_SETTINGS",
+        clear_gemini_api_key: true,
+      });
+      if (!res?.ok) {
+        showFeedback(res?.error || "Failed to clear key — is the server running?");
+        return;
+      }
+      if (geminiKeyInput) geminiKeyInput.value = "";
+      applySettingsResponse(res);
+      showFeedback("Gemini API key cleared");
+      await refreshHealthAndPoll();
+    } finally {
+      if (saveGeminiKeyBtn) saveGeminiKeyBtn.disabled = false;
+      clearGeminiKeyBtn.disabled = false;
+    }
   });
 }
 
@@ -950,6 +1115,10 @@ if (typeof module !== "undefined" && module.exports) {
     formatGpuTelemetry,
     formatGpuGuardNotice,
     applyGpuGuardNotice,
+    formatLocalModelLabel,
+    formatEngineStatusLabel,
+    formatGeminiKeyStatus,
+    applySettingsResponse,
     applyHealthUI,
   };
 }

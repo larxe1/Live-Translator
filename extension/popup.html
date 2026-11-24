@@ -259,7 +259,8 @@
     }
 
     input[type="text"],
-    input[type="url"] {
+    input[type="url"],
+    input[type="password"] {
       width: 100%;
       background: #0f172a;
       color: var(--text);
@@ -271,8 +272,52 @@
     }
 
     input[type="text"]:focus,
-    input[type="url"]:focus {
+    input[type="url"]:focus,
+    input[type="password"]:focus {
       border-color: var(--accent);
+    }
+
+    select.engine-select {
+      width: 100%;
+      background: #0f172a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      outline: none;
+      margin-bottom: 8px;
+    }
+
+    select.engine-select:focus {
+      border-color: var(--accent);
+    }
+
+    .gemini-key-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 5px;
+      align-items: center;
+    }
+
+    .key-status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 5px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .key-status {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+
+    .key-status.configured {
+      color: var(--ok);
     }
 
     .btn {
@@ -484,6 +529,29 @@
       <button type="button" class="lang-btn" data-lang="auto">Auto</button>
       <button type="button" class="lang-btn" data-lang="ja">Japanese</button>
       <button type="button" class="lang-btn" data-lang="ko">Korean</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Translation Engine</div>
+    <select id="engineModeSelect" class="engine-select" aria-label="Translation Engine">
+      <option value="hybrid">Hybrid (Gemini Vision + Local)</option>
+      <option value="local">Local Only (Shisa JP / EXAONE KR)</option>
+      <option value="gemini">Gemini Vision Only</option>
+    </select>
+    <div class="gemini-key-row">
+      <input
+        id="geminiKeyInput"
+        type="password"
+        placeholder="Paste Google AI Studio key..."
+        autocomplete="off"
+      />
+      <button type="button" class="btn btn-primary" id="saveGeminiKeyBtn">Save</button>
+      <button type="button" class="btn" id="clearGeminiKeyBtn">Clear</button>
+    </div>
+    <div class="key-status-row">
+      <span>Gemini API Key</span>
+      <span class="key-status" id="geminiKeyStatus">Not configured</span>
     </div>
   </div>
 

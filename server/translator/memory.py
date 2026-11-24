@@ -136,9 +136,10 @@ _STRONG_ROMAJI_WORDS: frozenset[str] = frozenset(
         "michin", "michyeosseo", "jinjja", "daebak", "aigo", "aigoo", "eotteoke", "eotteokhae",
         "molla", "mollayo", "alasseo", "algesseoyo", "gomawo", "gomapseumnida", "kamsahamnida",
         "gamsahamnida", "annyeong", "annyeonghaseyo", "wae", "mwo", "mwoya", "geurae", "geureom",
-        "geuman", "ppalli", "jamkkan", "jamkkanman", "yeogi", "geogi", "jeogi", "nugu", "eodi",
-        "eonje", "museun", "aniyo", "aniya", "jeongmal", "heol", "ssibal", "shibal", "saekki",
-        "jugeo", "salryeojwo",
+        "geuman", "geumanhae", "ppalli", "jamkkan", "jamkkanman", "gidaryeo", "yeogi", "yeogin",
+        "geogi", "jeogi", "nugu", "eodi", "eonje", "museun", "aniyo", "aniya", "jeongmal", "heol",
+        "ssibal", "shibal", "saekki", "jugeo", "salryeojwo", "silheo", "shireo", "johahae",
+        "joahae", "amudo", "eopseo", "eobseo", "ireomyeon", "oraenmanine",
     }
 )
 
@@ -161,7 +162,8 @@ _ROMAJI_BIGRAMS: frozenset[tuple[str, str]] = frozenset(
         ("mite", "kure"), ("mite", "kuro"), ("shite", "kure"), ("yatte", "kure"),
         ("nani", "mo"), ("nani", "ka"), ("nani", "ga"), ("nani", "wo"),
         ("dare", "mo"), ("dare", "ga"), ("dare", "da"),
-        ("wae", "irae"), ("wae", "geurae"), ("ani", "geuge"),
+        ("wae", "irae"), ("wae", "geurae"), ("ani", "geuge"), ("geuge", "anira"),
+        ("nado", "johahae"), ("nado", "joahae"), ("maldo", "andwae"), ("yeogiseo", "ireomyeon"),
     }
 )
 
