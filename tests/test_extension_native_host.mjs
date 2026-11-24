@@ -230,9 +230,9 @@ function createMinimalDom(href = "https://mangadex.org/chapter/101") {
   return { doc, win };
 }
 
-test("1. manifest.json has version 1.3.0 and nativeMessaging permission", () => {
+test("1. manifest.json has version 1.3.1 and nativeMessaging permission", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(EXT_DIR, "manifest.json"), "utf8"));
-  assert.equal(manifest.version, "1.3.0");
+  assert.equal(manifest.version, "1.3.1");
   assert.ok(manifest.permissions.includes("nativeMessaging"));
 });
 

@@ -26,3 +26,7 @@ Whenever changing `config.json`, `server/gpu_guard.py`, `server/translator/llama
 ## 4. Verification Commands
 - Python test suite: `.venv\Scripts\python.exe -m pytest -q --ignore=tests/test_e2e_gpu_samples.py`
 - Edge extension JS suite: `node --test tests/test_extension_*.mjs`
+
+## 5. Default Target Language — English Only
+- All translated dialogue and text across JP, KR, Spanish/other scanlations, Gemini Vision, and local LLMs MUST default to **English ONLY** unless the user explicitly requests another target language.
+- Validators and caches must reject/purge non-English outputs (including CJK, Romaji, and Spanish/other non-English Latin languages).

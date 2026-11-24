@@ -16,7 +16,11 @@ from server.config import AppConfig
 from server.pipeline import TranslationPipeline
 from server.schemas import Box, BubbleResult, TranslateResponse
 from server.translator.llama_manager import LlamaServerManager
-from server.translator.memory import ChapterMemoryStore, extract_character_names
+from server.translator.memory import (
+    ChapterMemoryStore,
+    extract_character_names,
+    looks_like_non_english_latin,
+)
 from server.translator.translator import (
     DEFAULT_REPEAT_PENALTY,
     DEFAULT_TEMPERATURE,
@@ -343,7 +347,7 @@ def _make_cache_response(translated_text: str, original_text: str = "夢幻団")
 
 
 def test_translation_cache_v5_key_evicts_cjk_and_romaji_and_purges_on_init(tmp_path):
-    assert CACHE_KEY_VERSION == "v6-hybrid-multi"
+    assert CACHE_KEY_VERSION == "v7-strict-en"
     db_path = tmp_path / "translations.db"
     cache = TranslationCache(db_path, max_entries=20)
 
@@ -1022,3 +1026,129 @@ async def test_batch_retry_falls_back_to_single_bubble_with_context_instead_of_d
     single_user = calls[2][1]["content"]
     assert "Masaki...!!" in single_user
     assert '"2"' in single_user
+
+
+def test_looks_like_non_english_latin_catches_spanish_and_preserves_english_loanwords():
+    spanish_cases = [
+        "@Yok TRADUCCIÓN",
+        "Limpieza y corrección",
+        "¿Qué estás haciendo?",
+        "¡Gracias!",
+        "Señor, espera un momento.",
+        "Pero tienes razón.",
+        "No me digas eso.",
+        "Te quiero mucho.",
+        "Te amo...",
+        "Por favor, lo siento.",
+        "De inmediato.",
+        "Como digas.",
+        "A tu ritmo.",
+        "Sin embargo, nadie vino.",
+        "Jajaja... hola!",
+        "Adiós, sí.",
+        "¿Dónde estás? Aquí estoy.",
+        "También necesito saber por qué.",
+        "Lo que tú dices nunca pasa.",
+        "Perdón, no puedo ahora.",
+    ]
+    for sample in spanish_cases:
+        assert looks_like_non_english_latin(sample) is True, f"Missed Spanish leak: {sample!r}"
+        assert is_valid_english_translation("ちょっと待って", sample) is False
+
+    english_and_loanwords = [
+        "café",
+        "fiancé",
+        "naïve",
+        "cliché",
+        "résumé",
+        "Masaki",
+        "Nanami",
+        "No way!",
+        "Come on!",
+        "Wait a second!",
+        "Me too.",
+        "No, me too!",
+        "Hehe... Thanks.",
+        "What are you talking about?",
+        "Let's meet at the café with my fiancé.",
+        "That cliché résumé is naïve.",
+    ]
+    for sample in english_and_loanwords:
+        assert looks_like_non_english_latin(sample) is False, f"False positive on English: {sample!r}"
+        assert is_valid_english_translation("ちょっと待って", sample) is True
+
+    # ChapterMemoryStore enforces non-Spanish across record_page, get_context, and get_formatted_context
+    mem = ChapterMemoryStore(max_recent=10)
+    mem.record_page(
+        "ch-es",
+        [
+            ("ありがとう", "¡Gracias!"),
+            ("翻訳", "@Yok TRADUCCIÓN"),
+            ("待って", "Wait a second!"),
+        ],
+        series_id="ser-es",
+    )
+    assert mem.get_context("ch-es", series_id="ser-es") == [("待って", "Wait a second!")]
+    formatted = mem.get_formatted_context("ch-es", series_id="ser-es")
+    assert "Wait a second!" in formatted
+    assert "Gracias" not in formatted
+    assert "TRADUCCIÓN" not in formatted
+
+    # Directly injected Spanish rows are filtered out by get_context and get_formatted_context
+    mem._contexts["ch-es"].append(("ごめん", "Lo siento, no me toques."))
+    mem._pages["ch-es"].append([("ごめん", "Lo siento, no me toques.")])
+    assert mem.get_context("ch-es") == [("待って", "Wait a second!")]
+    assert "Lo siento" not in mem.get_formatted_context("ch-es")
+
+
+@pytest.mark.asyncio
+async def test_translator_retries_spanish_leak_and_enforces_strict_english_prompts():
+    memory = ChapterMemoryStore()
+    calls: list[list[dict[str, str]]] = []
+
+    async def spanish_then_english(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return '{"0": "@Yok TRADUCCIÓN", "1": "¡Gracias! Pero no me digas eso.", "2": "Wait a second!"}'
+        return '{"0": "Translation Credit", "1": "Thanks! But don\'t tell me that."}'
+
+    tr = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=spanish_then_english)
+    out = await tr.translate_page(
+        [(0, "翻訳"), (1, "ありがとう！でも言わないで。"), (2, "ちょっと待って！")],
+        lang="ja",
+        chapter_id="ch-es-retry",
+    )
+    assert out == {
+        0: "Translation Credit",
+        1: "Thanks! But don't tell me that.",
+        2: "Wait a second!",
+    }
+    assert len(calls) == 2
+
+    # Verify primary & retry prompts for both ja and ko strictly mandate English ONLY and forbid Spanish
+    for lang_code in ("ja", "ko"):
+        primary = tr._build_primary_messages([(0, "テスト")], lang_code, {}, [])
+        retry = tr._build_retry_messages([(0, "テスト")], lang_code, {}, reason="non_english")
+        for prompt_pair in (primary, retry):
+            sys_txt = prompt_pair[0]["content"]
+            usr_txt = prompt_pair[1]["content"]
+            assert "english only" in sys_txt.lower()
+            assert "spanish" in sys_txt.lower()
+            assert "spanish" in usr_txt.lower()
+            assert "romanize" not in sys_txt.lower()
+
+    # Single-bubble retry prompt also mandates English ONLY and forbids Spanish
+    single_calls: list[list[dict[str, str]]] = []
+
+    async def capture_single(messages):
+        single_calls.append(messages)
+        return '{"0": "Hold on!"}'
+
+    tr_single = DialogueTranslator("http://127.0.0.1:8766", memory, llm_caller=capture_single)
+    res, refused = await tr_single._translate_single_bubble_english_checked(0, "잠깐만!", "ko", {})
+    assert res == "Hold on!"
+    assert refused is False
+    assert "english only" in single_calls[0][0]["content"].lower()
+    assert "spanish" in single_calls[0][0]["content"].lower()
+    assert "spanish" in single_calls[0][1]["content"].lower()
+    assert "romanize" not in single_calls[0][0]["content"].lower()

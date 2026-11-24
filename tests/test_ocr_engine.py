@@ -12,6 +12,7 @@ from PIL import Image
 from server import gpu_guard
 from server.ocr.engine import (
     OcrEngine,
+    _looks_like_ja_ocr_hallucination,
     classify_script,
     is_meaningful_dialogue,
     preprocess_crop_for_ocr,
@@ -209,3 +210,65 @@ def test_load_ja_uses_cpu_when_vram_headroom_insufficient(monkeypatch):
     assert seen_thresholds == [650]
     assert seen == [True]
     assert engine._ja_fp16 is False
+
+
+def test_ja_ocr_hallucination_detector_and_auto_switch_to_korean():
+    # Classic manga-ocr hallucinations on Korean Hangul / non-Japanese images
+    assert _looks_like_ja_ocr_hallucination(["２０１０年１０月１０日"]) is True
+    assert _looks_like_ja_ocr_hallucination(["2018年５月"]) is True
+    assert _looks_like_ja_ocr_hallucination(["10月10日"]) is True
+    assert _looks_like_ja_ocr_hallucination(["Windows 98"]) is True
+    assert _looks_like_ja_ocr_hallucination(["http://example.com"]) is True
+    assert _looks_like_ja_ocr_hallucination(["ABC123あ"]) is True
+
+    # Normal Japanese manga dialogue must NOT trigger hallucination check
+    assert _looks_like_ja_ocr_hallucination(["今！助けます！", "蜈蚣が！"]) is False
+    assert _looks_like_ja_ocr_hallucination(["ちょっと待って！"]) is False
+    assert _looks_like_ja_ocr_hallucination(["..."]) is False
+    assert _looks_like_ja_ocr_hallucination([]) is False
+
+    # Normal-aspect (aspect_ratio <= 2.2) Korean manhwa slice where manga-ocr hallucinates a Japanese date:
+    # Auto MUST probe EasyOCR (ko) and switch to ko when Hangul is detected!
+    engine = OcrEngine(device="cpu")
+
+    class FakeKoReader:
+        def __init__(self, output_text: str) -> None:
+            self.output_text = output_text
+            self.calls = 0
+
+        def readtext(self, arr, detail=1, paragraph=False):
+            self.calls += 1
+            return [([[0, 0], [50, 0], [50, 20], [0, 20]], self.output_text, 0.96)]
+
+    ja_calls = {"count": 0}
+
+    def fake_ja_hallucinating(img: Image.Image) -> str:
+        ja_calls["count"] += 1
+        return "２０１０年１０月１０日"
+
+    ko_reader = FakeKoReader("잠깐만 기다려!")
+    engine._ja_ocr = fake_ja_hallucinating
+    engine._ko_ocr = ko_reader
+
+    crops = [
+        (Image.new("RGB", (200, 120), (255, 255, 255)), False),
+        (Image.new("RGB", (180, 100), (255, 255, 255)), False),
+        (Image.new("RGB", (90, 70), (255, 255, 255)), False),
+    ]
+
+    lang, texts = engine.read_page_bubbles(crops, lang_hint="auto", aspect_ratio=1.4)
+    assert lang == "ko"
+    assert texts == ["잠깐만 기다려!", "잠깐만 기다려!", "잠깐만 기다려!"]
+    assert ja_calls["count"] == 2
+    assert ko_reader.calls == 3
+
+    # Genuine Japanese page containing a date (EasyOCR finds 0 Hangul) MUST stay 'ja'
+    engine_ja = OcrEngine(device="cpu")
+    ko_empty = FakeKoReader("2024")
+    engine_ja._ja_ocr = lambda img: "2024年、東京へ行く！"
+    engine_ja._ko_ocr = ko_empty
+
+    lang_ja, texts_ja = engine_ja.read_page_bubbles(crops[:2], lang_hint="auto", aspect_ratio=1.4)
+    assert lang_ja == "ja"
+    assert texts_ja == ["2024年、東京へ行く！", "2024年、東京へ行く！"]
+    assert ko_empty.calls == 2

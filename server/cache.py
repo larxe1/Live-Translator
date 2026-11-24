@@ -11,18 +11,23 @@ from contextlib import closing
 from pathlib import Path
 
 from server.schemas import TranslateResponse
-from server.translator.memory import contains_non_english_cjk, looks_like_romaji
+from server.translator.memory import (
+    contains_non_english_cjk,
+    looks_like_non_english_latin,
+    looks_like_romaji,
+)
 
 logger = logging.getLogger(__name__)
 
-CACHE_KEY_VERSION = "v6-hybrid-multi"
+CACHE_KEY_VERSION = "v7-strict-en"
 
 
 def _response_has_non_english_cjk(response: TranslateResponse) -> bool:
-    """Return True if any cached bubble contains CJK/Kana/Hangul characters or untranslated Romaji."""
+    """Return True if any cached bubble contains CJK/Kana/Hangul, Romaji, or non-English Latin text."""
     return any(
         contains_non_english_cjk(bubble.translated)
         or looks_like_romaji(bubble.original, bubble.translated)
+        or looks_like_non_english_latin(bubble.translated)
         for bubble in response.bubbles
     )
 

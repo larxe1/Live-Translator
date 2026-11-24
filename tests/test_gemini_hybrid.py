@@ -635,7 +635,7 @@ async def test_gemini_only_mode_retries_text_only_once_on_block():
 
 @pytest.mark.asyncio
 async def test_pipeline_lazy_llm_startup_cache_mode_isolation_and_provider_events(tmp_path: Path):
-    assert CACHE_KEY_VERSION == "v6-hybrid-multi"
+    assert CACHE_KEY_VERSION == "v7-strict-en"
     memory = ChapterMemoryStore()
     cache = TranslationCache(tmp_path / "translations.db", max_entries=50)
 
@@ -765,3 +765,35 @@ async def test_dynamic_hybrid_partial_chunk_refusal_shifts_only_missing_bubble_t
     assert local_seen_ids == [[2]]
     assert tr.last_provider == "hybrid"
     assert llama_mgr.calls == [("ja", False)]
+
+
+@pytest.mark.asyncio
+async def test_gemini_prompts_mandate_strict_english_only_and_reject_spanish_output(monkeypatch):
+    for lang_code in ("ja", "ko"):
+        sys_inst = GeminiVisionTranslator.build_system_instruction(lang_code)
+        assert "strictly english only" in sys_inst.lower()
+        assert "spanish" in sys_inst.lower()
+        assert "always translate it into natural english" in sys_inst.lower()
+
+    user_prompt = GeminiVisionTranslator.build_user_prompt([(0, "잠깐만!")])
+    assert "strictly english only" in user_prompt.lower()
+    assert "spanish" in user_prompt.lower()
+
+    # Gemini returning Spanish-only bubbles is rejected by validator -> GeminiBlockedError
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json=_make_v1_interaction_response('{"0": "¡Gracias! Pero no me digas eso."}'),
+        )
+    )
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **kw: real_async_client(*a, transport=transport, **kw),
+    )
+
+    cfg = SimpleNamespace(gemini_models=["gemini-3.5-flash-lite"], gemini_use_vision=False)
+    gem = GeminiVisionTranslator(cfg=cfg, api_key="test-dummy-key-99999")
+    with pytest.raises(GeminiBlockedError):
+        await gem.translate_chunk([(0, "고마워! 하지만 그러지 마.")], lang="ko")

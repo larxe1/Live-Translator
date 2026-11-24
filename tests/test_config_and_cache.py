@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 from pathlib import Path
+import sqlite3
 
-from server.cache import TranslationCache
+from server.cache import CACHE_KEY_VERSION, TranslationCache
 from server.config import (
     AppConfig,
     enforce_d_drive_env,
@@ -481,3 +483,49 @@ def test_llama_manager_ensure_model_switching_and_disk_fallback(tmp_path: Path, 
         "ko": True,
         "default": True,
     }
+
+
+def test_cache_v7_strict_en_rejects_and_purges_spanish_rows(tmp_path: Path) -> None:
+    assert CACHE_KEY_VERSION == "v7-strict-en"
+    db_path = tmp_path / "strict_en.db"
+    cache = TranslationCache(db_path, max_entries=20)
+
+    # put() refuses Spanish rows
+    spanish_key = cache.make_key(b"spanish-page", "ko")
+    spanish_resp = _sample_response("@Yok TRADUCCIÓN — ¡Gracias! Pero no me digas eso.")
+    cache.put(spanish_key, spanish_resp)
+    assert cache.get(spanish_key) is None
+
+    # Directly seeded Spanish row is evicted on get()
+    seeded_key = cache.make_key(b"seeded-spanish", "ko")
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (seeded_key, _sample_response("¿Qué estás haciendo?").model_dump_json(), 1),
+        )
+        conn.commit()
+    assert cache.get(seeded_key) is None
+
+    # Re-opening cache automatically purges Spanish rows while keeping valid English + loanwords
+    good_key = cache.make_key(b"english-loanword-page", "ja")
+    good_resp = _sample_response("Let's meet at the café with my fiancé!")
+    bad_purge_key = "stale-spanish-row"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (bad_purge_key, _sample_response("Por favor, espera aquí.").model_dump_json(), 1),
+        )
+        conn.execute(
+            "INSERT INTO translations (cache_key, payload, last_accessed) VALUES (?, ?, ?)",
+            (good_key, good_resp.model_dump_json(), 2),
+        )
+        conn.commit()
+
+    reopened = TranslationCache(db_path, max_entries=20)
+    with closing(sqlite3.connect(db_path)) as conn:
+        keys = {r[0] for r in conn.execute("SELECT cache_key FROM translations").fetchall()}
+    assert bad_purge_key not in keys
+    assert good_key in keys
+    hit = reopened.get(good_key)
+    assert hit is not None
+    assert hit.bubbles[0].translated == "Let's meet at the café with my fiancé!"

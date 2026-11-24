@@ -282,6 +282,9 @@ class GeminiVisionTranslator:
         return (
             f"You are an expert {source_label}-to-English localization translator.\n"
             "Rules:\n"
+            "- Target output language is STRICTLY English ONLY (default target language is ALWAYS English). "
+            "NEVER output Spanish, French, Portuguese, Romaji, or any non-English language — "
+            "even if the attached page image or source text contains Spanish or another language, ALWAYS translate it into natural English.\n"
             "- Use the attached page image ONLY as visual context for speaker gender, facial expressions, tone, and panel flow.\n"
             "- Translate ONLY the exact numbered OCR bubble keys in the JSON below. Return the EXACT same string numeric keys — do NOT invent extra keys, merge keys, or omit keys.\n"
             "- Produce natural, fluent, idiomatic English comic lettering (concise, natural dialogue—not stiff literal translations).\n"
@@ -324,7 +327,9 @@ class GeminiVisionTranslator:
         bubble_map = {str(bid): _normalize_ocr_for_llm(text) for bid, text in bubbles}
         sections.append(
             "Translate ONLY the exact numbered OCR bubble keys below into natural, idiomatic English "
-            "(strictly English ONLY; zero Romaji/romanization, zero CJK/Hangul). "
+            "(strictly English ONLY — default target language is ALWAYS English; NEVER output Spanish, "
+            "French, Portuguese, Romaji/romanization, or CJK/Hangul, even if the source image or text "
+            "is in Spanish or another language). "
             "Return ONLY a JSON object with these exact string keys:\n"
             + json.dumps(bubble_map, ensure_ascii=False)
         )

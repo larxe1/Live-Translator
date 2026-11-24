@@ -23,6 +23,7 @@ from server.translator.memory import (
     ChapterMemoryStore,
     contains_non_english_cjk,
     extract_character_names,
+    looks_like_non_english_latin,
     looks_like_romaji,
 )
 
@@ -112,7 +113,7 @@ def is_refusal(text: str) -> bool:
 
 
 def is_valid_english_translation(orig: str, candidate: str) -> bool:
-    """Return True if candidate is a non-empty, non-refusal, non-Romaji English translation without CJK scripts."""
+    """Return True if candidate is a non-empty, non-refusal, strict English translation."""
     cleaned = _clean_candidate(candidate)
     if not cleaned:
         return False
@@ -123,6 +124,8 @@ def is_valid_english_translation(orig: str, candidate: str) -> bool:
     if contains_non_english_cjk(orig) and cleaned == orig.strip():
         return False
     if looks_like_romaji(orig, cleaned):
+        return False
+    if looks_like_non_english_latin(cleaned):
         return False
     if _ORIG_ELLIPSIS_RE.search(orig or "") and _DOT_DOT_HALLUCINATION_RE.search(cleaned):
         return False
@@ -512,7 +515,10 @@ class DialogueTranslator:
             "Rules:\n"
             "1. Translate every bubble into natural, fluent, idiomatic English manga dialogue—"
             "concise comic lettering, NOT stiff word-for-word literal translations.\n"
-            f"2. Output strictly English ONLY. {anti_romaji}\n"
+            "2. Output strictly English ONLY — the target output language is ALWAYS English ONLY. "
+            "NEVER output Spanish, Portuguese, French, Romaji, or any other non-English language. "
+            "Even if a bubble or scanlation page contains Spanish or another language, ALWAYS translate it into natural English. "
+            f"{anti_romaji}\n"
             f"3. {subject_rule}\n"
             f"4. {idiom_rule}\n"
             "5. Keep ellipses ('…'/'...') as '...'—NEVER spell them out as 'Dot dot'. "
@@ -549,7 +555,8 @@ class DialogueTranslator:
         bubble_map = {str(bid): _normalize_ocr_for_llm(text) for bid, text in bubbles}
         sections.append(
             "Translate EVERY bubble below into natural, idiomatic English comic dialogue "
-            "(English ONLY; never Romaji, never CJK). "
+            "(ALWAYS English ONLY; NEVER Spanish, Portuguese, French, Romaji, or CJK — "
+            "even if a bubble or page contains Spanish or another language, translate it into natural English). "
             "Return ONLY a JSON object mapping each string bubble ID to its English translation:\n"
             + json.dumps(bubble_map, ensure_ascii=False)
         )
@@ -578,7 +585,8 @@ class DialogueTranslator:
             "'제발 하지마' -> \"Please, don't!\", NEVER 'Jebal hajima'"
         )
         non_english_notice = (
-            " CRITICAL: Your previous output contained Chinese, Japanese, or Korean characters, "
+            " CRITICAL: Your previous output contained non-English text (Chinese, Japanese, Korean, "
+            "Spanish, Portuguese, French, or another non-English language), "
             "Japanese/Korean Romaji (e.g. 'Chotto matte', 'Koko ja yada', 'Jamkkanman'), or spelled-out ellipses ('Dot dot'). "
             "You MUST translate the MEANING of every entry into natural English ONLY."
             if reason == "non_english"
@@ -586,7 +594,10 @@ class DialogueTranslator:
         )
         system_prompt = (
             f"You are an expert {src_name}-to-English localization translator for comic scripts. "
+            "Target output language is ALWAYS English ONLY. "
             "Translate the MEANING into natural, idiomatic English comic dialogue using Latin letters ONLY. "
+            "NEVER output Spanish, Portuguese, French, or any other non-English language — "
+            "even if a bubble or page contains Spanish or another language, ALWAYS translate it into natural English. "
             f"NEVER output Chinese, Japanese, or Korean characters, NEVER output {src_name} Romaji "
             f"or phonetic spelling of spoken words (e.g. {romaji_examples}), "
             "and NEVER spell ellipses as 'Dot dot' (use '...'). "
@@ -603,10 +614,10 @@ class DialogueTranslator:
         )
         bubble_map = {str(bid): _normalize_ocr_for_llm(text) for bid, text in failed_bubbles}
         user_header = (
-            "Previous output contained non-English text, Romaji, or literalized ellipses and was rejected. "
-            "Translate the MEANING of EVERY item below into natural English ONLY (zero CJK, zero Romaji):"
+            "Previous output contained non-English text (such as Spanish, CJK, or Romaji) or literalized ellipses and was rejected. "
+            "Translate the MEANING of EVERY item below into natural English ONLY (ALWAYS English ONLY; zero Spanish/other languages, zero CJK, zero Romaji):"
             if reason == "non_english"
-            else "Translate EVERY item below into natural, idiomatic English ONLY (zero CJK, zero Romaji):"
+            else "Translate EVERY item below into natural, idiomatic English ONLY (ALWAYS English ONLY; zero Spanish/other languages, zero CJK, zero Romaji):"
         )
         parts.append(f"{user_header}\n" + json.dumps(bubble_map, ensure_ascii=False))
         return [
@@ -641,7 +652,10 @@ class DialogueTranslator:
         )
         system_prompt = (
             f"You are an expert {src_name}-to-English manga localization translator. "
+            "Target output language is ALWAYS English ONLY. "
             "Translate the MEANING of this single comic line into natural, fluent, idiomatic English. "
+            "NEVER output Spanish, Portuguese, French, or any other non-English language — "
+            "even if the bubble or page contains Spanish or another language, ALWAYS translate it into natural English. "
             "Supply omitted subjects/objects naturally from context, keep ellipses as '...' (NEVER 'Dot dot'), "
             f"and preserve stutters/sighs naturally (e.g. {sigh_ex}). "
             f"NEVER output Chinese, Japanese, or Korean characters, and NEVER output {src_name} Romaji "
@@ -657,7 +671,8 @@ class DialogueTranslator:
         )
         normalized_orig = _normalize_ocr_for_llm(orig_text)
         parts.append(
-            "Translate this single item's MEANING into natural, idiomatic English ONLY (zero CJK, zero Romaji). "
+            "Translate this single item's MEANING into natural, idiomatic English ONLY "
+            "(ALWAYS English ONLY; zero Spanish/other languages, zero CJK, zero Romaji). "
             f'Return JSON mapping key "{bid}" to its English translation:\n'
             + json.dumps({str(bid): normalized_orig}, ensure_ascii=False)
         )

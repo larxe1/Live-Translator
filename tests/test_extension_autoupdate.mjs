@@ -272,12 +272,12 @@ function createMinimalDom(href = "https://mangadex.org/chapter/99") {
   return { doc, win, wasReloaded: () => reloaded };
 }
 
-test("1. manifest.json is valid MV3 v1.3.0 with alarms + nativeMessaging permissions and all referenced files exist", () => {
+test("1. manifest.json is valid MV3 v1.3.1 with alarms + nativeMessaging permissions and all referenced files exist", () => {
   const manifestPath = path.join(EXT_DIR, "manifest.json");
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 
   assert.equal(manifest.manifest_version, 3);
-  assert.equal(manifest.version, "1.3.0");
+  assert.equal(manifest.version, "1.3.1");
   assert.ok(Array.isArray(manifest.permissions));
   assert.ok(manifest.permissions.includes("alarms"));
   assert.ok(manifest.permissions.includes("nativeMessaging"));
@@ -631,7 +631,7 @@ test("7. GET_UPDATE_STATUS, CHECK_FOR_UPDATES, APPLY_UPDATE, SET_AUTO_UPDATE mat
 
   const statusRes = await sb.dispatchMessage({ type: "GET_UPDATE_STATUS" });
   assert.equal(statusRes.resp.ok, true);
-  assert.equal(statusRes.resp.localVersion, "1.3.0");
+  assert.equal(statusRes.resp.localVersion, "1.3.1");
   assert.equal(statusRes.resp.autoUpdateEnabled, true);
   assert.equal(statusRes.resp.data.update_available, true);
 

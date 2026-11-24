@@ -16,8 +16,46 @@ _CJK_SCRIPT_RE = re.compile(
 _HIRAGANA_RE = re.compile(r"[\u3041-\u3096]+")
 _KATAKANA_ONLY_SFX_RE = re.compile(r"^[\u30a1-\u30fa\u30fc\s…・.!?！？ー\-~～]+$")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+_LATIN_EXT_WORD_RE = re.compile(r"[A-Za-z\u00C0-\u024F]+(?:'[A-Za-z\u00C0-\u024F]+)?")
+_NON_ENGLISH_LATIN_CHARS_RE = re.compile(r"[¿¡ñÑ]")
+_SPANISH_LAUGH_RE = re.compile(r"^(?:(?:ja){2,}|(?:je){2,})$")
+_CLAUSE_SPLIT_RE = re.compile(r"[^A-Za-z\u00C0-\u024F'\s-]+")
 _JP_MORA_WORD_RE = re.compile(
     r"^(?:(?:sh|ch|ts|ky|gy|ny|hy|my|ry|by|py|jy|fu|[kgsztdnhbpmyrwjfvc])?[aeiou]+|n(?!$)|n$)+$"
+)
+
+# Unambiguous Spanish dialogue and scanlation credit tokens (zero overlap with English/loanwords).
+_STRONG_SPANISH_WORDS: frozenset[str] = frozenset(
+    {
+        "traducción", "traduccion", "limpieza", "corrección", "correccion", "edición", "edicion",
+        "gracias", "tienes", "tengo", "estás", "estas", "estoy", "estaba", "eres",
+        "puedo", "puedes", "quiero", "quieres", "porque", "pero",
+        "también", "tambien", "todavía", "todavia", "entonces", "ahora",
+        "aquí", "aqui", "dónde", "donde", "cuándo", "cuando", "quién", "quien",
+        "cómo", "qué", "está", "nadie", "nunca", "siempre", "necesito", "espera",
+        "perdón", "perdon", "jaja", "jajaja", "jeje", "hola", "adiós", "adios", "sí",
+        "maldición", "maldicion", "disculpa", "entiendo", "contigo", "conmigo",
+        "nosotros", "ustedes", "detente",
+    }
+)
+
+# Multi-word Spanish syntax bigrams (checked only between whitespace-adjacent words in the same clause).
+_SPANISH_BIGRAMS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("no", "me"),
+        ("te", "quiero"),
+        ("te", "amo"),
+        ("por", "favor"),
+        ("lo", "siento"),
+        ("por", "que"),
+        ("lo", "que"),
+        ("de", "inmediato"),
+        ("como", "digas"),
+        ("tu", "ritmo"),
+        ("que", "dices"),
+        ("mi", "amor"),
+        ("sin", "embargo"),
+    }
 )
 
 # Minimal kana->Hepburn table used ONLY internally for detecting untranslated Romaji echoes.
@@ -271,6 +309,45 @@ def contains_non_english_cjk(text: str) -> bool:
     return _CJK_SCRIPT_RE.search(text) is not None
 
 
+def _strip_accents_lower(word: str) -> str:
+    decomposed = unicodedata.normalize("NFD", word.lower())
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
+
+def looks_like_non_english_latin(text: str) -> bool:
+    """Return True if text contains Spanish or clear non-English Romance/Latin dialogue leaks.
+
+    Designed to have zero false positives on normal English and accepted English loanwords
+    such as café, fiancé, naïve, cliché, résumé, Masaki, Nanami, etc.
+    """
+    if not text or not text.strip():
+        return False
+
+    normalized = unicodedata.normalize("NFC", text).strip()
+
+    # Signal 1: Spanish-specific punctuation or ñ/Ñ.
+    if _NON_ENGLISH_LATIN_CHARS_RE.search(normalized) is not None:
+        return True
+
+    # Signal 2: Unambiguous Spanish dialogue/scanlation tokens and Spanish laughter.
+    raw_words = _LATIN_EXT_WORD_RE.findall(normalized)
+    if not raw_words:
+        return False
+    for raw_w in raw_words:
+        low = raw_w.lower()
+        if low in _STRONG_SPANISH_WORDS or _SPANISH_LAUGH_RE.match(low) is not None:
+            return True
+
+    # Signal 3: Multi-word Spanish syntax bigrams within the same punctuation-delimited clause.
+    for span in _CLAUSE_SPLIT_RE.split(normalized):
+        span_words = [_strip_accents_lower(w) for w in _LATIN_EXT_WORD_RE.findall(span)]
+        for i in range(len(span_words) - 1):
+            if (span_words[i], span_words[i + 1]) in _SPANISH_BIGRAMS:
+                return True
+
+    return False
+
+
 def looks_like_romaji(orig: str, candidate: str) -> bool:
     """Return True if candidate appears to be Japanese/Korean Romaji instead of English."""
     if not orig or not candidate:
@@ -465,6 +542,7 @@ def _is_clean_pair(orig: str, trans: str) -> bool:
         and trans
         and not contains_non_english_cjk(trans)
         and not looks_like_romaji(orig, trans)
+        and not looks_like_non_english_latin(trans)
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,6 +33,38 @@ _MEANINGFUL_RE = re.compile(
 _HANGUL_RE = re.compile(r"[\uAC00-\uD7A3\u3130-\u318F\u1100-\u11FF]")
 _JA_KANA_RE = re.compile(r"[\u3040-\u309F\u30A0-\u30FF\uFF66-\uFF9F]")
 _CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF]")
+_LATIN_DIGIT_RE = re.compile(r"[A-Za-z0-9\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A]")
+_JA_DATE_HALLUCINATION_RE = re.compile(r"(?:19|20)\d{2}\s*年|\d{1,2}\s*月\s*\d{1,2}\s*日")
+_JA_BOILERPLATE_HALLUCINATION_RE = re.compile(
+    r"(?:\bwindows\b|https?|\.com\b|www\.)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_ja_ocr_hallucination(texts: list[str]) -> bool:
+    """Return True when manga-ocr output looks like a classic non-Japanese hallucination.
+
+    When manga-ocr is fed Korean Hangul or non-Japanese bubbles, it frequently outputs
+    Japanese date stamps (e.g., '２０１０年１０月１０日', '2018年'), Windows/URL boilerplate,
+    or strings dominated (>50%) by ASCII/fullwidth Latin letters and digits instead of kana/kanji.
+    """
+    joined = " ".join(t.strip() for t in texts if t and t.strip())
+    if not joined:
+        return False
+
+    normalized = unicodedata.normalize("NFKC", joined)
+    if _JA_DATE_HALLUCINATION_RE.search(normalized) is not None:
+        return True
+    if _JA_BOILERPLATE_HALLUCINATION_RE.search(normalized) is not None:
+        return True
+
+    meaningful_count = len(_MEANINGFUL_RE.findall(joined))
+    if meaningful_count > 0:
+        latin_digit_count = len(_LATIN_DIGIT_RE.findall(joined))
+        if latin_digit_count / meaningful_count > 0.5:
+            return True
+
+    return False
 
 
 def preprocess_crop_for_ocr(crop: Image.Image, is_dark: bool) -> Image.Image:
@@ -317,9 +350,11 @@ class OcrEngine:
         chosen_lang: Literal["ja", "ko"] = first_lang
         chosen_cache: dict[int, str] = first_cache
 
-        # Check if first probe produced meaningful target-script glyphs; if not, probe other engine
+        # Check if first probe produced meaningful target-script glyphs (or suspicious JA hallucination);
+        # if not, probe the other OCR engine before committing.
         target_hits = ko_count if first_lang == "ko" else ja_count
-        if target_hits == 0:
+        ja_hallucination = first_lang == "ja" and _looks_like_ja_ocr_hallucination(first_texts)
+        if target_hits == 0 or ja_hallucination:
             other_cache: dict[int, str] = {}
             for idx in probe_indices:
                 crop, is_dark = crops[idx]
@@ -330,6 +365,9 @@ class OcrEngine:
             if other_hits > 0:
                 chosen_lang = other_lang
                 chosen_cache = other_cache
+            elif ja_hallucination and target_hits > 0:
+                chosen_lang = first_lang
+                chosen_cache = first_cache
             else:
                 chosen_lang = classify_script(first_texts + other_texts, aspect_ratio)
                 chosen_cache = first_cache if chosen_lang == first_lang else other_cache
