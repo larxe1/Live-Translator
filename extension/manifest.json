@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Live Manga & Manhwa Translator",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Free local GPU-accelerated live dialogue translator for Japanese manga and Korean manhwa.",
   "permissions": [
     "storage",

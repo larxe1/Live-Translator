@@ -70,9 +70,9 @@ let healthPollStartedAt = 0;
 
 function getLocalVersion() {
   try {
-    return chrome.runtime?.getManifest?.()?.version || "1.3.1";
+    return chrome.runtime?.getManifest?.()?.version || "1.3.2";
   } catch (_err) {
-    return "1.3.1";
+    return "1.3.2";
   }
 }
 

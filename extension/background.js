@@ -276,7 +276,7 @@ function getLocalManifestVersion(deps = {}) {
   } catch (_err) {
     // Ignore manifest lookup failures.
   }
-  return "1.3.1";
+  return "1.3.2";
 }
 
 async function safeStorageGet(storage, keys) {

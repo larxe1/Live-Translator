@@ -310,3 +310,184 @@ def test_pid_file_claim_and_stale_cleanup(tmp_path):
     assert supervisor.acquire_pid_file(tmp_path, own_pid=os.getpid())
     supervisor.remove_pid_file(tmp_path, only_if_pid=os.getpid())
     assert not (tmp_path / "cache" / "server.pid").exists()
+
+
+# ------------------------------------------------------------ PID reuse protection
+
+def test_legacy_pid_reused_by_conhost_is_rejected_and_cleaned(tmp_path, monkeypatch):
+    """Stale plain-int server.pid reused by Windows conhost.exe must not block start_server."""
+    stale_pid = 18216
+    pid_path = tmp_path / "cache" / "server.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(stale_pid), encoding="utf-8")
+
+    monkeypatch.setattr(supervisor, "pid_alive", lambda pid: pid in (stale_pid, os.getpid()))
+    monkeypatch.setattr(
+        supervisor,
+        "process_identity",
+        lambda pid: (
+            (r"c:\windows\system32\conhost.exe", 134400000000000000)
+            if pid == stale_pid
+            else (str(tmp_path / ".venv" / "Scripts" / "pythonw.exe").lower(), 134400500000000000)
+        ),
+    )
+
+    assert supervisor.live_supervisor_pid(tmp_path) is None
+    assert not pid_path.exists()
+
+    # Re-create stale file and verify acquire_pid_file replaces it cleanly.
+    pid_path.write_text(str(stale_pid), encoding="utf-8")
+    assert supervisor.acquire_pid_file(tmp_path, own_pid=os.getpid()) is True
+    assert supervisor.read_pid_record(tmp_path) == (os.getpid(), 134400500000000000)
+
+    # Re-create stale file and verify host.action_start_server spawns a new supervisor.
+    pid_path.write_text(str(stale_pid), encoding="utf-8")
+    monkeypatch.setattr(host.supervisor, "fetch_health", lambda cfg, timeout=1.5: None)
+    spawned = []
+    monkeypatch.setattr(host, "spawn_supervisor", lambda root: spawned.append(root) or 55555)
+    resp = host.handle_message({"action": "start_server"}, tmp_path)
+    assert resp == {"ok": True, "started": True, "already_running": False, "pid": 55555}
+    assert spawned == [tmp_path]
+    assert not pid_path.exists()
+
+
+def test_legacy_pid_unrelated_system_python_rejected_but_repo_venv_accepted(tmp_path, monkeypatch):
+    """Legacy plain-int server.pid must reject unrelated system python.exe but accept repo venv."""
+    pid_path = tmp_path / "cache" / "server.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True, exist_ok=True)
+
+    other_pid = 22222
+    pid_path.write_text(str(other_pid), encoding="utf-8")
+    monkeypatch.setattr(supervisor, "pid_alive", lambda pid: pid == other_pid)
+    monkeypatch.setattr(
+        supervisor,
+        "process_identity",
+        lambda pid: (r"c:\someotherpython\python.exe", 134400100000000000) if pid == other_pid else None,
+    )
+    assert supervisor.live_supervisor_pid(tmp_path) is None
+    assert not pid_path.exists()
+
+    repo_exe = str(tmp_path / ".venv" / "Scripts" / "pythonw.exe").lower()
+    pid_path.write_text(str(other_pid), encoding="utf-8")
+    monkeypatch.setattr(
+        supervisor,
+        "process_identity",
+        lambda pid: (repo_exe, 134400100000000000) if pid == other_pid else None,
+    )
+    assert supervisor.live_supervisor_pid(tmp_path) == other_pid
+    assert pid_path.exists()
+
+
+def test_json_pid_reused_by_another_python_with_mismatched_created_at(tmp_path, monkeypatch):
+    """JSON server.pid whose PID was reused by a newer python.exe must be treated as stale."""
+    reused_pid = 24680
+    old_created_at = 134400000000000000
+    new_created_at = old_created_at + 600_000_000  # 60 seconds later (> 1s tolerance)
+    pid_path = tmp_path / "cache" / "server.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(json.dumps({"pid": reused_pid, "created_at": old_created_at}), encoding="utf-8")
+
+    monkeypatch.setattr(supervisor, "pid_alive", lambda pid: pid in (reused_pid, os.getpid()))
+    monkeypatch.setattr(
+        supervisor,
+        "process_identity",
+        lambda pid: (
+            (r"d:\code\manga-live-translator\.venv\scripts\python.exe", new_created_at)
+            if pid == reused_pid
+            else (r"d:\code\manga-live-translator\.venv\scripts\pythonw.exe", new_created_at + 50_000_000)
+        ),
+    )
+
+    assert supervisor.live_supervisor_pid(tmp_path) is None
+    assert not pid_path.exists()
+
+    # acquire_pid_file should also reclaim a stale JSON record when creation time differs.
+    pid_path.write_text(json.dumps({"pid": reused_pid, "created_at": old_created_at}), encoding="utf-8")
+    assert supervisor.acquire_pid_file(tmp_path, own_pid=os.getpid()) is True
+    assert supervisor.read_pid(tmp_path) == os.getpid()
+
+
+@pytest.mark.parametrize(
+    "exe_path,delta_100ns",
+    [
+        (r"d:\code\manga-live-translator\.venv\scripts\pythonw.exe", 0),
+        (
+            r"c:\program files\windowsapps\pythonsoftwarefoundation.python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\pythonw3.12.exe",
+            5_000_000,  # 0.5s within 1s tolerance
+        ),
+    ],
+)
+def test_json_pid_matching_pythonw_and_created_at_is_recognized_live(tmp_path, monkeypatch, exe_path, delta_100ns):
+    """JSON server.pid with matching pythonw executable and created_at must be treated as live."""
+    live_pid = 31337
+    created_at = 134400380158222135
+    pid_path = tmp_path / "cache" / "server.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(json.dumps({"pid": live_pid, "created_at": created_at}), encoding="utf-8")
+
+    monkeypatch.setattr(supervisor, "pid_alive", lambda pid: pid == live_pid)
+    monkeypatch.setattr(
+        supervisor,
+        "process_identity",
+        lambda pid: (exe_path, created_at + delta_100ns) if pid == live_pid else None,
+    )
+
+    assert supervisor.live_supervisor_pid(tmp_path) == live_pid
+    assert pid_path.exists()
+    assert supervisor.acquire_pid_file(tmp_path, own_pid=os.getpid()) is False
+
+    monkeypatch.setattr(host.supervisor, "fetch_health", lambda cfg, timeout=1.5: None)
+    spawned = []
+    monkeypatch.setattr(host, "spawn_supervisor", lambda root: spawned.append(root) or 99999)
+    resp = host.handle_message({"action": "start_server"}, tmp_path)
+    assert resp == {"ok": True, "started": False, "already_running": True, "pid": live_pid}
+    assert spawned == []
+
+
+def test_read_pid_record_parses_json_legacy_and_rejects_malformed(tmp_path):
+    pid_path = tmp_path / "cache" / "server.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pid_path.write_text("12345\n", encoding="utf-8")
+    assert supervisor.read_pid_record(tmp_path) == (12345, None)
+    assert supervisor.read_pid(tmp_path) == 12345
+
+    pid_path.write_text(json.dumps({"pid": 12345, "created_at": 134400000000000000}), encoding="utf-8")
+    assert supervisor.read_pid_record(tmp_path) == (12345, 134400000000000000)
+    assert supervisor.read_pid(tmp_path) == 12345
+
+    for bad in ("", "not-a-pid", "-5", "0", "{bad json", '{"pid": true}', '{"pid": 123, "created_at": "bad"}'):
+        pid_path.write_text(bad, encoding="utf-8")
+        assert supervisor.read_pid_record(tmp_path) is None
+        assert supervisor.read_pid(tmp_path) is None
+
+
+def test_process_identity_and_acquire_pid_file_write_json_on_windows(tmp_path):
+    ident = supervisor.process_identity(os.getpid())
+    if os.name == "nt":
+        assert ident is not None
+        exe_lower, created_at = ident
+        assert exe_lower == exe_lower.lower()
+        assert supervisor._is_python_executable(exe_lower)
+        assert isinstance(created_at, int) and created_at > 0
+        assert supervisor.acquire_pid_file(tmp_path, own_pid=os.getpid()) is True
+        raw = json.loads((tmp_path / "cache" / "server.pid").read_text(encoding="utf-8"))
+        assert raw["pid"] == os.getpid()
+        assert raw["created_at"] == created_at
+        assert supervisor.live_supervisor_pid(tmp_path) == os.getpid()
+
+
+def test_monkeypatched_pid_alive_backward_compatibility(tmp_path, monkeypatch):
+    """Existing-style unit tests that monkeypatch only supervisor.pid_alive keep working."""
+    fake_pid = 88888888
+    pid_path = tmp_path / "cache" / "server.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(fake_pid), encoding="utf-8")
+
+    monkeypatch.setattr(supervisor, "pid_alive", lambda pid: pid == fake_pid)
+    assert supervisor.live_supervisor_pid(tmp_path) == fake_pid
+
+    monkeypatch.setattr(supervisor, "pid_alive", lambda pid: False)
+    assert supervisor.live_supervisor_pid(tmp_path) is None
+    assert not pid_path.exists()
