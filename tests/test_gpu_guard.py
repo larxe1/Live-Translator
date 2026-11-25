@@ -579,3 +579,106 @@ def test_lazy_hybrid_idle_watchdog_and_health_state_reset(
         assert app.state.loading_stage == "ready"
 
 
+def test_gpu_snapshot_ttl_is_5s_and_caches_within_window(monkeypatch) -> None:
+    assert gg._SNAPSHOT_TTL_SEC == pytest.approx(5.0)
+    calls = {"n": 0}
+    clock = {"now": 100.0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return SimpleNamespace(
+            returncode=0,
+            stdout="NVIDIA GeForce RTX 3070, 2100, 8192, 5900, 50, 10, 45.0, 240.0\n",
+        )
+
+    monkeypatch.setattr(gg, "_snapshot_cache", None)
+    monkeypatch.setattr(gg.subprocess, "run", fake_run)
+    monkeypatch.setattr(gg.time, "monotonic", lambda: clock["now"])
+
+    s1 = gg.get_gpu_snapshot()
+    assert calls["n"] == 1
+
+    clock["now"] = 104.5
+    s2 = gg.get_gpu_snapshot()
+    assert calls["n"] == 1
+    assert s2 == s1
+
+    clock["now"] = 105.1
+    gg.get_gpu_snapshot()
+    assert calls["n"] == 2
+
+
+def test_health_lazy_hybrid_skips_is_healthy_when_process_not_alive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "TEST_HYBRID_KEY_123456")
+    monkeypatch.setattr(
+        gg,
+        "get_gpu_snapshot",
+        lambda force_refresh=False: _make_snap(name="RTX 3070"),
+    )
+
+    class FakeDeadOrUnloadedMgr:
+        def __init__(self) -> None:
+            self._process = None
+            self.active_model_filename = ""
+            self.model_name = "shisa-v2-qwen2.5-7b.i1-Q4_K_M.gguf"
+            self.health_probe_calls = 0
+
+        def is_healthy(self) -> bool:
+            self.health_probe_calls += 1
+            raise AssertionError("mgr.is_healthy() must not be called when lazy llama-server is unloaded")
+
+        def available_local_models(self) -> dict[str, bool]:
+            return {"ja": True}
+
+    mgr = FakeDeadOrUnloadedMgr()
+    cfg = AppConfig(project_root=tmp_path, translation_mode="hybrid")
+    app = create_app(
+        cfg=cfg,
+        cache=TranslationCache(tmp_path / "lazy_health.db"),
+        memory=ChapterMemoryStore(),
+        llama_manager=mgr,  # type: ignore[arg-type]
+        auto_load_models=False,
+    )
+    app.state.ready = True
+    app.state.loading_stage = "ready"
+    app.state.llm_lazy = True
+
+    with TestClient(app) as client:
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ready"] is True
+        assert data["llm_ready"] is False
+        assert data["active_local_model"] == ""
+        assert mgr.health_probe_calls == 0
+
+    # Mocked manager without _process must still be probed for backward compatibility.
+    class FakeMockMgrWithoutProcess:
+        model_name = "shisa-v2-qwen2.5-7b.i1-Q4_K_M.gguf"
+        active_model_filename = "shisa-v2-qwen2.5-7b.i1-Q4_K_M.gguf"
+
+        def __init__(self) -> None:
+            self.health_probe_calls = 0
+
+        def is_healthy(self) -> bool:
+            self.health_probe_calls += 1
+            return True
+
+        def available_local_models(self) -> dict[str, bool]:
+            return {"ja": True}
+
+    mock_mgr = FakeMockMgrWithoutProcess()
+    app.state.llama_manager = mock_mgr  # type: ignore[assignment]
+    with TestClient(app) as client:
+        resp2 = client.get("/health")
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["ready"] is True
+        assert data2["llm_ready"] is True
+        assert mock_mgr.health_probe_calls == 1
+
+
+

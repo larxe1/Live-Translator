@@ -75,7 +75,11 @@
       return `canvas:${el.dataset?.mltCanvasId || el.id || `${el.width}x${el.height}`}`;
     }
     const attrDataSrc =
-      typeof el.getAttribute === "function" ? el.getAttribute("data-src") : "";
+      typeof el.getAttribute === "function"
+        ? el.getAttribute("data-src") ||
+          el.getAttribute("data-original") ||
+          el.getAttribute("data-lazy-src")
+        : "";
     const attrSrc = typeof el.getAttribute === "function" ? el.getAttribute("src") : "";
     return String(el.currentSrc || el.src || attrSrc || attrDataSrc || "").trim();
   }
@@ -296,6 +300,7 @@
     let healthPollTimer = null;
     let healthPollTries = 0;
     let preloadTimer = null;
+    let viewportSyncTimer = null;
     let startRequestInFlight = false;
     const healthPollIntervalMs = deps.healthPollIntervalMs ?? 2000;
     const healthPollMaxTries = deps.healthPollMaxTries ?? 90;
@@ -406,6 +411,22 @@
       return bottom > -250 && rect.top < vh + 250 && right > 0 && rect.left < vw;
     }
 
+    function syncVisibleCandidatesFromViewport() {
+      const vh = Number(win?.innerHeight || 0);
+      const vw = Number(win?.innerWidth || 0);
+      if (vh <= 0 || vw <= 0) return;
+      for (const el of candidates) {
+        if (!el || typeof el.getBoundingClientRect !== "function") continue;
+        const rect = el.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+        if (isElementInViewport(el)) {
+          visibleSet.add(el);
+        } else {
+          visibleSet.delete(el);
+        }
+      }
+    }
+
     function resolveActiveGlossary(bySeries, flat) {
       if (bySeries && typeof bySeries === "object") {
         return Object.prototype.hasOwnProperty.call(bySeries, seriesId)
@@ -459,6 +480,7 @@
       if (contextInvalidated) return;
       contextInvalidated = true;
       stopHealthPoll();
+      stopViewportSyncTimer();
       stopObservers();
       inFlightByEl.clear();
       clearAllPageLoadingBadges();
@@ -565,6 +587,10 @@
       lastErrorLabel = "";
       offlineFailedEls.clear();
       failedByEl.clear();
+      if (enabled && !contextInvalidated) {
+        scanDocumentCandidates();
+        syncVisibleCandidatesFromViewport();
+      }
       refreshStatusIndicator();
       if (enabled && !contextInvalidated) {
         void refreshVisibleAndLookahead();
@@ -689,6 +715,23 @@
         }
       });
 
+      const rescanBtn = doc.createElement("button");
+      rescanBtn.type = "button";
+      rescanBtn.className = "mlt-pill-btn";
+      rescanBtn.textContent = "↻";
+      rescanBtn.title = "Scan & translate visible pages";
+      if (rescanBtn.dataset) rescanBtn.dataset.mltRescan = "true";
+      if (typeof rescanBtn.setAttribute === "function") {
+        rescanBtn.setAttribute("data-mlt-rescan", "true");
+      }
+      rescanBtn.addEventListener("click", (evt) => {
+        if (evt && typeof evt.stopPropagation === "function") {
+          evt.stopPropagation();
+        }
+        if (contextInvalidated) return;
+        void rescanAndTranslate();
+      });
+
       const collapseBtn = doc.createElement("button");
       collapseBtn.type = "button";
       collapseBtn.className = "mlt-pill-btn";
@@ -701,12 +744,18 @@
       });
 
       pill.addEventListener("click", (evt) => {
-        if (contextInvalidated && evt?.target !== collapseBtn && typeof win?.location?.reload === "function") {
+        if (
+          contextInvalidated &&
+          evt?.target !== collapseBtn &&
+          evt?.target !== rescanBtn &&
+          typeof win?.location?.reload === "function"
+        ) {
           win.location.reload();
         }
       });
 
       header.appendChild(statusWrap);
+      header.appendChild(rescanBtn);
       header.appendChild(collapseBtn);
       pill.appendChild(header);
 
@@ -850,11 +899,38 @@
       }
     }
 
+    function stopViewportSyncTimer() {
+      if (viewportSyncTimer !== null) {
+        clearTimeoutImpl(viewportSyncTimer);
+        viewportSyncTimer = null;
+      }
+    }
+
     function cancelAllActive() {
       stopPreloadTimer();
+      stopViewportSyncTimer();
       stopHealthPoll();
       for (const [el] of [...inFlightByEl.entries()]) {
         cancelElementInFlight(el);
+      }
+    }
+
+    function handleImageLoaded(el) {
+      if (!enabled || contextInvalidated || !el) return;
+      const nextSrc = getElementSourceKey(el);
+      const prevSrc = lastSourceByEl.get(el);
+      if (prevSrc && nextSrc && nextSrc !== prevSrc) {
+        lastSourceByEl.set(el, nextSrc);
+        bumpGeneration(el);
+        overlayApi?.clearOverlay(el);
+        completedByEl.delete(el);
+        failedByEl.delete(el);
+        cancelElementInFlight(el);
+      }
+      registerElement(el);
+      if (isCandidateMangaElement(el)) {
+        addCandidate(el);
+        refreshVisibleAndLookahead();
       }
     }
 
@@ -867,21 +943,7 @@
         // Persistent load listener: handles both initial async loads AND lazy-loaders
         // that swap src onto an already-complete 1x1 placeholder <img>.
         const onLoad = () => {
-          if (!enabled || contextInvalidated) return;
-          const nextSrc = getElementSourceKey(el);
-          const prevSrc = lastSourceByEl.get(el);
-          if (prevSrc && nextSrc && nextSrc !== prevSrc) {
-            lastSourceByEl.set(el, nextSrc);
-            bumpGeneration(el);
-            overlayApi?.clearOverlay(el);
-            completedByEl.delete(el);
-            failedByEl.delete(el);
-            cancelElementInFlight(el);
-          }
-          if (isCandidateMangaElement(el)) {
-            addCandidate(el);
-            refreshVisibleAndLookahead();
-          }
+          handleImageLoaded(el);
         };
         loadListeners.set(el, onLoad);
         el.addEventListener("load", onLoad);
@@ -893,7 +955,12 @@
     }
 
     function addCandidate(el) {
-      if (candidateSet.has(el)) return;
+      if (candidateSet.has(el)) {
+        if (isElementInViewport(el)) {
+          visibleSet.add(el);
+        }
+        return;
+      }
       candidateSet.add(el);
       candidates.push(el);
       if (!generations.has(el)) {
@@ -1060,7 +1127,44 @@
         lastErrorLabel = msg.length > 34 ? `Error: ${msg.slice(0, 31)}...` : `Error: ${msg}`;
       };
 
-      const translateViaPort = () => {
+      function isImageFetchError(detail) {
+        return /failed to fetch image/i.test(String(detail || ""));
+      }
+
+      function captureImageElementToBase64(imgEl) {
+        if (
+          !imgEl ||
+          String(imgEl.tagName || "").toUpperCase() !== "IMG" ||
+          !imgEl.complete ||
+          !(Number(imgEl.naturalWidth) > 0) ||
+          !(Number(imgEl.naturalHeight) > 0) ||
+          !doc ||
+          typeof doc.createElement !== "function"
+        ) {
+          return "";
+        }
+        try {
+          const canvas = doc.createElement("canvas");
+          if (
+            !canvas ||
+            typeof canvas.getContext !== "function" ||
+            typeof canvas.toDataURL !== "function"
+          ) {
+            return "";
+          }
+          canvas.width = Number(imgEl.naturalWidth);
+          canvas.height = Number(imgEl.naturalHeight);
+          const ctx = canvas.getContext("2d");
+          if (!ctx || typeof ctx.drawImage !== "function") return "";
+          ctx.drawImage(imgEl, 0, 0);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+          return String(dataUrl || "").split(",")[1] || "";
+        } catch (_err) {
+          return ""; // Cross-origin tainted canvas; fail gracefully.
+        }
+      }
+
+      const translateViaPort = (attemptUrl, attemptBase64, attemptReqId, allowCanvasRetry) => {
         if (typeof connectPort !== "function") return null;
         let port;
         try {
@@ -1081,7 +1185,7 @@
           let session = null;
           const bubblesById = new Map();
 
-          const settle = (value, fallbackToMessage = false) => {
+          const settle = (value, fallbackToMessage = false, retryCanvasError = "") => {
             if (settled) return;
             settled = true;
             entry.cancelPort = null;
@@ -1090,7 +1194,7 @@
             } catch (_err) {
               // Ignore already disconnected port.
             }
-            resolve({ handled: !fallbackToMessage, value });
+            resolve({ handled: !fallbackToMessage, value, retryCanvasError });
           };
           entry.cancelPort = () => {
             session?.destroy?.();
@@ -1180,6 +1284,9 @@
                 markServerOffline("Launcher missing — run setup.ps1");
               } else if (evt.offline) {
                 markServerOffline("Offline — Click to start");
+              } else if (allowCanvasRetry && isImageFetchError(errMsg)) {
+                settle(null, false, errMsg);
+                return;
               } else {
                 recordElementError(errMsg);
               }
@@ -1207,8 +1314,8 @@
           try {
             const startMsg = {
               type: "START",
-              imageUrl,
-              imageBase64,
+              imageUrl: attemptUrl,
+              imageBase64: attemptBase64,
               refererUrl: win.location?.href || "",
               lang: langMode,
               chapterId,
@@ -1216,7 +1323,7 @@
               includeFloating,
               priority,
               glossary,
-              requestId,
+              requestId: attemptReqId,
             };
             if (translationMode) {
               startMsg.translationMode = translationMode;
@@ -1234,58 +1341,93 @@
       };
 
       try {
-        const portPromise = translateViaPort();
-        if (portPromise) {
-          const portOutcome = await portPromise;
-          if (portOutcome && portOutcome.handled) {
-            return portOutcome.value;
+        let attemptUrl = imageUrl;
+        let attemptBase64 = imageBase64;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const allowCanvasRetry = attempt === 0 && Boolean(attemptUrl) && !attemptBase64;
+          if (attempt > 0) {
+            entry.requestId = `mlt-${++reqCounter}-${Date.now()}`;
+            showPageLoadingBadge(el, "Translating...");
           }
-        }
 
-        if (isStale() || typeof sendMessage !== "function") return null;
-
-        const msgPayload = {
-          type: "TRANSLATE_IMAGE",
-          imageUrl,
-          imageBase64,
-          refererUrl: win.location?.href || "",
-          lang: langMode,
-          chapterId,
-          seriesId,
-          includeFloating,
-          priority,
-          glossary,
-          requestId,
-        };
-        if (translationMode) {
-          msgPayload.translationMode = translationMode;
-        }
-        const result = await sendMessage(msgPayload);
-
-        // Stale-response guard: discard if disabled, invalidated, generation changed, or src mutated.
-        if (isStale()) return null;
-
-        if (!result || result.ok === false || !result.data) {
-          if (result && !result.aborted) {
-            if (isContextInvalidatedError(result.error)) {
-              handleContextInvalidated();
-            } else if (result.starting) {
-              beginStartingWatch();
-            } else if (result.hostMissing) {
-              markServerOffline("Launcher missing — run setup.ps1");
-            } else if (result.offline) {
-              markServerOffline("Offline — Click to start");
-            } else {
-              recordElementError(result.error);
+          const portPromise = translateViaPort(
+            attemptUrl,
+            attemptBase64,
+            entry.requestId,
+            allowCanvasRetry
+          );
+          if (portPromise) {
+            const portOutcome = await portPromise;
+            if (portOutcome && portOutcome.retryCanvasError) {
+              if (isStale()) return null;
+              const captured = captureImageElementToBase64(el);
+              if (captured) {
+                attemptUrl = "";
+                attemptBase64 = captured;
+                continue;
+              }
+              recordElementError(portOutcome.retryCanvasError);
+              return null;
+            }
+            if (portOutcome && portOutcome.handled) {
+              return portOutcome.value;
             }
           }
-          return null;
-        }
 
-        const data = result.data;
-        finishSuccess(data);
-        overlayApi?.renderOverlay(el, data, { document: doc, window: win });
-        return data;
+          if (isStale() || typeof sendMessage !== "function") return null;
+
+          const msgPayload = {
+            type: "TRANSLATE_IMAGE",
+            imageUrl: attemptUrl,
+            imageBase64: attemptBase64,
+            refererUrl: win.location?.href || "",
+            lang: langMode,
+            chapterId,
+            seriesId,
+            includeFloating,
+            priority,
+            glossary,
+            requestId: entry.requestId,
+          };
+          if (translationMode) {
+            msgPayload.translationMode = translationMode;
+          }
+          const result = await sendMessage(msgPayload);
+
+          // Stale-response guard: discard if disabled, invalidated, generation changed, or src mutated.
+          if (isStale()) return null;
+
+          if (!result || result.ok === false || !result.data) {
+            if (result && !result.aborted) {
+              if (isContextInvalidatedError(result.error)) {
+                handleContextInvalidated();
+              } else if (result.starting) {
+                beginStartingWatch();
+              } else if (result.hostMissing) {
+                markServerOffline("Launcher missing — run setup.ps1");
+              } else if (result.offline) {
+                markServerOffline("Offline — Click to start");
+              } else if (allowCanvasRetry && isImageFetchError(result.error)) {
+                const captured = captureImageElementToBase64(el);
+                if (captured) {
+                  attemptUrl = "";
+                  attemptBase64 = captured;
+                  continue;
+                }
+                recordElementError(result.error);
+              } else {
+                recordElementError(result.error);
+              }
+            }
+            return null;
+          }
+
+          const data = result.data;
+          finishSuccess(data);
+          overlayApi?.renderOverlay(el, data, { document: doc, window: win });
+          return data;
+        }
+        return null;
       } catch (err) {
         if (isContextInvalidatedError(err)) {
           handleContextInvalidated();
@@ -1296,7 +1438,7 @@
       } finally {
         removePageLoadingBadge(el);
         const cur = inFlightByEl.get(el);
-        if (cur && cur.requestId === requestId) {
+        if (cur && cur === entry) {
           inFlightByEl.delete(el);
         }
         if (!contextInvalidated) {
@@ -1361,6 +1503,13 @@
     function refreshVisibleAndLookahead() {
       if (!enabled || contextInvalidated) return;
 
+      if (candidates.length === 0) {
+        scanDocumentCandidates();
+      }
+      if (visibleSet.size === 0 && candidates.length > 0) {
+        syncVisibleCandidatesFromViewport();
+      }
+
       sortCandidatesInDomOrder();
 
       const { immediate, lookahead } = computeLookaheadTargets(
@@ -1409,6 +1558,31 @@
         cancelElementInFlight(el);
       }
       refreshVisibleAndLookahead();
+    }
+
+    function rescanAndTranslate() {
+      if (!enabled || contextInvalidated) return null;
+      scanDocumentCandidates();
+      failedByEl.clear();
+      offlineFailedEls.clear();
+      lastErrorLabel = "";
+      syncVisibleCandidatesFromViewport();
+      for (const el of candidates) {
+        if (!visibleSet.has(el)) continue;
+        const done = completedByEl.get(el);
+        const bubbleCount = Array.isArray(done?.response?.bubbles)
+          ? done.response.bubbles.length
+          : 0;
+        if (done && bubbleCount === 0) {
+          const cacheKey = getCacheKey(getElementSourceKey(el));
+          if (cacheKey) pageCache.delete(cacheKey);
+          bumpGeneration(el);
+          completedByEl.delete(el);
+          overlayApi?.clearOverlay(el);
+        }
+      }
+      refreshStatusIndicator();
+      return refreshVisibleAndLookahead();
     }
 
     function setVisibility(el, isVisible) {
@@ -1480,7 +1654,7 @@
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ["src", "srcset", "data-src"],
+            attributeFilter: ["src", "srcset", "data-src", "data-original", "data-lazy-src"],
           });
         }
       }
@@ -1636,12 +1810,27 @@
 
     function teardown() {
       disable();
+      stopViewportSyncTimer();
+      if (typeof doc?.removeEventListener === "function" && onCaptureImgLoad) {
+        doc.removeEventListener("load", onCaptureImgLoad, true);
+      }
       if (typeof win?.removeEventListener === "function") {
         win.removeEventListener("pagehide", onUnload);
         win.removeEventListener("beforeunload", onUnload);
         win.removeEventListener("scroll", onViewportMove);
         win.removeEventListener("resize", onViewportMove);
       }
+    }
+
+    let onCaptureImgLoad = null;
+    if (typeof doc?.addEventListener === "function") {
+      onCaptureImgLoad = (evt) => {
+        if (!enabled || contextInvalidated) return;
+        const target = evt?.target;
+        if (!target || String(target.tagName || "").toUpperCase() !== "IMG") return;
+        handleImageLoaded(target);
+      };
+      doc.addEventListener("load", onCaptureImgLoad, true);
     }
 
     let onUnload = null;
@@ -1654,6 +1843,15 @@
         if (pageLoadingBadges.size > 0) {
           repositionAllLoadingBadges();
         }
+        if (!enabled || contextInvalidated) return;
+        stopViewportSyncTimer();
+        viewportSyncTimer = setTimeoutImpl(() => {
+          viewportSyncTimer = null;
+          if (!enabled || contextInvalidated) return;
+          scanDocumentCandidates();
+          syncVisibleCandidatesFromViewport();
+          void refreshVisibleAndLookahead();
+        }, 180);
       };
       win.addEventListener("pagehide", onUnload);
       win.addEventListener("beforeunload", onUnload);
@@ -1667,6 +1865,7 @@
       disable,
       teardown,
       notifyEngineReady,
+      rescanAndTranslate,
       cancelAllActive,
       isEnabled: () => enabled,
       isContextInvalidated: () => contextInvalidated,

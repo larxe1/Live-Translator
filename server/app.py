@@ -636,9 +636,13 @@ def create_app(
         gpu_guard_status = await asyncio.to_thread(gpu_guard_obj.status)
         mgr: LlamaServerManager | None = app.state.llama_manager
         if mgr is not None:
-            if _is_llama_proc_alive(mgr):
+            proc_alive = _is_llama_proc_alive(mgr)
+            if proc_alive:
                 app.state.llm_idle_unloaded = False
-            llm_ready = False if app.state.llm_idle_unloaded else await asyncio.to_thread(mgr.is_healthy)
+            skip_llm_probe = bool(app.state.llm_idle_unloaded) or (
+                hasattr(mgr, "_process") and not proc_alive and bool(app.state.llm_lazy)
+            )
+            llm_ready = False if skip_llm_probe else await asyncio.to_thread(mgr.is_healthy)
             active_local_model = str(getattr(mgr, "active_model_filename", "") or "") if llm_ready else ""
             llm_model = active_local_model or getattr(mgr, "model_name", live_cfg.llm_repo_id)
             available_local_models = await asyncio.to_thread(mgr.available_local_models)

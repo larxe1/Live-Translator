@@ -1244,3 +1244,107 @@ test("19. content controller honors translationMode in TRANSLATE_IMAGE fallback 
   assert.equal(netErr.ok, false);
   assert.match(netErr.error, /Failed to fetch/);
 });
+
+test("20. floating HUD pill rescan button scans, clears errors, re-translates 0-bubble pages, and MO observes lazy attributes", async () => {
+  const doc = createMockDocument();
+  const win = createMockWindow(doc, "https://klmanga.black/manga/ch1");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+
+  let observedMutationOpts = null;
+  class SpyMO {
+    observe(_root, opts) {
+      observedMutationOpts = opts;
+    }
+    disconnect() {}
+  }
+
+  let translateCount = 0;
+  const calls = [];
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "klmanga.black",
+    storage: {
+      async get() {
+        return { enabledDomains: { "klmanga.black": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "TRANSLATE_IMAGE") {
+        translateCount += 1;
+        calls.push(msg.imageUrl);
+        if (translateCount === 1) {
+          // Simulate initial 0-bubble completion (e.g. page wasn't fully rendered yet)
+          return { ok: true, data: { lang: "ja", width: 800, height: 1200, bubbles: [] } };
+        }
+        return {
+          ok: true,
+          data: {
+            lang: "ja",
+            width: 800,
+            height: 1200,
+            bubbles: [
+              {
+                id: 0,
+                bbox: { x1: 80, y1: 80, x2: 280, y2: 240 },
+                safe_box: { x1: 90, y1: 90, x2: 270, y2: 230 },
+                bg_color: "#FFFFFF",
+                text_color: "#111111",
+                is_dark: false,
+                original: "見つけた！",
+                translated: "Found it!",
+              },
+            ],
+          },
+        };
+      }
+      return { ok: true };
+    },
+    overlayApi: overlay,
+    MutationObserver: SpyMO,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  assert.deepEqual(observedMutationOpts.attributeFilter, [
+    "src",
+    "srcset",
+    "data-src",
+    "data-original",
+    "data-lazy-src",
+  ]);
+
+  // Verify compact clickable ↻ rescan button exists on the floating pill
+  const pill = doc.querySelector(".mlt-pill");
+  assert.ok(pill, "Expected floating .mlt-pill to be mounted");
+  const buttons = pill.querySelectorAll("button");
+  const rescanBtn = buttons.find((b) => b.dataset?.mltRescan === "true" || b.getAttribute("data-mlt-rescan") === "true");
+  assert.ok(rescanBtn, "Expected data-mlt-rescan button on floating pill");
+  assert.equal(rescanBtn.textContent, "↻");
+  assert.equal(rescanBtn.title, "Scan & translate visible pages");
+
+  // Add a visible manga image AFTER init (simulating lazy DOM injection missed by observer)
+  const img = doc.createElement("img");
+  img.src = "https://cdn.klmanga.black/page-01.jpg";
+  img.width = 800;
+  img.height = 1200;
+  img.naturalWidth = 800;
+  img.naturalHeight = 1200;
+  doc.body.appendChild(img);
+  assert.equal(calls.length, 0);
+
+  // First click on ↻ discovers and translates the visible page (returns 0 bubbles)
+  rescanBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0], "https://cdn.klmanga.black/page-01.jpg");
+
+  // Second click on ↻ re-translates the visible 0-bubble page (bypassing stale 0-bubble cache) and renders overlay
+  rescanBtn.dispatchEvent({ type: "click" });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(calls.length, 2);
+  assert.equal(doc.querySelector(".mlt-bubble-text")?.textContent, "Found it!");
+
+  controller.teardown();
+});

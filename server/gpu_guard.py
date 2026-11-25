@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SNAPSHOT_TTL_SEC = 2.0
+_SNAPSHOT_TTL_SEC = 5.0
 _snapshot_lock = threading.Lock()
 _snapshot_cache: tuple[float, GpuSnapshot] | None = None
 
@@ -122,7 +122,7 @@ def _query_nvidia_smi() -> GpuSnapshot:
 
 
 def get_gpu_snapshot(force_refresh: bool = False) -> GpuSnapshot:
-    """Return cached GPU telemetry (2s TTL) via nvidia-smi; never raises."""
+    """Return cached GPU telemetry (5s TTL) via nvidia-smi; never raises."""
     global _snapshot_cache
     now = time.monotonic()
     if not force_refresh:

@@ -51,6 +51,7 @@ let feedbackTimer = null;
 
 const HEALTH_POLL_INTERVAL_MS = 1500;
 const HEALTH_POLL_MAX_MS = 180000;
+const HEALTH_SNAPSHOT_MAX_AGE_MS = 60000;
 const OFFLINE_TEXT = "Offline — click Start Engine";
 const STAGE_LABELS = {
   initializing: "Initializing...",
@@ -70,9 +71,9 @@ let healthPollStartedAt = 0;
 
 function getLocalVersion() {
   try {
-    return chrome.runtime?.getManifest?.()?.version || "1.3.2";
+    return chrome.runtime?.getManifest?.()?.version || "1.3.3";
   } catch (_err) {
-    return "1.3.2";
+    return "1.3.3";
   }
 }
 
@@ -460,6 +461,33 @@ async function notifyActiveTabEngineReady() {
  * Renders current server health and returns { online, ready, starting }.
  * Never schedules polling itself; callers decide.
  */
+function applyCachedHealthSnapshot(
+  snapshot,
+  nowMs = Date.now(),
+  dom = {
+    statusDot,
+    statusText,
+    statusVram,
+    gpuGuardNotice,
+    engineModeSelect,
+    geminiKeyStatus,
+  }
+) {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  const data = snapshot.data;
+  const savedAt = Number(snapshot.savedAt || 0);
+  if (!data || data.ready !== true) return false;
+  if (!Number.isFinite(savedAt) || savedAt <= 0 || nowMs - savedAt >= HEALTH_SNAPSHOT_MAX_AGE_MS) {
+    return false;
+  }
+  if (data.extension_build_id) {
+    renderVersionBadge(data.extension_build_id, data.extension_version || getLocalVersion());
+  }
+  applyHealthUI(data, dom);
+  setEngineControls("online");
+  return true;
+}
+
 async function refreshHealth() {
   const res = await sendBgMessage({ type: "GET_HEALTH" });
   if (!res || !res.ok || !res.data) {
@@ -468,6 +496,11 @@ async function refreshHealth() {
       renderStarting();
     } else {
       renderOffline();
+      try {
+        void chrome.storage?.local?.remove?.(["lastHealthSnapshot"]);
+      } catch (_err) {
+        // Ignore storage remove failures.
+      }
     }
     return { online: false, ready: false, starting };
   }
@@ -479,6 +512,13 @@ async function refreshHealth() {
     engineStarting = false;
     applyHealthUI(h);
     setEngineControls("online");
+    try {
+      void chrome.storage?.local?.set?.({
+        lastHealthSnapshot: { data: h, savedAt: Date.now() },
+      });
+    } catch (_err) {
+      // Ignore storage write failures.
+    }
     void notifyActiveTabEngineReady();
     return { online: true, ready: true, starting: false };
   }
@@ -674,6 +714,7 @@ async function initPopup() {
         "glossariesBySeries",
         "serverUrl",
         "autoUpdateEnabled",
+        "lastHealthSnapshot",
       ])) || {};
   } catch (_err) {
     stored = {};
@@ -718,6 +759,13 @@ async function initPopup() {
   serverUrlInput.value = currentServerUrl;
   if (autoUpdateToggle) {
     autoUpdateToggle.checked = stored.autoUpdateEnabled !== false;
+  }
+
+  if (
+    stored.lastHealthSnapshot?.data?.ready === true &&
+    Date.now() - Number(stored.lastHealthSnapshot.savedAt || 0) < HEALTH_SNAPSHOT_MAX_AGE_MS
+  ) {
+    applyCachedHealthSnapshot(stored.lastHealthSnapshot);
   }
 
   if (currentHostname && currentTabId) {
@@ -996,6 +1044,11 @@ if (shutdownBtn) {
     engineStarting = false;
     const res = await sendBgMessage({ type: "SHUTDOWN_SERVER" });
     if (res?.ok) {
+      try {
+        void chrome.storage?.local?.remove?.(["lastHealthSnapshot"]);
+      } catch (_err) {
+        // Ignore storage remove failures.
+      }
       renderOffline("Offline — VRAM Freed");
       if (updateStatusText) updateStatusText.textContent = "Server offline";
       showFeedback("Local GPU engine stopped");
@@ -1120,5 +1173,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatGeminiKeyStatus,
     applySettingsResponse,
     applyHealthUI,
+    applyCachedHealthSnapshot,
+    HEALTH_SNAPSHOT_MAX_AGE_MS,
   };
 }

@@ -1821,3 +1821,429 @@ test("18. stream translate status updates badge for Gemini/Local and forwards tr
   assert.equal(seenStreamBodies.length, 1);
   assert.equal(seenStreamBodies[0].translation_mode, "local");
 });
+
+test("19. capture-phase load, handleEngineReady, and debounced scroll recover lazy-loaded / src-swapped pages", async () => {
+  const { doc, win } = createMinimalDom("https://klmanga.black/chapter-1");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+
+  const docCaptureListeners = new Map();
+  doc.addEventListener = (type, fn, capture) => {
+    const key = `${type}:${Boolean(capture)}`;
+    if (!docCaptureListeners.has(key)) docCaptureListeners.set(key, []);
+    docCaptureListeners.get(key).push(fn);
+  };
+  doc.removeEventListener = (type, fn, capture) => {
+    const key = `${type}:${Boolean(capture)}`;
+    const arr = docCaptureListeners.get(key) || [];
+    docCaptureListeners.set(
+      key,
+      arr.filter((f) => f !== fn)
+    );
+  };
+
+  const startedUrls = [];
+  let failOnceUrl = "https://cdn.klmanga.black/ch1-p2.jpg";
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "klmanga.black",
+    storage: {
+      async get() {
+        return { enabledDomains: { "klmanga.black": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          startedUrls.push(msg.imageUrl);
+          setTimeout(() => {
+            if (msg.imageUrl === failOnceUrl) {
+              failOnceUrl = "";
+              for (const fn of listeners) fn({ type: "error", detail: "Temporary error" });
+              return;
+            }
+            for (const fn of listeners) {
+              fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [] });
+              fn({ type: "done", response: { lang: "ja", width: 800, height: 1200, bubbles: [] } });
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  assert.equal(startedUrls.length, 0);
+  assert.equal((docCaptureListeners.get("load:true") || []).length, 1);
+
+  // (a) Dynamically injected lazy <img> finishes loading -> capture-phase load catches and translates it.
+  const img1 = doc.createElement("img");
+  img1.src = "https://cdn.klmanga.black/ch1-p1.jpg";
+  doc.body.appendChild(img1);
+  for (const fn of docCaptureListeners.get("load:true") || []) {
+    fn({ target: img1 });
+  }
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(startedUrls, ["https://cdn.klmanga.black/ch1-p1.jpg"]);
+
+  // (b) Existing candidate swaps src while outside visibleSet -> addCandidate re-adds to visibleSet.
+  controller.setVisibility(img1, false);
+  img1.src = "https://cdn.klmanga.black/ch1-p1-hd.jpg";
+  controller.handleSourceMutation(img1);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(startedUrls, [
+    "https://cdn.klmanga.black/ch1-p1.jpg",
+    "https://cdn.klmanga.black/ch1-p1-hd.jpg",
+  ]);
+
+  // (c) Newly inserted page 2 initially fails, then notifyEngineReady() re-scans, clears failures, and translates.
+  const img2 = doc.createElement("img");
+  img2.src = "https://cdn.klmanga.black/ch1-p2.jpg";
+  doc.body.appendChild(img2);
+  controller.notifyEngineReady();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(startedUrls.filter((u) => u.endsWith("ch1-p2.jpg")).length, 1);
+
+  controller.notifyEngineReady();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(startedUrls.filter((u) => u.endsWith("ch1-p2.jpg")).length, 2);
+
+  // (d) Page 3 added off-observer -> debounced scroll (180ms) scans, syncs viewport, and translates.
+  const img3 = doc.createElement("img");
+  img3.src = "https://cdn.klmanga.black/ch1-p3.jpg";
+  doc.body.appendChild(img3);
+  win.dispatchEvent({ type: "scroll" });
+  await new Promise((r) => setTimeout(r, 230));
+  assert.ok(startedUrls.includes("https://cdn.klmanga.black/ch1-p3.jpg"));
+
+  controller.teardown();
+  assert.equal((docCaptureListeners.get("load:true") || []).length, 0);
+});
+
+test("20. same-tab canvas pixel fallback retries once with imageBase64 when imageUrl fetch fails", async () => {
+  const { doc, win } = createMinimalDom("https://klmanga.black/chapter-2");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+
+  let drawCalls = 0;
+  let throwTainted = false;
+  const origCreateElement = doc.createElement;
+  doc.createElement = (tag) => {
+    const el = origCreateElement(tag);
+    if (String(tag).toLowerCase() === "canvas") {
+      el.getContext = (kind) => {
+        if (kind !== "2d") return null;
+        return {
+          drawImage() {
+            drawCalls += 1;
+          },
+        };
+      };
+      el.toDataURL = (mime, quality) => {
+        if (throwTainted) throw new Error("SecurityError: tainted canvas");
+        assert.equal(mime, "image/jpeg");
+        assert.equal(quality, 0.92);
+        return "data:image/jpeg;base64,RkFMTEJBQ0tfQllURVM=";
+      };
+    }
+    return el;
+  };
+
+  const img = doc.createElement("img");
+  img.src = "https://hotlink-blocked.example/page-1.jpg";
+  doc.body.appendChild(img);
+
+  const sentStarts = [];
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "klmanga.black",
+    storage: {
+      async get() {
+        return { enabledDomains: { "klmanga.black": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          sentStarts.push({ imageUrl: msg.imageUrl, imageBase64: msg.imageBase64 });
+          setTimeout(() => {
+            if (msg.imageUrl) {
+              for (const fn of listeners) {
+                fn({ type: "error", detail: "Failed to fetch image (403)" });
+              }
+            } else {
+              for (const fn of listeners) {
+                fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [] });
+                fn({
+                  type: "done",
+                  response: {
+                    lang: "ja",
+                    width: 800,
+                    height: 1200,
+                    bubbles: [
+                      {
+                        id: 0,
+                        bbox: [10, 10, 120, 90],
+                        safe_box: [14, 14, 116, 86],
+                        original: "テスト",
+                        translated: "Canvas Fallback Worked!",
+                      },
+                    ],
+                  },
+                });
+              }
+            }
+          }, 2);
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  await new Promise((r) => setTimeout(r, 35));
+
+  assert.equal(drawCalls, 1);
+  assert.equal(sentStarts.length, 2);
+  assert.equal(sentStarts[0].imageUrl, "https://hotlink-blocked.example/page-1.jpg");
+  assert.equal(sentStarts[0].imageBase64, "");
+  assert.equal(sentStarts[1].imageUrl, "");
+  assert.equal(sentStarts[1].imageBase64, "RkFMTEJBQ0tfQllURVM=");
+
+  // Tainted canvas fails cleanly without infinite retry
+  throwTainted = true;
+  const taintedImg = doc.createElement("img");
+  taintedImg.src = "https://hotlink-blocked.example/tainted.jpg";
+  doc.body.appendChild(taintedImg);
+  await controller.translateElement(taintedImg, 0, true);
+  assert.equal(sentStarts.length, 3);
+  controller.teardown();
+});
+
+test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before GET_HEALTH resolves and updates cache", async () => {
+  // Unit-level verification of applyCachedHealthSnapshot
+  const makeDom = () => ({
+    statusDot: { className: "status-dot" },
+    statusText: { textContent: "Checking local engine..." },
+    statusVram: { textContent: "" },
+    gpuGuardNotice: { hidden: true, textContent: "", title: "", className: "gpu-guard-notice" },
+    engineModeSelect: { value: "hybrid" },
+    geminiKeyStatus: { textContent: "", className: "key-status" },
+  });
+
+  const now = 1_700_000_000_000;
+  const domFresh = makeDom();
+  const appliedFresh = popup.applyCachedHealthSnapshot(
+    {
+      savedAt: now - 5000,
+      data: {
+        ready: true,
+        translation_mode: "hybrid",
+        gemini_configured: true,
+        gemini_key_hint: "TEST...1234",
+        vram_used_mb: 1400,
+        vram_total_mb: 8192,
+        gpu_guard: { state: "ok", temp_c: 50 },
+      },
+    },
+    now,
+    domFresh
+  );
+  assert.equal(appliedFresh, true);
+  assert.equal(domFresh.statusDot.className, "status-dot ready");
+  assert.equal(domFresh.statusText.textContent, "Hybrid · Gemini + Shisa/EXAONE");
+  assert.equal(domFresh.statusVram.textContent, "1400/8192 MB · 50°C");
+
+  // Stale (>= 60s) snapshot is ignored
+  const domStale = makeDom();
+  const appliedStale = popup.applyCachedHealthSnapshot(
+    { savedAt: now - 65000, data: { ready: true, translation_mode: "hybrid" } },
+    now,
+    domStale
+  );
+  assert.equal(appliedStale, false);
+  assert.equal(domStale.statusText.textContent, "Checking local engine...");
+
+  // Full initPopup() VM sandbox test: pre-renders green Hybrid BEFORE GET_HEALTH resolves
+  const elements = new Map();
+  const makePopupEl = (id, init = {}) => {
+    const el = {
+      id,
+      className: "",
+      textContent: "",
+      value: "",
+      title: "",
+      hidden: false,
+      checked: false,
+      disabled: false,
+      dataset: {},
+      children: [],
+      classList: {
+        toggle() {},
+        add() {},
+        remove() {},
+      },
+      addEventListener() {},
+      appendChild(c) {
+        el.children.push(c);
+        return c;
+      },
+      ...init,
+    };
+    elements.set(id, el);
+    return el;
+  };
+
+  makePopupEl("statusDot", { className: "status-dot" });
+  makePopupEl("statusText", { textContent: "Checking local engine..." });
+  makePopupEl("statusVram");
+  makePopupEl("gpuGuardNotice", { hidden: true });
+  makePopupEl("versionBadge", { textContent: "v1.3.3" });
+  makePopupEl("siteHost");
+  makePopupEl("siteToggle");
+  makePopupEl("floatingToggle");
+  makePopupEl("preloadToggle");
+  makePopupEl("engineModeSelect", { value: "hybrid" });
+  makePopupEl("geminiKeyInput");
+  makePopupEl("saveGeminiKeyBtn");
+  makePopupEl("clearGeminiKeyBtn");
+  makePopupEl("geminiKeyStatus");
+  makePopupEl("glossaryLookupForm");
+  makePopupEl("glossaryLookupInput");
+  makePopupEl("glossaryLookupBtn");
+  makePopupEl("glossaryClearBtn");
+  makePopupEl("glossaryForm");
+  makePopupEl("glossaryOrig");
+  makePopupEl("glossaryEng");
+  makePopupEl("glossaryList");
+  makePopupEl("clearMemoryBtn");
+  makePopupEl("openTestBtn");
+  makePopupEl("shutdownBtn", { hidden: true });
+  makePopupEl("startEngineBtn", { hidden: false });
+  makePopupEl("autoUpdateToggle");
+  makePopupEl("updateStatusText");
+  makePopupEl("checkUpdatesBtn");
+  makePopupEl("installUpdateBtn", { hidden: true });
+  makePopupEl("serverUrlInput");
+  makePopupEl("saveServerUrlBtn");
+  makePopupEl("feedback");
+
+  const storage = createMockStorage({
+    enabledDomains: { "klmanga.black": true },
+    langMode: "ja",
+    lastHealthSnapshot: {
+      savedAt: Date.now() - 2000,
+      data: {
+        ready: true,
+        translation_mode: "hybrid",
+        gemini_configured: true,
+        gemini_key_hint: "TEST...4321",
+        vram_used_mb: 1100,
+        vram_total_mb: 8192,
+        gpu_guard: { state: "ok", temp_c: 48 },
+      },
+    },
+  });
+
+  let resolveHealth = null;
+  const sandbox = {
+    document: {
+      activeElement: null,
+      getElementById: (id) => elements.get(id) || null,
+      querySelectorAll: () => [],
+      createElement: (tag) => makePopupEl(`dyn-${tag}-${Math.random()}`),
+    },
+    window: { addEventListener() {} },
+    chrome: {
+      storage: { local: storage },
+      tabs: {
+        async query() {
+          return [{ id: 7, url: "https://klmanga.black/chapter-1" }];
+        },
+        async sendMessage() {},
+      },
+      runtime: {
+        getManifest: () => ({ version: "1.3.3" }),
+        sendMessage(msg) {
+          if (msg.type === "GET_HEALTH") {
+            return new Promise((r) => {
+              resolveHealth = r;
+            });
+          }
+          if (msg.type === "GET_UPDATE_STATUS") {
+            return Promise.resolve({ ok: true, localVersion: "1.3.3", autoUpdateEnabled: true, data: { has_remote: false } });
+          }
+          return Promise.resolve({ ok: true });
+        },
+      },
+    },
+    URL,
+    Date,
+    Math,
+    JSON,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Set,
+    Map,
+    Promise,
+    Error,
+    setTimeout,
+    clearTimeout,
+    console,
+  };
+  sandbox.globalThis = sandbox;
+
+  const popupSrc = fs.readFileSync(path.join(EXT_DIR, "popup.js"), "utf8");
+  assert.match(popupSrc, /return chrome\.runtime\?\.getManifest\?\.\(\)\?\.version \|\| "1\.3\.3"/);
+  vm.runInNewContext(popupSrc, sandbox, { filename: "extension/popup.js" });
+
+  // Wait for storage.get() microtasks to run, while GET_HEALTH is STILL unresolved
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(typeof resolveHealth, "function");
+  assert.equal(elements.get("statusDot").className, "status-dot ready");
+  assert.equal(elements.get("statusText").textContent, "Hybrid · Gemini + Shisa/EXAONE");
+  assert.equal(elements.get("statusVram").textContent, "1100/8192 MB · 48°C");
+  assert.equal(elements.get("startEngineBtn").hidden, true);
+  assert.equal(elements.get("shutdownBtn").hidden, false);
+  assert.equal(elements.get("versionBadge").textContent, "v1.3.3");
+
+  // Resolve live GET_HEALTH and verify lastHealthSnapshot is refreshed in storage
+  resolveHealth({
+    ok: true,
+    data: {
+      ready: true,
+      translation_mode: "hybrid",
+      gemini_configured: true,
+      gemini_key_hint: "TEST...4321",
+      vram_used_mb: 1250,
+      vram_total_mb: 8192,
+      gpu_guard: { state: "ok", temp_c: 51 },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(elements.get("statusVram").textContent, "1250/8192 MB · 51°C");
+  assert.equal(storage._data.lastHealthSnapshot?.data?.vram_used_mb, 1250);
+});
