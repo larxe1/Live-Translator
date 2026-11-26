@@ -230,10 +230,11 @@ function createMinimalDom(href = "https://mangadex.org/chapter/101") {
   return { doc, win };
 }
 
-test("1. manifest.json has version 1.3.3 and nativeMessaging permission", () => {
+test("1. manifest.json has version 1.4.0 and nativeMessaging permission", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(EXT_DIR, "manifest.json"), "utf8"));
-  assert.equal(manifest.version, "1.3.3");
+  assert.equal(manifest.version, "1.4.0");
   assert.ok(manifest.permissions.includes("nativeMessaging"));
+  assert.equal(background.SERVER_STARTING_WINDOW_MS, 180000);
 });
 
 test("2. START_SERVER sends { action: 'start_server' } to com.mangalivetranslator.host and stores serverStartingAt", async () => {
@@ -446,7 +447,7 @@ test("7. content.js transitions to 'Starting Engine...', polls GET_HEALTH, and a
 
   const pill = doc.body.children.find((c) => c.className === "mlt-pill");
   const statusText = pill.children[0].children[0].children[1];
-  assert.equal(statusText.textContent, "Starting Engine...");
+  assert.equal(statusText.textContent, "Starting Engine 1%");
 
   // Wait for bounded health poll to observe ready: true and re-trigger translation
   await new Promise((r) => setTimeout(r, 80));
@@ -509,4 +510,253 @@ test("8. content.js notifyEngineReady recovers from start timeout and auto-trans
 
   assert.equal(translateCalls, 2);
   assert.equal(statusText.textContent, "Translated 1/1");
+});
+
+test("9. background GET_HEALTH broadcasts ENGINE_READY on false -> true transition even without serverStartingAt", async () => {
+  const sentMessages = [];
+  let ready = false;
+  const sb = loadBackgroundSandbox({
+    fetchImpl: async (url) => {
+      if (url.endsWith("/health")) {
+        return createJsonResponse({ ready, loading_stage: ready ? "ready" : "loading_ocr" });
+      }
+      return createJsonResponse({}, 404);
+    },
+  });
+  sb.chromeMock.tabs = {
+    async query() {
+      return [{ id: 55, url: "https://mangadex.org/chapter/1" }];
+    },
+    async sendMessage(tabId, msg) {
+      sentMessages.push({ tabId, msg });
+      return { ok: true };
+    },
+  };
+
+  // First check sees ready: false (sets lastSeenServerReady = false, no broadcast)
+  const r1 = await sb.dispatchMessage({ type: "GET_HEALTH" });
+  assert.equal(r1.resp.ok, true);
+  assert.equal(r1.resp.data.ready, false);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sentMessages.filter((m) => m.msg?.type === "ENGINE_READY").length, 0);
+
+  // Server transitions to ready: true -> broadcasts ENGINE_READY without serverStartingAt
+  ready = true;
+  const r2 = await sb.dispatchMessage({ type: "GET_HEALTH" });
+  assert.equal(r2.resp.ok, true);
+  assert.equal(r2.resp.data.ready, true);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sentMessages.filter((m) => m.msg?.type === "ENGINE_READY" && m.tabId === 55).length, 1);
+
+  // Repeated ready: true polls must NOT re-broadcast
+  await sb.dispatchMessage({ type: "GET_HEALTH" });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sentMessages.filter((m) => m.msg?.type === "ENGINE_READY").length, 1);
+});
+
+test("10. content.js tolerates up to 3 transient poll errors, preserves monotonic starting status, and polls on visibilitychange/rescan", async () => {
+  const { doc, win } = createMinimalDom();
+  const docListeners = new Map();
+  doc.hidden = true;
+  doc.addEventListener = (type, fn) => {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  };
+  doc.removeEventListener = (type, fn) => {
+    if (!docListeners.has(type)) return;
+    docListeners.set(
+      type,
+      docListeners.get(type).filter((f) => f !== fn)
+    );
+  };
+
+  const img1 = doc.createElement("img");
+  img1.src = "https://cdn.example.org/p1.jpg";
+  doc.body.appendChild(img1);
+
+  const img2 = doc.createElement("img");
+  img2.src = "https://cdn.example.org/p2.jpg";
+  doc.body.appendChild(img2);
+
+  let healthCalls = 0;
+  let serverReady = false;
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    healthPollIntervalMs: 12,
+    healthPollMaxTries: 20,
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "auto", glossary: {} };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "TRANSLATE_IMAGE") {
+        if (!serverReady) {
+          return {
+            ok: false,
+            starting: true,
+            status: 503,
+            loadingStage: "loading_detector",
+            loadingProgress: 42,
+            loadingDetail: "Loading YOLO bubble detector...",
+          };
+        }
+        return { ok: true, data: { lang: "ja", width: 800, height: 1200, bubbles: [] } };
+      }
+      if (msg.type === "GET_HEALTH") {
+        healthCalls += 1;
+        if (healthCalls === 1) {
+          return {
+            ok: true,
+            data: {
+              ready: false,
+              loading_stage: "loading_detector",
+              loading_progress: 30, // lower than 42 -> monotonic guard must keep 42%
+              loading_detail: "Loading YOLO bubble detector...",
+            },
+          };
+        }
+        if (healthCalls === 2 || healthCalls === 3) {
+          throw new Error("Transient message port timeout");
+        }
+        if (healthCalls === 4) {
+          return {
+            ok: true,
+            data: {
+              ready: false,
+              loading_stage: "loading_ocr",
+              loading_progress: 78,
+              loading_detail: "Loading MangaOCR onto CUDA...",
+            },
+          };
+        }
+        serverReady = true;
+        return { ok: true, data: { ready: true, loading_stage: "ready", loading_progress: 100 } };
+      }
+      return { ok: true };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  controller.setVisibility(img1, true);
+  controller.setVisibility(img2, true);
+  await controller.refreshVisibleAndLookahead();
+
+  const pill = doc.body.children.find((c) => c.className === "mlt-pill");
+  const statusWrap = pill.children[0].children[0];
+  const statusText = statusWrap.children[1];
+  const progressBar = pill.children[1];
+  const progressFill = progressBar.children[0];
+
+  // Immediate 503 metadata is rendered and second 503 does not reset to Starting Engine
+  assert.equal(statusText.textContent, "Loading detector 42%");
+  assert.equal(statusWrap.title, "Loading YOLO bubble detector...");
+  assert.equal(progressBar.hidden, false);
+  assert.equal(progressFill.style.width, "42%");
+
+  // Wait for poll 1 (30 -> clamped to 42), poll 2 & 3 (transient errors), poll 4 (78%), poll 5 (ready)
+  await new Promise((r) => setTimeout(r, 120));
+  assert.ok(healthCalls >= 5);
+  assert.equal(statusText.textContent, "Translated 2/2");
+  assert.equal(progressBar.hidden, true);
+
+  // Verify controller's visibilitychange listener is registered and removed on teardown
+  const visBeforeTeardown = (docListeners.get("visibilitychange") || []).length;
+  assert.ok(visBeforeTeardown >= 1);
+  controller.teardown();
+  assert.equal((docListeners.get("visibilitychange") || []).length, visBeforeTeardown - 1);
+});
+
+test("11. content.js aborts after >3 consecutive poll errors and recovers via visibilitychange & rescan", async () => {
+  const { doc, win } = createMinimalDom();
+  const docListeners = new Map();
+  doc.hidden = true;
+  doc.addEventListener = (type, fn) => {
+    if (!docListeners.has(type)) docListeners.set(type, []);
+    docListeners.get(type).push(fn);
+  };
+  doc.removeEventListener = (type, fn) => {
+    if (!docListeners.has(type)) return;
+    docListeners.set(
+      type,
+      docListeners.get(type).filter((f) => f !== fn)
+    );
+  };
+
+  const img = doc.createElement("img");
+  img.src = "https://cdn.example.org/p1.jpg";
+  doc.body.appendChild(img);
+
+  let mode = "starting_errors";
+  let healthCalls = 0;
+  let translateCalls = 0;
+
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    healthPollIntervalMs: 10,
+    healthPollMaxTries: 20,
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "auto", glossary: {} };
+      },
+    },
+    sendMessage: async (msg) => {
+      if (msg.type === "TRANSLATE_IMAGE") {
+        translateCalls += 1;
+        if (mode !== "ready") {
+          return { ok: false, offline: true, starting: true, error: "Starting..." };
+        }
+        return { ok: true, data: { lang: "ja", width: 800, height: 1200, bubbles: [] } };
+      }
+      if (msg.type === "GET_HEALTH") {
+        healthCalls += 1;
+        if (mode === "starting_errors") {
+          throw new Error("Port closed");
+        }
+        if (mode === "loading") {
+          return { ok: true, data: { ready: false, loading_stage: "loading_ocr", loading_progress: 80 } };
+        }
+        return { ok: true, data: { ready: true, loading_stage: "ready", loading_progress: 100 } };
+      }
+      return { ok: true };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  controller.setVisibility(img, true);
+  await controller.refreshVisibleAndLookahead();
+
+  // >3 consecutive errors (4th fails) -> aborts to Offline — Click to start
+  await new Promise((r) => setTimeout(r, 80));
+  const pill = doc.body.children.find((c) => c.className === "mlt-pill");
+  const statusText = pill.children[0].children[0].children[1];
+  assert.equal(healthCalls, 4);
+  assert.equal(statusText.textContent, "Offline — Click to start");
+
+  // Tab becomes visible while offline -> triggers immediate GET_HEALTH and resumes starting watch
+  mode = "loading";
+  doc.hidden = false;
+  for (const fn of docListeners.get("visibilitychange") || []) fn();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.ok(healthCalls >= 5);
+  assert.equal(statusText.textContent, "Loading OCR 80%");
+
+  // Rescan while starting triggers immediate GET_HEALTH -> becomes ready and translates
+  mode = "ready";
+  controller.rescanAndTranslate();
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(translateCalls, 2);
+  assert.equal(statusText.textContent, "Translated 1/1");
+
+  controller.teardown();
 });

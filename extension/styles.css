@@ -257,6 +257,30 @@ html.mlt-peek-original .mlt-tooltip-portal {
   background: #ef4444;
 }
 
+.mlt-pill-progress {
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.22);
+  overflow: hidden;
+}
+
+.mlt-pill-progress[hidden] {
+  display: none;
+}
+
+.mlt-pill-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: #6366f1;
+  transition: width 0.2s ease;
+}
+
+.mlt-pill-progress[data-state="busy"] .mlt-pill-progress-fill {
+  background: #f59e0b;
+}
+
 /* Per-page floating loading badge anchored to the active manga image */
 .mlt-page-loading {
   position: fixed;

@@ -272,3 +272,81 @@ def test_ja_ocr_hallucination_detector_and_auto_switch_to_korean():
     assert lang_ja == "ja"
     assert texts_ja == ["2024年、東京へ行く！", "2024年、東京へ行く！"]
     assert ko_empty.calls == 2
+
+
+def test_load_ja_emits_progress_callbacks_and_restores_offline_module_flags(monkeypatch):
+    hf_const = SimpleNamespace(HF_HUB_OFFLINE=False)
+    tf_hub = SimpleNamespace(_is_offline_mode=False)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.constants", hf_const)
+    monkeypatch.setitem(sys.modules, "transformers.utils.hub", tf_hub)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+
+    observed_flags: list[tuple[str | None, str | None, bool, bool]] = []
+
+    class FakeModel:
+        def half(self):
+            return self
+
+        def float(self):
+            return self
+
+    class FakeMangaOcr:
+        def __init__(self, force_cpu: bool = False) -> None:
+            observed_flags.append(
+                (
+                    os.environ.get("HF_HUB_OFFLINE"),
+                    os.environ.get("TRANSFORMERS_OFFLINE"),
+                    hf_const.HF_HUB_OFFLINE,
+                    tf_hub._is_offline_mode,
+                )
+            )
+            if len(observed_flags) == 1:
+                raise OSError("not cached locally")
+            self.model = FakeModel()
+
+        def _preprocess(self, img: Image.Image):
+            return SimpleNamespace(half=lambda: "fp16")
+
+        def __call__(self, img: Image.Image) -> str:
+            return "テスト"
+
+    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=FakeMangaOcr))
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: True)
+
+    progress_events: list[tuple[str, str]] = []
+    engine = OcrEngine(device="cuda")
+    engine.load_ja(progress_cb=lambda step, detail: progress_events.append((step, detail)))
+
+    assert progress_events == [
+        ("loading_ocr_model", "Loading Japanese OCR"),
+        ("warming_ocr_gpu", "Warming up OCR on GPU"),
+    ]
+    assert observed_flags == [
+        ("1", "1", True, True),
+        (None, None, False, False),
+    ]
+    assert os.environ.get("HF_HUB_OFFLINE") is None
+    assert os.environ.get("TRANSFORMERS_OFFLINE") is None
+    assert hf_const.HF_HUB_OFFLINE is False
+    assert tf_hub._is_offline_mode is False
+
+    # Unexpected non-OSError must also restore offline flags in finally
+    class BrokenMangaOcr:
+        def __init__(self, force_cpu: bool = False) -> None:
+            assert hf_const.HF_HUB_OFFLINE is True
+            assert tf_hub._is_offline_mode is True
+            raise RuntimeError("unexpected failure")
+
+    monkeypatch.setitem(sys.modules, "manga_ocr", SimpleNamespace(MangaOcr=BrokenMangaOcr))
+    engine2 = OcrEngine(device="cuda")
+    try:
+        engine2.load_ja()
+        raise AssertionError("Expected RuntimeError")
+    except RuntimeError:
+        pass
+
+    assert os.environ.get("HF_HUB_OFFLINE") is None
+    assert os.environ.get("TRANSFORMERS_OFFLINE") is None
+    assert hf_const.HF_HUB_OFFLINE is False
+    assert tf_hub._is_offline_mode is False

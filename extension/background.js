@@ -7,13 +7,14 @@ const POST_TRANSLATE_HEALTH_THROTTLE_MS = 10000;
 const RELOAD_DELAY_MS = 150;
 const NATIVE_HOST_NAME = "com.mangalivetranslator.host";
 const AUTO_START_COOLDOWN_MS = 12000;
-const SERVER_STARTING_WINDOW_MS = 90000;
+const SERVER_STARTING_WINDOW_MS = 180000;
 const NATIVE_COMMAND_TIMEOUT_MS = 20000;
 const STARTING_ENGINE_MESSAGE = "Starting local translator engine...";
 const STREAM_PORT_NAME = "mlt-translate-stream";
 
 const inflightControllers = new Map();
 let nativeStartInFlight = null;
+let lastSeenServerReady = null;
 let ruleIdCounter = 10000;
 
 function nextRuleId() {
@@ -127,6 +128,37 @@ async function fetchImageAsBase64(imageUrl, refererUrl, deps = {}) {
   }
 }
 
+function getResponseHeader(headers, name) {
+  if (!headers) return "";
+  if (typeof headers.get === "function") {
+    return headers.get(name) ?? headers.get(name.toLowerCase()) ?? "";
+  }
+  if (typeof headers === "object") {
+    const target = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (String(k).toLowerCase() === target && v != null) {
+        return String(v);
+      }
+    }
+  }
+  return "";
+}
+
+function extractLoadingMetadata(response) {
+  const headers = response?.headers;
+  const loadingStage = String(getResponseHeader(headers, "X-MLT-Loading-Stage") || "").trim();
+  const rawProgress = getResponseHeader(headers, "X-MLT-Loading-Progress");
+  let loadingProgress = null;
+  if (rawProgress !== "" && rawProgress !== null && rawProgress !== undefined) {
+    const num = Number(rawProgress);
+    if (Number.isFinite(num)) {
+      loadingProgress = Math.max(0, Math.min(100, num));
+    }
+  }
+  const loadingDetail = String(getResponseHeader(headers, "X-MLT-Loading-Detail") || "").trim();
+  return { loadingStage, loadingProgress, loadingDetail };
+}
+
 async function fetchJson(url, options = {}, fetchImpl = fetch) {
   const response = await fetchImpl(url, options);
   const text = await response.text();
@@ -140,7 +172,12 @@ async function fetchJson(url, options = {}, fetchImpl = fetch) {
   }
   if (!response.ok) {
     const detail = parsed?.detail || parsed?.raw || `HTTP ${response.status}`;
-    throw new Error(String(detail));
+    const err = new Error(String(detail));
+    err.status = response.status;
+    if (response.status === 503) {
+      err.loadingMeta = extractLoadingMetadata(response);
+    }
+    throw err;
   }
   return parsed;
 }
@@ -276,7 +313,7 @@ function getLocalManifestVersion(deps = {}) {
   } catch (_err) {
     // Ignore manifest lookup failures.
   }
-  return "1.3.3";
+  return "1.4.0";
 }
 
 async function safeStorageGet(storage, keys) {
@@ -737,15 +774,19 @@ async function handleMessage(message, sender = {}, deps = {}) {
     case "GET_HEALTH": {
       try {
         const data = await fetchJson(`${serverBase}/health`, { method: "GET" }, fetchImpl);
-        if (data?.ready === true) {
+        const isReady = data?.ready === true;
+        const wasNotReady = lastSeenServerReady === false;
+        lastSeenServerReady = isReady;
+        if (isReady) {
           const wasStarting = await clearServerStartingAt(deps);
-          if (wasStarting) {
+          if (wasStarting || wasNotReady) {
             void notifyOpenTabsEngineReady(deps);
           }
         }
         await maybeAutoReloadForBuild(data?.extension_build_id, {}, deps);
         return { ok: true, data };
       } catch (err) {
+        lastSeenServerReady = false;
         const startingAt = await getServerStartingAt(deps);
         const starting = Boolean(
           startingAt && getNowMs(deps) - startingAt < SERVER_STARTING_WINDOW_MS
@@ -963,6 +1004,7 @@ async function handleMessage(message, sender = {}, deps = {}) {
     }
 
     case "SHUTDOWN_SERVER": {
+      lastSeenServerReady = false;
       let httpError = "";
       try {
         const data = await fetchJson(`${serverBase}/shutdown`, { method: "POST" }, fetchImpl);
@@ -1034,6 +1076,19 @@ async function handleMessage(message, sender = {}, deps = {}) {
         } catch (serverErr) {
           if (serverErr?.name === "AbortError" || controller.signal.aborted) {
             throw serverErr;
+          }
+          if (serverErr?.status === 503) {
+            lastSeenServerReady = false;
+            const meta = serverErr.loadingMeta || {};
+            return {
+              ok: false,
+              starting: true,
+              status: 503,
+              error: serverErr?.message || "Models are loading",
+              loadingStage: meta.loadingStage || "",
+              loadingProgress: meta.loadingProgress ?? null,
+              loadingDetail: meta.loadingDetail || "",
+            };
           }
           if (isServerUnreachableError(serverErr) && isLoopbackServer(serverBase)) {
             const startRes = await startServerViaNativeHost({ auto: true }, deps);
@@ -1238,12 +1293,17 @@ function handlePortConnect(port, deps = {}) {
           }
         }
         if (response.status === 503) {
+          lastSeenServerReady = false;
+          const meta = extractLoadingMetadata(response);
           safePost({
             type: "error",
             starting: true,
             status: 503,
             detail: String(detail),
             error: String(detail),
+            loadingStage: meta.loadingStage || "",
+            loadingProgress: meta.loadingProgress ?? null,
+            loadingDetail: meta.loadingDetail || "",
           });
           return;
         }

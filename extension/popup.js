@@ -8,6 +8,8 @@ const hasDom = typeof document !== "undefined";
 const statusDot = hasDom ? document.getElementById("statusDot") : null;
 const statusText = hasDom ? document.getElementById("statusText") : null;
 const statusVram = hasDom ? document.getElementById("statusVram") : null;
+const loadingProgressBar = hasDom ? document.getElementById("loadingProgressBar") : null;
+const loadingProgressFill = hasDom ? document.getElementById("loadingProgressFill") : null;
 const gpuGuardNotice = hasDom ? document.getElementById("gpuGuardNotice") : null;
 const versionBadge = hasDom ? document.getElementById("versionBadge") : null;
 const siteHostEl = hasDom ? document.getElementById("siteHost") : null;
@@ -63,17 +65,27 @@ const STAGE_LABELS = {
   idle_unloaded: "LLM unloaded (idle)",
   unloaded: "Models not loaded",
 };
+const STAGE_DEFAULT_PROGRESS = {
+  initializing: 10,
+  starting_llm: 25,
+  restarting_llm: 25,
+  loading_detector: 45,
+  loading_ocr: 75,
+  initializing_pipeline: 92,
+};
 
 let engineStarting = false;
+let startingProgressPct = 0;
+let preHealthPollCount = 0;
 let healthPollTimer = null;
 let healthPollActive = false;
 let healthPollStartedAt = 0;
 
 function getLocalVersion() {
   try {
-    return chrome.runtime?.getManifest?.()?.version || "1.3.3";
+    return chrome.runtime?.getManifest?.()?.version || "1.4.0";
   } catch (_err) {
-    return "1.3.3";
+    return "1.4.0";
   }
 }
 
@@ -242,12 +254,49 @@ function renderUpdateUI(statusData, autoEnabled, localVersion = getLocalVersion(
       : "Auto-update active (local live-reload)";
 }
 
-function formatLoadingStage(stage) {
+function resolveLoadingProgress(stage, progress) {
+  if (
+    progress !== null &&
+    progress !== undefined &&
+    progress !== "" &&
+    Number.isFinite(Number(progress))
+  ) {
+    return Math.max(0, Math.min(100, Math.round(Number(progress))));
+  }
   const raw = String(stage || "").trim();
-  if (!raw) return "Loading models...";
-  if (STAGE_LABELS[raw]) return STAGE_LABELS[raw];
+  if (Object.prototype.hasOwnProperty.call(STAGE_DEFAULT_PROGRESS, raw)) {
+    return STAGE_DEFAULT_PROGRESS[raw];
+  }
+  if (raw === "idle_unloaded" || raw === "unloaded" || raw.startsWith("error")) {
+    return null;
+  }
+  return 10;
+}
+
+function formatLoadingStage(stage, progress = null) {
+  const raw = String(stage || "").trim();
   if (raw.startsWith("error")) return `Engine error: ${raw.replace(/^error:\s*/, "")}`;
-  return `Loading models... (${raw})`;
+  const baseLabel = !raw
+    ? "Loading models..."
+    : STAGE_LABELS[raw] || `Loading models... (${raw})`;
+  const pct = resolveLoadingProgress(raw, progress);
+  return pct !== null ? `${baseLabel} ${pct}%` : baseLabel;
+}
+
+function setLoadingProgressBar(
+  pct,
+  visible,
+  dom = { loadingProgressBar, loadingProgressFill }
+) {
+  if (dom.loadingProgressBar) {
+    dom.loadingProgressBar.hidden = !visible;
+  }
+  if (dom.loadingProgressFill) {
+    const clamped = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+    if (dom.loadingProgressFill.style) {
+      dom.loadingProgressFill.style.width = visible ? `${clamped}%` : "0%";
+    }
+  }
 }
 
 /**
@@ -390,12 +439,18 @@ function applySettingsResponse(data, dom = { engineModeSelect, geminiKeyStatus }
   }
 }
 
+function isHealthFullyReady(h) {
+  return Boolean(h && h.ready && String(h.loading_stage || "").trim() !== "restarting_llm");
+}
+
 function applyHealthUI(
   h,
   dom = {
     statusDot,
     statusText,
     statusVram,
+    loadingProgressBar,
+    loadingProgressFill,
     gpuGuardNotice,
     engineModeSelect,
     geminiKeyStatus,
@@ -405,45 +460,74 @@ function applyHealthUI(
   const notice = applyGpuGuardNotice(h.gpu_guard, dom.gpuGuardNotice);
   const telemetry = formatGpuTelemetry(h);
   applySettingsResponse(h, dom);
-  if (h.ready) {
+  if (isHealthFullyReady(h)) {
     if (dom.statusDot) {
       dom.statusDot.className =
         notice.state === "paused" ? "status-dot loading" : "status-dot ready";
     }
     if (dom.statusText) {
       dom.statusText.textContent = formatEngineStatusLabel(h);
+      dom.statusText.title = "";
     }
     if (dom.statusVram) {
       dom.statusVram.textContent = telemetry;
     }
+    setLoadingProgressBar(0, false, dom);
     return { ready: true, notice };
   }
   if (dom.statusDot) {
     dom.statusDot.className = "status-dot loading";
   }
+  const pct = resolveLoadingProgress(h.loading_stage, h.loading_progress);
   if (dom.statusText) {
-    dom.statusText.textContent = formatLoadingStage(h.loading_stage);
+    dom.statusText.textContent = formatLoadingStage(h.loading_stage, pct);
+    dom.statusText.title = String(h.loading_detail || "").trim();
   }
   if (dom.statusVram) {
     dom.statusVram.textContent = telemetry;
   }
+  const isError = String(h.loading_stage || "").trim().startsWith("error");
+  setLoadingProgressBar(pct ?? 0, !isError && pct !== null, dom);
   return { ready: false, notice };
 }
 
 function renderOffline(message = OFFLINE_TEXT) {
+  startingProgressPct = 0;
+  preHealthPollCount = 0;
   if (statusDot) statusDot.className = "status-dot";
-  if (statusText) statusText.textContent = message;
+  if (statusText) {
+    statusText.textContent = message;
+    statusText.title = "";
+  }
   if (statusVram) statusVram.textContent = "";
+  setLoadingProgressBar(0, false);
   applyGpuGuardNotice(null);
   setEngineControls("offline");
 }
 
-function renderStarting(message = "Starting local engine...") {
-  if (statusDot) statusDot.className = "status-dot loading";
-  if (statusText) statusText.textContent = message;
-  if (statusVram) statusVram.textContent = "";
-  applyGpuGuardNotice(null);
-  setEngineControls("starting");
+function renderStarting(
+  message = "Starting local engine...",
+  progress = null,
+  dom = { statusDot, statusText, statusVram, loadingProgressBar, loadingProgressFill }
+) {
+  const rawPct =
+    progress !== null && progress !== undefined && Number.isFinite(Number(progress))
+      ? Math.max(0, Math.min(100, Math.round(Number(progress))))
+      : 5;
+  const pct = Math.max(startingProgressPct, rawPct);
+  startingProgressPct = pct;
+  const text = /%\s*$/.test(String(message || "")) ? String(message) : `${message} ${pct}%`;
+  if (dom.statusDot) dom.statusDot.className = "status-dot loading";
+  if (dom.statusText) {
+    dom.statusText.textContent = text;
+    dom.statusText.title = "";
+  }
+  if (dom.statusVram) dom.statusVram.textContent = "";
+  setLoadingProgressBar(pct, true, dom);
+  if (dom.statusDot === statusDot) {
+    applyGpuGuardNotice(null);
+    setEngineControls("starting");
+  }
 }
 
 async function notifyActiveTabEngineReady() {
@@ -476,7 +560,7 @@ function applyCachedHealthSnapshot(
   if (!snapshot || typeof snapshot !== "object") return false;
   const data = snapshot.data;
   const savedAt = Number(snapshot.savedAt || 0);
-  if (!data || data.ready !== true) return false;
+  if (!data || !isHealthFullyReady(data)) return false;
   if (!Number.isFinite(savedAt) || savedAt <= 0 || nowMs - savedAt >= HEALTH_SNAPSHOT_MAX_AGE_MS) {
     return false;
   }
@@ -493,7 +577,9 @@ async function refreshHealth() {
   if (!res || !res.ok || !res.data) {
     const starting = engineStarting || Boolean(res?.starting);
     if (starting) {
-      renderStarting();
+      preHealthPollCount += 1;
+      const rampPct = Math.min(10, 5 + preHealthPollCount);
+      renderStarting("Starting local engine...", rampPct);
     } else {
       renderOffline();
       try {
@@ -508,8 +594,10 @@ async function refreshHealth() {
   if (h.extension_build_id) {
     renderVersionBadge(h.extension_build_id, h.extension_version || getLocalVersion());
   }
-  if (h.ready) {
+  if (isHealthFullyReady(h)) {
     engineStarting = false;
+    startingProgressPct = 0;
+    preHealthPollCount = 0;
     applyHealthUI(h);
     setEngineControls("online");
     try {
@@ -522,7 +610,12 @@ async function refreshHealth() {
     void notifyActiveTabEngineReady();
     return { online: true, ready: true, starting: false };
   }
-  applyHealthUI(h);
+  const rawPct = resolveLoadingProgress(h.loading_stage, h.loading_progress);
+  const clampedPct = rawPct !== null ? Math.max(startingProgressPct, rawPct) : null;
+  if (clampedPct !== null) {
+    startingProgressPct = clampedPct;
+  }
+  applyHealthUI(clampedPct !== null ? { ...h, loading_progress: clampedPct } : h);
   setEngineControls("loading");
   const failed = String(h.loading_stage || "").startsWith("error");
   return { online: true, ready: false, starting: !failed, failed };
@@ -584,7 +677,9 @@ async function pollHealthTick() {
 async function startEngine() {
   if (engineStarting) return false;
   engineStarting = true;
-  renderStarting();
+  startingProgressPct = 0;
+  preHealthPollCount = 0;
+  renderStarting("Starting local engine...", 5);
 
   const res = await sendBgMessage({ type: "START_SERVER" });
   if (!res || !res.ok) {
@@ -1171,6 +1266,9 @@ if (typeof module !== "undefined" && module.exports) {
     formatLocalModelLabel,
     formatEngineStatusLabel,
     formatGeminiKeyStatus,
+    resolveLoadingProgress,
+    formatLoadingStage,
+    renderStarting,
     applySettingsResponse,
     applyHealthUI,
     applyCachedHealthSnapshot,

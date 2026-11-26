@@ -3,18 +3,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 import gc
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -290,6 +291,201 @@ def _detect_torch_device() -> str:
         return "cpu"
 
 
+_LOCAL_PROGRESS_STEPS: dict[str, tuple[int, int, float, str]] = {
+    "initializing": (0, 5, 2.0, "Initializing engine"),
+    "starting_llm": (5, 35, 15.0, "Starting local LLM"),
+    "loading_detector": (35, 38, 1.0, "Loading bubble detector"),
+    "importing_transformers": (38, 46, 4.0, "Importing vision libraries"),
+    "loading_processor": (46, 52, 2.0, "Loading detector processor"),
+    "loading_weights": (52, 63, 5.0, "Loading detector weights"),
+    "moving_to_gpu": (63, 68, 2.0, "Moving detector to GPU"),
+    "loading_ocr": (68, 70, 1.0, "Loading OCR engine"),
+    "loading_ocr_model": (70, 86, 8.0, "Loading Japanese OCR"),
+    "warming_ocr_gpu": (86, 93, 3.0, "Warming up OCR on GPU"),
+    "initializing_pipeline": (93, 99, 2.0, "Initializing translation pipeline"),
+}
+
+_LAZY_PROGRESS_STEPS: dict[str, tuple[int, int, float, str]] = {
+    "initializing": (0, 8, 2.0, "Initializing engine"),
+    "loading_detector": (8, 12, 1.0, "Loading bubble detector"),
+    "importing_transformers": (12, 24, 4.0, "Importing vision libraries"),
+    "loading_processor": (24, 33, 2.0, "Loading detector processor"),
+    "loading_weights": (33, 48, 5.0, "Loading detector weights"),
+    "moving_to_gpu": (48, 55, 2.0, "Moving detector to GPU"),
+    "loading_ocr": (55, 58, 1.0, "Loading OCR engine"),
+    "loading_ocr_model": (58, 80, 8.0, "Loading Japanese OCR"),
+    "warming_ocr_gpu": (80, 90, 3.0, "Warming up OCR on GPU"),
+    "initializing_pipeline": (90, 99, 2.0, "Initializing translation pipeline"),
+}
+
+_RESTART_PROGRESS_STEP: tuple[int, int, float, str] = (
+    5,
+    100,
+    12.0,
+    "Restarting local LLM",
+)
+
+_SUBSTEP_TO_TOP_STAGE: dict[str, str] = {
+    "importing_transformers": "loading_detector",
+    "loading_processor": "loading_detector",
+    "loading_weights": "loading_detector",
+    "moving_to_gpu": "loading_detector",
+    "loading_ocr_model": "loading_ocr",
+    "warming_ocr_gpu": "loading_ocr",
+}
+
+
+class _StartupProgressTracker:
+    """Thread-safe monotonic startup progress tracker with asymptotic intra-step interpolation."""
+
+    def __init__(
+        self,
+        *,
+        lazy_llm: bool = False,
+        stage: str = "unloaded",
+        now_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._lazy_llm = bool(lazy_llm)
+        self._now_fn = now_fn
+        self._step = stage
+        self._step_started_at = float(now_fn())
+        self._high_water = 100 if stage == "ready" else 0
+        self._frozen_progress: int | None = None
+        if stage == "ready":
+            self._detail = "Ready"
+        elif stage == "unloaded":
+            self._detail = ""
+        else:
+            _, _, _, default_detail = self._lookup_step_unlocked(stage)
+            self._detail = default_detail
+
+    def _lookup_step_unlocked(self, step: str) -> tuple[int, int, float, str]:
+        if step == "restarting_llm":
+            return _RESTART_PROGRESS_STEP
+        table = _LAZY_PROGRESS_STEPS if self._lazy_llm else _LOCAL_PROGRESS_STEPS
+        if step in table:
+            return table[step]
+        return (self._high_water, min(99, self._high_water + 5), 5.0, step or "")
+
+    def _compute_unlocked(self) -> int:
+        if self._step == "unloaded":
+            return 0
+        if self._step == "ready":
+            return 100
+        if self._step == "error":
+            val = self._frozen_progress if self._frozen_progress is not None else self._high_water
+            return max(0, min(100, int(val)))
+        base, ceiling, expected_s, _ = self._lookup_step_unlocked(self._step)
+        elapsed = max(0.0, float(self._now_fn()) - self._step_started_at)
+        span = max(0, ceiling - base)
+        cap = max(base, min(99, ceiling - 1))
+        raw = base + round(span * (1.0 - math.exp(-elapsed / max(expected_s, 0.1))))
+        clamped = max(0, min(cap, int(raw)))
+        self._high_water = max(self._high_water, clamped)
+        return max(0, min(99, self._high_water))
+
+    @property
+    def top_stage(self) -> str:
+        with self._lock:
+            return _SUBSTEP_TO_TOP_STAGE.get(self._step, self._step)
+
+    def set_lazy_llm(self, lazy_llm: bool) -> None:
+        with self._lock:
+            self._lazy_llm = bool(lazy_llm)
+
+    def set_step(self, step: str, detail: str | None = None) -> None:
+        with self._lock:
+            if step == "unloaded":
+                self._step = "unloaded"
+                self._high_water = 0
+                self._frozen_progress = None
+                self._detail = "" if detail is None else detail
+                self._step_started_at = float(self._now_fn())
+                return
+            if step == "restarting_llm" and self._step != "restarting_llm":
+                self._high_water = 0
+            elif step == "initializing" and self._step == "unloaded":
+                self._high_water = 0
+
+            base, _, _, default_detail = self._lookup_step_unlocked(step)
+            self._step = step
+            self._step_started_at = float(self._now_fn())
+            self._frozen_progress = None
+            self._detail = default_detail if detail is None else detail
+            self._high_water = max(self._high_water, max(0, min(99, base)))
+
+    def mark_ready(self, detail: str = "Ready") -> None:
+        with self._lock:
+            self._step = "ready"
+            self._high_water = 100
+            self._frozen_progress = None
+            self._detail = detail
+            self._step_started_at = float(self._now_fn())
+
+    def mark_error(self, detail: str = "") -> None:
+        with self._lock:
+            if self._step != "error":
+                self._frozen_progress = self._compute_unlocked()
+            self._step = "error"
+            self._detail = detail
+
+    def get_progress(self) -> tuple[int, str]:
+        with self._lock:
+            return self._compute_unlocked(), self._detail
+
+
+def _get_loading_state(app: FastAPI) -> tuple[str, int, str]:
+    """Return (loading_stage, loading_progress, loading_detail) safely."""
+    stage = str(getattr(app.state, "loading_stage", "") or "")
+    ready = bool(getattr(app.state, "ready", False))
+    loading_error = getattr(app.state, "loading_error", None)
+    tracker: _StartupProgressTracker | None = getattr(app.state, "progress_tracker", None)
+
+    if loading_error or stage.startswith("error"):
+        err_detail = str(loading_error or stage)
+        if tracker is not None:
+            tracker.mark_error(err_detail)
+            progress, detail = tracker.get_progress()
+            return (stage or "error", max(0, min(100, progress)), detail)
+        return (stage or "error", 0, err_detail)
+
+    if stage == "unloaded" and not ready:
+        return ("unloaded", 0, "")
+
+    if ready and stage != "restarting_llm":
+        if tracker is not None and stage == "ready":
+            tracker.mark_ready()
+        detail = "Local LLM idle-unloaded" if stage == "idle_unloaded" else ("Ready" if stage == "ready" else "")
+        return (stage or "ready", 100, detail)
+
+    if tracker is not None:
+        if stage and stage != tracker.top_stage and stage in (*_LOCAL_PROGRESS_STEPS, "restarting_llm"):
+            tracker.set_step(stage)
+        progress, detail = tracker.get_progress()
+        return (stage, max(0, min(99, progress)), detail)
+
+    return (stage, 0, "")
+
+
+def _sanitize_header_value(value: str) -> str:
+    return " ".join(str(value or "").splitlines()).strip()
+
+
+def _raise_not_ready_503(app: FastAPI) -> NoReturn:
+    stage, progress, detail = _get_loading_state(app)
+    progress_clamped = max(0, min(99, int(progress)))
+    raise HTTPException(
+        status_code=503,
+        detail=f"Models are not ready yet ({stage}, {progress_clamped}%)",
+        headers={
+            "X-MLT-Loading-Stage": _sanitize_header_value(stage),
+            "X-MLT-Loading-Progress": str(progress_clamped),
+            "X-MLT-Loading-Detail": _sanitize_header_value(detail),
+        },
+    )
+
+
 def _release_torch_cache() -> None:
     gc.collect()
     try:
@@ -315,10 +511,15 @@ async def _ensure_llm_ready(app: FastAPI) -> None:
         if app.state.llama_manager is None or getattr(app.state, "llm_lazy", False):
             return
         if app.state.llm_idle_unloaded or not await asyncio.to_thread(app.state.llama_manager.is_healthy):
+            tracker: _StartupProgressTracker | None = getattr(app.state, "progress_tracker", None)
             app.state.loading_stage = "restarting_llm"
+            if tracker is not None:
+                tracker.set_step("restarting_llm", "Restarting local LLM")
             await asyncio.to_thread(app.state.llama_manager.start)
             app.state.llm_idle_unloaded = False
             app.state.loading_stage = "ready"
+            if tracker is not None:
+                tracker.mark_ready()
             app.state.last_activity = time.monotonic()
 
 
@@ -403,8 +604,15 @@ async def _load_production_models(app: FastAPI) -> None:
     max_image_width = int(getattr(cfg, "max_image_width", 2400))
     max_queue_size = int(getattr(cfg, "max_queue_size", 12))
 
+    tracker: _StartupProgressTracker | None = getattr(app.state, "progress_tracker", None)
+    if tracker is None:
+        tracker = _StartupProgressTracker(stage="initializing")
+        app.state.progress_tracker = tracker
+
     try:
-        device = _detect_torch_device()
+        app.state.loading_stage = "initializing"
+        tracker.set_step("initializing", "Detecting compute device")
+        device = await asyncio.to_thread(_detect_torch_device)
         gpu_guard: GpuSafetyGuard = getattr(app.state, "gpu_guard", None) or GpuSafetyGuard(cfg)
         app.state.gpu_guard = gpu_guard
         min_free_vram_mb = int(getattr(cfg, "gpu_min_free_vram_mb", 1024))
@@ -416,9 +624,11 @@ async def _load_production_models(app: FastAPI) -> None:
         has_gemini_key = bool(get_gemini_api_key(env_path=cfg.project_root / ".env"))
         lazy_llm = mode in ("hybrid", "gemini") and has_gemini_key
         app.state.llm_lazy = lazy_llm
+        tracker.set_lazy_llm(lazy_llm)
 
         if not lazy_llm:
             app.state.loading_stage = "starting_llm"
+            tracker.set_step("starting_llm", "Starting local LLM")
             await asyncio.to_thread(llama_mgr.start)
             app.state.llm_idle_unloaded = False
         else:
@@ -426,25 +636,34 @@ async def _load_production_models(app: FastAPI) -> None:
             app.state.llm_idle_unloaded = False
 
         app.state.loading_stage = "loading_detector"
+        tracker.set_step("loading_detector", "Loading bubble detector")
         detector = BubbleDetector(
             model_id=cfg.detector_model_id,
             device=device,
             min_free_vram_mb=min_free_vram_mb,
         )
-        await asyncio.to_thread(detector.load)
+        if _accepts_kwarg(detector.load, "progress_cb"):
+            await asyncio.to_thread(detector.load, progress_cb=tracker.set_step)
+        else:
+            await asyncio.to_thread(detector.load)
 
         app.state.loading_stage = "loading_ocr"
+        tracker.set_step("loading_ocr", "Loading OCR engine")
         ocr = OcrEngine(
             device=device,
             cache_dir=cfg.cache_dir,
             min_free_vram_mb=min_free_vram_mb,
         )
         try:
-            await asyncio.to_thread(ocr.load_ja)
+            if _accepts_kwarg(ocr.load_ja, "progress_cb"):
+                await asyncio.to_thread(ocr.load_ja, progress_cb=tracker.set_step)
+            else:
+                await asyncio.to_thread(ocr.load_ja)
         except Exception as exc:
             logger.warning("Preloading Japanese OCR deferred to first request: %s", exc)
 
         app.state.loading_stage = "initializing_pipeline"
+        tracker.set_step("initializing_pipeline", "Initializing translation pipeline")
         gemini_translator: Any = None
         try:
             from server.translator.gemini_translator import GeminiVisionTranslator
@@ -496,6 +715,7 @@ async def _load_production_models(app: FastAPI) -> None:
         app.state.ready = True
         app.state.loading_stage = "ready"
         app.state.loading_error = None
+        tracker.mark_ready()
         app.state.last_activity = time.monotonic()
     except asyncio.CancelledError:
         raise
@@ -504,6 +724,7 @@ async def _load_production_models(app: FastAPI) -> None:
         app.state.ready = False
         app.state.loading_error = str(exc)
         app.state.loading_stage = f"error: {exc}"
+        tracker.mark_error(str(exc))
 
 
 def create_app(
@@ -614,6 +835,10 @@ def create_app(
         in ("hybrid", "gemini")
         and bool(get_gemini_api_key(env_path=resolved_cfg.project_root / ".env"))
     )
+    app.state.progress_tracker = _StartupProgressTracker(
+        lazy_llm=app.state.llm_lazy,
+        stage=app.state.loading_stage,
+    )
     app.state.llm_restart_lock = asyncio.Lock()
 
     app.add_middleware(
@@ -622,6 +847,11 @@ def create_app(
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "X-MLT-Loading-Stage",
+            "X-MLT-Loading-Progress",
+            "X-MLT-Loading-Detail",
+        ],
     )
 
     assets_dir = resolved_cfg.project_root / "assets"
@@ -654,6 +884,7 @@ def create_app(
 
         gemini_key = get_gemini_api_key(env_path=live_cfg.project_root / ".env")
         health_update = await asyncio.to_thread(updater.get_health_fields)
+        loading_stage, loading_progress, loading_detail = _get_loading_state(app)
         status = "ok" if app.state.ready else ("error" if app.state.loading_error else "loading")
         return HealthResponse(
             status=status,
@@ -663,7 +894,9 @@ def create_app(
             vram_total_mb=vram_total,
             llm_model=llm_model,
             llm_ready=bool(llm_ready),
-            loading_stage=str(app.state.loading_stage or ""),
+            loading_stage=loading_stage,
+            loading_progress=loading_progress,
+            loading_detail=loading_detail,
             extension_version=str(health_update["extension_version"]),
             extension_build_id=str(health_update["extension_build_id"]),
             has_remote=bool(health_update["has_remote"]),
@@ -742,10 +975,7 @@ def create_app(
     async def translate(request: Request) -> TranslateResponse:
         active_pipeline: TranslationPipeline | None = app.state.pipeline
         if active_pipeline is None or not app.state.ready:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Models are not ready yet ({app.state.loading_stage})",
-            )
+            _raise_not_ready_503(app)
 
         (
             image_bytes,
@@ -788,10 +1018,7 @@ def create_app(
     async def translate_stream(request: Request) -> StreamingResponse:
         active_pipeline: TranslationPipeline | None = app.state.pipeline
         if active_pipeline is None or not app.state.ready:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Models are not ready yet ({app.state.loading_stage})",
-            )
+            _raise_not_ready_503(app)
 
         (
             image_bytes,

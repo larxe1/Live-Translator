@@ -12,6 +12,60 @@
     return VALID_TRANSLATION_MODES.has(mode) ? mode : "";
   }
 
+  const STAGE_DEFAULT_PROGRESS = {
+    initializing: 10,
+    starting_llm: 25,
+    restarting_llm: 25,
+    loading_detector: 45,
+    loading_ocr: 75,
+    initializing_pipeline: 92,
+  };
+
+  function stageLabel(stage) {
+    const raw = String(stage || "").trim();
+    if (raw === "starting_llm" || raw === "restarting_llm") return "Loading LLM...";
+    if (raw === "loading_detector") return "Loading detector...";
+    if (raw === "loading_ocr") return "Loading OCR...";
+    if (raw === "initializing_pipeline") return "Preparing pipeline...";
+    return "Starting Engine...";
+  }
+
+  function formatStartingStatus(stage, progress) {
+    const raw = String(stage || "").trim();
+    const base = stageLabel(raw).replace(/\.\.\.$/, "");
+    let pct;
+    if (
+      progress !== null &&
+      progress !== undefined &&
+      progress !== "" &&
+      Number.isFinite(Number(progress))
+    ) {
+      pct = Math.max(0, Math.min(100, Math.round(Number(progress))));
+    } else if (Object.prototype.hasOwnProperty.call(STAGE_DEFAULT_PROGRESS, raw)) {
+      pct = STAGE_DEFAULT_PROGRESS[raw];
+    } else {
+      pct = 5;
+    }
+    return `${base} ${pct}%`;
+  }
+
+  function computePageProgressPct(phase, done = 0, total = 0) {
+    const d = Math.max(0, Number(done) || 0);
+    const t = Math.max(0, Number(total) || 0);
+    switch (phase) {
+      case "detect":
+        return 5;
+      case "ocr":
+        return t > 0 ? Math.round(15 + (Math.min(d, t) / t) * 35) : 25;
+      case "translate_init":
+        return 50;
+      case "bubble":
+        return t > 0 ? Math.min(99, Math.round(50 + (Math.min(d, t) / t) * 49)) : 75;
+      default:
+        return 5;
+    }
+  }
+
   function formatTranslateProviderLabel(provider) {
     const raw = String(provider || "").trim().toLowerCase();
     if (!raw) return "Translating...";
@@ -288,6 +342,8 @@
     let pillDot = null;
     let pillStatusWrap = null;
     let pillStatusText = null;
+    let pillProgress = null;
+    let pillProgressFill = null;
     let pillLangSelect = null;
     let pillPeekBtn = null;
     let isPeeking = false;
@@ -296,9 +352,13 @@
     // Server lifecycle as seen by this tab: "ok" | "offline" | "starting".
     let serverState = "ok";
     let offlineLabel = "Offline — Click to start";
-    let startingLabel = "Starting Engine...";
+    let startingLabel = formatStartingStatus("", 1);
+    let startingProgress = 0;
+    let startingDetail = "";
+    let consecutivePollErrors = 0;
     let healthPollTimer = null;
     let healthPollTries = 0;
+    let healthPollInFlight = false;
     let preloadTimer = null;
     let viewportSyncTimer = null;
     let startRequestInFlight = false;
@@ -455,10 +515,26 @@
       }
     }
 
-    function updatePillStatus(state, label) {
+    function updatePillStatus(state, label, progressPct = null) {
       if (!pillDot || !pillStatusText) return;
       if (pillDot.dataset) pillDot.dataset.state = state;
       pillStatusText.textContent = label;
+      if (pillProgress) {
+        const showProgress = state === "starting" || state === "busy";
+        pillProgress.hidden = !showProgress;
+        if (pillProgress.style) {
+          pillProgress.style.display = showProgress ? "block" : "none";
+        }
+        if (pillProgress.dataset) {
+          pillProgress.dataset.state = showProgress ? state : "";
+        }
+        if (pillProgressFill?.style) {
+          const pct = showProgress
+            ? Math.max(0, Math.min(100, Math.round(Number(progressPct) || 0)))
+            : 0;
+          pillProgressFill.style.width = `${pct}%`;
+        }
+      }
     }
 
     function applyUpdatedPillUI() {
@@ -507,6 +583,21 @@
       return done.gen === gen && done.srcKey === getElementSourceKey(el);
     }
 
+    function getActivePageProgressPct() {
+      let activePct = 5;
+      let hasP0 = false;
+      for (const active of inFlightByEl.values()) {
+        const p = Number.isFinite(Number(active.progressPct)) ? Number(active.progressPct) : 5;
+        if (active.priority === 0) {
+          activePct = hasP0 ? Math.max(activePct, p) : p;
+          hasP0 = true;
+        } else if (!hasP0) {
+          activePct = Math.max(activePct, p);
+        }
+      }
+      return Math.max(0, Math.min(99, Math.round(activePct)));
+    }
+
     function refreshStatusIndicator() {
       if (!enabled || contextInvalidated) return;
       const total = candidates.length;
@@ -514,14 +605,22 @@
 
       if (inFlightByEl.size > 0) {
         setOfflineClickable(false);
+        const activePct = getActivePageProgressPct();
+        const overallPct =
+          total > 0
+            ? Math.min(99, Math.round(((doneCount + activePct / 100) / total) * 100))
+            : activePct;
         const label =
           total > 0
-            ? `Translating ${Math.min(doneCount + 1, total)}/${total}...`
-            : `Translating (${inFlightByEl.size})`;
-        updatePillStatus("busy", label);
+            ? `Translating ${Math.min(doneCount + 1, total)}/${total} (${overallPct}%)`
+            : `Translating (${activePct}%)`;
+        updatePillStatus("busy", label, overallPct);
       } else if (serverState === "starting") {
         setOfflineClickable(false);
-        updatePillStatus("starting", startingLabel);
+        if (pillStatusWrap) {
+          pillStatusWrap.title = startingDetail || "";
+        }
+        updatePillStatus("starting", startingLabel, startingProgress);
       } else if (serverState === "offline") {
         updatePillStatus("offline", offlineLabel);
         setOfflineClickable(true);
@@ -538,6 +637,9 @@
     function markServerOffline(label = "Offline — Click to start") {
       if (serverState === "starting") return;
       serverState = "offline";
+      startingProgress = 0;
+      startingDetail = "";
+      consecutivePollErrors = 0;
       offlineLabel = label;
       refreshStatusIndicator();
     }
@@ -548,42 +650,72 @@
         healthPollTimer = null;
       }
       healthPollTries = 0;
+      consecutivePollErrors = 0;
     }
 
-    function scheduleHealthPoll() {
+    function scheduleHealthPoll(immediate = false) {
+      if (immediate && healthPollTimer !== null) {
+        clearTimeoutImpl(healthPollTimer);
+        healthPollTimer = null;
+      }
       if (healthPollTimer !== null) return;
       healthPollTimer = setTimeoutImpl(() => {
         healthPollTimer = null;
         void healthPollTick();
-      }, healthPollIntervalMs);
+      }, immediate ? 0 : healthPollIntervalMs);
     }
 
     /**
      * Enters "starting" mode and runs a bounded GET_HEALTH poll that
      * re-triggers translation automatically once the engine is ready.
      */
-    function beginStartingWatch() {
+    function beginStartingWatch(initialInfo = null) {
       if (contextInvalidated) return;
       const wasStarting = serverState === "starting";
       serverState = "starting";
-      startingLabel = "Starting Engine...";
-      refreshStatusIndicator();
-      if (!wasStarting) healthPollTries = 0;
-      scheduleHealthPoll();
-    }
+      if (!wasStarting) {
+        healthPollTries = 0;
+        startingProgress = 0;
+        startingDetail = "";
+        consecutivePollErrors = 0;
+      }
 
-    function stageLabel(stage) {
-      const raw = String(stage || "");
-      if (raw === "starting_llm" || raw === "restarting_llm") return "Loading LLM...";
-      if (raw === "loading_detector") return "Loading detector...";
-      if (raw === "loading_ocr") return "Loading OCR...";
-      if (raw === "initializing_pipeline") return "Preparing pipeline...";
-      return "Starting Engine...";
+      const stage = String(initialInfo?.loadingStage || initialInfo?.loading_stage || "").trim();
+      const rawProg = initialInfo?.loadingProgress ?? initialInfo?.loading_progress;
+      const hasProg =
+        rawProg !== null &&
+        rawProg !== undefined &&
+        rawProg !== "" &&
+        Number.isFinite(Number(rawProg));
+      const detail = String(initialInfo?.loadingDetail || initialInfo?.loading_detail || "").trim();
+      if (detail) {
+        startingDetail = detail;
+      }
+
+      if (stage || hasProg) {
+        const target = hasProg
+          ? Math.max(0, Math.min(100, Math.round(Number(rawProg))))
+          : Object.prototype.hasOwnProperty.call(STAGE_DEFAULT_PROGRESS, stage)
+            ? STAGE_DEFAULT_PROGRESS[stage]
+            : Math.max(1, startingProgress || 1);
+        startingProgress = Math.max(startingProgress, target);
+        startingLabel = formatStartingStatus(stage, startingProgress);
+      } else if (!wasStarting) {
+        startingProgress = Math.max(startingProgress, 1);
+        startingLabel = formatStartingStatus("", startingProgress);
+      }
+
+      refreshStatusIndicator();
+      if (!wasStarting || (healthPollTimer === null && !healthPollInFlight)) {
+        scheduleHealthPoll(true);
+      }
     }
 
     function handleEngineReady() {
       stopHealthPoll();
       serverState = "ok";
+      startingProgress = 0;
+      startingDetail = "";
       lastErrorLabel = "";
       offlineFailedEls.clear();
       failedByEl.clear();
@@ -598,56 +730,161 @@
     }
 
     async function healthPollTick() {
-      if (contextInvalidated || serverState !== "starting" || typeof sendMessage !== "function") {
-        stopHealthPoll();
+      if (
+        contextInvalidated ||
+        serverState !== "starting" ||
+        typeof sendMessage !== "function" ||
+        healthPollInFlight
+      ) {
+        if (serverState !== "starting" || contextInvalidated || typeof sendMessage !== "function") {
+          stopHealthPoll();
+        }
         return;
       }
+      healthPollInFlight = true;
       healthPollTries += 1;
+
+      let res = null;
+      let pollErr = null;
+      try {
+        res = await sendMessage({ type: "GET_HEALTH" });
+      } catch (err) {
+        pollErr = err;
+      } finally {
+        healthPollInFlight = false;
+      }
+
+      if (pollErr) {
+        if (isContextInvalidatedError(pollErr)) {
+          stopHealthPoll();
+          handleContextInvalidated();
+          return;
+        }
+        if (contextInvalidated || serverState !== "starting") return;
+        consecutivePollErrors += 1;
+        if (consecutivePollErrors > 3 || healthPollTries >= healthPollMaxTries) {
+          stopHealthPoll();
+          serverState = "ok";
+          markServerOffline();
+          return;
+        }
+        refreshStatusIndicator();
+        scheduleHealthPoll();
+        return;
+      }
+
+      if (contextInvalidated || serverState !== "starting") return;
+
+      if (res?.ok && res.data?.ready === true) {
+        consecutivePollErrors = 0;
+        handleEngineReady();
+        return;
+      }
+
+      if (res?.ok && res.data) {
+        consecutivePollErrors = 0;
+        const stage = String(res.data.loading_stage || "").trim();
+        if (stage.startsWith("error")) {
+          stopHealthPoll();
+          serverState = "ok";
+          markServerOffline("Engine error — Click to retry");
+          return;
+        }
+        if (healthPollTries >= healthPollMaxTries) {
+          stopHealthPoll();
+          serverState = "ok";
+          markServerOffline("Start timed out — Click to retry");
+          return;
+        }
+        if (res.data.loading_detail !== undefined) {
+          startingDetail = String(res.data.loading_detail || "").trim();
+        }
+        const rawProg = res.data.loading_progress;
+        const hasProg =
+          rawProg !== null &&
+          rawProg !== undefined &&
+          rawProg !== "" &&
+          Number.isFinite(Number(rawProg));
+        const target = hasProg
+          ? Math.max(0, Math.min(100, Math.round(Number(rawProg))))
+          : Object.prototype.hasOwnProperty.call(STAGE_DEFAULT_PROGRESS, stage)
+            ? STAGE_DEFAULT_PROGRESS[stage]
+            : Math.min(10, Math.max(1, healthPollTries + 1));
+        startingProgress = Math.max(startingProgress, target);
+        startingLabel = formatStartingStatus(stage, startingProgress);
+        refreshStatusIndicator();
+        scheduleHealthPoll();
+        return;
+      }
+
+      if (res?.ok === false && res?.starting === true) {
+        consecutivePollErrors = 0;
+        if (healthPollTries >= healthPollMaxTries) {
+          stopHealthPoll();
+          serverState = "ok";
+          markServerOffline("Start timed out — Click to retry");
+          return;
+        }
+        const rampPct = Math.min(10, Math.max(1, healthPollTries + 1));
+        startingProgress = Math.max(startingProgress, rampPct);
+        startingLabel = formatStartingStatus("", startingProgress);
+        refreshStatusIndicator();
+        scheduleHealthPoll();
+        return;
+      }
+
+      consecutivePollErrors += 1;
+      if (consecutivePollErrors > 3 || healthPollTries >= healthPollMaxTries) {
+        stopHealthPoll();
+        serverState = "ok";
+        markServerOffline();
+        return;
+      }
+      refreshStatusIndicator();
+      scheduleHealthPoll();
+    }
+
+    async function checkHealthNow() {
+      if (!enabled || contextInvalidated || typeof sendMessage !== "function") return;
+      if (serverState === "starting") {
+        if (healthPollTimer !== null) {
+          clearTimeoutImpl(healthPollTimer);
+          healthPollTimer = null;
+        }
+        if (!healthPollInFlight) {
+          void healthPollTick();
+        }
+        return;
+      }
+      if (serverState !== "offline") return;
 
       let res = null;
       try {
         res = await sendMessage({ type: "GET_HEALTH" });
       } catch (err) {
-        stopHealthPoll();
         if (isContextInvalidatedError(err)) {
           handleContextInvalidated();
-          return;
         }
-        serverState = "ok";
-        markServerOffline();
         return;
       }
-      if (contextInvalidated || serverState !== "starting") return;
+      if (contextInvalidated || !enabled || serverState !== "offline") return;
 
       if (res?.ok && res.data?.ready === true) {
         handleEngineReady();
         return;
       }
-
-      const stage = String(res?.data?.loading_stage || "");
-      if (res?.ok && res.data && stage.startsWith("error")) {
-        stopHealthPoll();
-        serverState = "ok";
-        markServerOffline("Engine error — Click to retry");
+      if (res?.ok && res.data) {
+        const stage = String(res.data.loading_stage || "").trim();
+        if (stage.startsWith("error")) {
+          markServerOffline("Engine error — Click to retry");
+        } else {
+          beginStartingWatch(res.data);
+        }
         return;
       }
-      if (!res || (res.ok === false && !res.starting)) {
-        stopHealthPoll();
-        serverState = "ok";
-        markServerOffline();
-        return;
+      if (res?.starting) {
+        beginStartingWatch();
       }
-
-      if (healthPollTries >= healthPollMaxTries) {
-        stopHealthPoll();
-        serverState = "ok";
-        markServerOffline("Start timed out — Click to retry");
-        return;
-      }
-
-      startingLabel = res?.ok && res.data ? stageLabel(stage) : "Starting Engine...";
-      refreshStatusIndicator();
-      scheduleHealthPoll();
     }
 
     async function requestEngineStart() {
@@ -657,7 +894,9 @@
       if (serverState === "starting") return false;
       startRequestInFlight = true;
       serverState = "starting";
-      startingLabel = "Starting Engine...";
+      startingProgress = 1;
+      startingDetail = "";
+      startingLabel = formatStartingStatus("", 1);
       refreshStatusIndicator();
 
       let res = null;
@@ -759,6 +998,16 @@
       header.appendChild(collapseBtn);
       pill.appendChild(header);
 
+      const progressTrack = doc.createElement("div");
+      progressTrack.className = "mlt-pill-progress";
+      progressTrack.hidden = true;
+      if (progressTrack.style) progressTrack.style.display = "none";
+      const progressFill = doc.createElement("div");
+      progressFill.className = "mlt-pill-progress-fill";
+      if (progressFill.style) progressFill.style.width = "0%";
+      progressTrack.appendChild(progressFill);
+      pill.appendChild(progressTrack);
+
       const controls = doc.createElement("div");
       controls.className = "mlt-pill-controls";
 
@@ -832,6 +1081,8 @@
       pillDot = dot;
       pillStatusWrap = statusWrap;
       pillStatusText = statusSpan;
+      pillProgress = progressTrack;
+      pillProgressFill = progressFill;
       pillLangSelect = langSelect;
       pillPeekBtn = peekBtn;
       if (contextInvalidated) {
@@ -847,6 +1098,8 @@
       pillDot = null;
       pillStatusWrap = null;
       pillStatusText = null;
+      pillProgress = null;
+      pillProgressFill = null;
       pillLangSelect = null;
       pillPeekBtn = null;
       isPeeking = false;
@@ -1084,10 +1337,20 @@
       }
 
       const requestId = `mlt-${++reqCounter}-${Date.now()}`;
-      const entry = { gen, srcKey, requestId, priority, port: null, session: null, cancelPort: null };
+      const initPct = computePageProgressPct("detect");
+      const entry = {
+        gen,
+        srcKey,
+        requestId,
+        priority,
+        progressPct: initPct,
+        port: null,
+        session: null,
+        cancelPort: null,
+      };
       inFlightByEl.set(el, entry);
       failedByEl.delete(el);
-      showPageLoadingBadge(el, "Translating...");
+      showPageLoadingBadge(el, `Translating... ${initPct}%`);
       refreshStatusIndicator();
 
       const isStale = () =>
@@ -1214,18 +1477,24 @@
               if (evt.stage === "ocr") {
                 const totalR = Number(evt.total) || 0;
                 const doneR = Number(evt.done) || 0;
+                const pct = computePageProgressPct("ocr", doneR, totalR);
+                entry.progressPct = pct;
                 if (totalR > 0) {
                   showPageLoadingBadge(
                     el,
                     doneR === 0
-                      ? `Reading text (${totalR})...`
-                      : `Reading text ${doneR}/${totalR}...`
+                      ? `Reading text (${totalR})... ${pct}%`
+                      : `Reading text ${doneR}/${totalR} (${pct}%)`
                   );
                 } else {
-                  showPageLoadingBadge(el, "Reading text...");
+                  showPageLoadingBadge(el, `Reading text... ${pct}%`);
                 }
+                refreshStatusIndicator();
               } else if (evt.stage === "translate" && bubblesById.size === 0) {
-                showPageLoadingBadge(el, formatTranslateProviderLabel(evt.provider));
+                const pct = computePageProgressPct("translate_init");
+                entry.progressPct = pct;
+                showPageLoadingBadge(el, `${formatTranslateProviderLabel(evt.provider)} ${pct}%`);
+                refreshStatusIndicator();
               }
               return;
             }
@@ -1233,10 +1502,13 @@
             if (evt.type === "meta") {
               meta = evt;
               const count = Array.isArray(evt.bubbles) ? evt.bubbles.length : 0;
+              const pct = computePageProgressPct("translate_init");
+              entry.progressPct = pct;
               showPageLoadingBadge(
                 el,
-                count > 0 ? `Translating 0/${count}...` : "Translating..."
+                count > 0 ? `Translating 0/${count} (${pct}%)` : `Translating... ${pct}%`
               );
+              refreshStatusIndicator();
               if (typeof overlayApi?.createOverlaySession === "function") {
                 session = overlayApi.createOverlaySession(el, evt, { document: doc, window: win });
                 entry.session = session;
@@ -1248,7 +1520,10 @@
               bubblesById.set(evt.id, evt);
               const totalB = Array.isArray(meta?.bubbles) ? meta.bubbles.length : 0;
               if (totalB > 0) {
-                showPageLoadingBadge(el, `Translating ${bubblesById.size}/${totalB}...`);
+                const pct = computePageProgressPct("bubble", bubblesById.size, totalB);
+                entry.progressPct = pct;
+                showPageLoadingBadge(el, `Translating ${bubblesById.size}/${totalB} (${pct}%)`);
+                refreshStatusIndicator();
               }
               if (session) {
                 const base = (meta?.bubbles || []).find((b) => b.id === evt.id) || {};
@@ -1279,7 +1554,7 @@
               if (isContextInvalidatedError(errMsg)) {
                 handleContextInvalidated();
               } else if (evt.starting) {
-                beginStartingWatch();
+                beginStartingWatch(evt);
               } else if (evt.hostMissing) {
                 markServerOffline("Launcher missing — run setup.ps1");
               } else if (evt.offline) {
@@ -1347,7 +1622,10 @@
           const allowCanvasRetry = attempt === 0 && Boolean(attemptUrl) && !attemptBase64;
           if (attempt > 0) {
             entry.requestId = `mlt-${++reqCounter}-${Date.now()}`;
-            showPageLoadingBadge(el, "Translating...");
+            const retryPct = computePageProgressPct("detect");
+            entry.progressPct = retryPct;
+            showPageLoadingBadge(el, `Translating... ${retryPct}%`);
+            refreshStatusIndicator();
           }
 
           const portPromise = translateViaPort(
@@ -1402,7 +1680,7 @@
               if (isContextInvalidatedError(result.error)) {
                 handleContextInvalidated();
               } else if (result.starting) {
-                beginStartingWatch();
+                beginStartingWatch(result);
               } else if (result.hostMissing) {
                 markServerOffline("Launcher missing — run setup.ps1");
               } else if (result.offline) {
@@ -1562,6 +1840,13 @@
 
     function rescanAndTranslate() {
       if (!enabled || contextInvalidated) return null;
+      if (serverState === "starting") {
+        void checkHealthNow();
+        return null;
+      }
+      if (serverState === "offline") {
+        void checkHealthNow();
+      }
       scanDocumentCandidates();
       failedByEl.clear();
       offlineFailedEls.clear();
@@ -1811,8 +2096,9 @@
     function teardown() {
       disable();
       stopViewportSyncTimer();
-      if (typeof doc?.removeEventListener === "function" && onCaptureImgLoad) {
-        doc.removeEventListener("load", onCaptureImgLoad, true);
+      if (typeof doc?.removeEventListener === "function") {
+        if (onCaptureImgLoad) doc.removeEventListener("load", onCaptureImgLoad, true);
+        if (onVisibilityChange) doc.removeEventListener("visibilitychange", onVisibilityChange);
       }
       if (typeof win?.removeEventListener === "function") {
         win.removeEventListener("pagehide", onUnload);
@@ -1823,6 +2109,7 @@
     }
 
     let onCaptureImgLoad = null;
+    let onVisibilityChange = null;
     if (typeof doc?.addEventListener === "function") {
       onCaptureImgLoad = (evt) => {
         if (!enabled || contextInvalidated) return;
@@ -1830,7 +2117,14 @@
         if (!target || String(target.tagName || "").toUpperCase() !== "IMG") return;
         handleImageLoaded(target);
       };
+      onVisibilityChange = () => {
+        if (!enabled || contextInvalidated || doc.hidden) return;
+        if (serverState === "starting" || serverState === "offline") {
+          void checkHealthNow();
+        }
+      };
       doc.addEventListener("load", onCaptureImgLoad, true);
+      doc.addEventListener("visibilitychange", onVisibilityChange);
     }
 
     let onUnload = null;
@@ -2034,6 +2328,8 @@
     computeLookaheadTargets,
     isContextInvalidatedError,
     formatTranslateProviderLabel,
+    formatStartingStatus,
+    computePageProgressPct,
     createPageController,
   };
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import logging
 import os
 import re
+import sys
 import unicodedata
 from pathlib import Path
 from typing import Any, Literal
@@ -131,8 +133,16 @@ class OcrEngine:
         self._ko_ocr: Any = None
         self._ja_fp16: bool = False
 
-    def load_ja(self) -> None:
+    def load_ja(self, progress_cb: Callable[[str, str], None] | None = None) -> None:
         """Lazy-load manga-ocr onto CUDA (fp16 when VRAM headroom suffices) or CPU."""
+        def _notify(step: str, detail: str) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(step, detail)
+                except Exception:
+                    pass
+
+        _notify("loading_ocr_model", "Loading Japanese OCR")
         from manga_ocr import MangaOcr
 
         use_cuda = self.device.startswith("cuda") and gpu_guard.has_safe_vram_headroom(
@@ -140,32 +150,51 @@ class OcrEngine:
         )
         prev_hf = os.environ.get("HF_HUB_OFFLINE")
         prev_tf = os.environ.get("TRANSFORMERS_OFFLINE")
+
+        hf_const = sys.modules.get("huggingface_hub.constants")
+        if hf_const is None:
+            try:
+                import huggingface_hub.constants as hf_const
+            except Exception:
+                hf_const = None
+        tf_hub = sys.modules.get("transformers.utils.hub")
+
+        has_hf_const = hf_const is not None and hasattr(hf_const, "HF_HUB_OFFLINE")
+        prev_hf_const = getattr(hf_const, "HF_HUB_OFFLINE", None) if has_hf_const else None
+        has_tf_offline = tf_hub is not None and hasattr(tf_hub, "_is_offline_mode")
+        prev_tf_offline = getattr(tf_hub, "_is_offline_mode", None) if has_tf_offline else None
+
+        def _restore_offline_state() -> None:
+            if prev_hf is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev_hf
+            if prev_tf is None:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            else:
+                os.environ["TRANSFORMERS_OFFLINE"] = prev_tf
+            if has_hf_const:
+                setattr(hf_const, "HF_HUB_OFFLINE", prev_hf_const)
+            if has_tf_offline:
+                setattr(tf_hub, "_is_offline_mode", prev_tf_offline)
+
         try:
             os.environ["HF_HUB_OFFLINE"] = "1"
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            if has_hf_const:
+                setattr(hf_const, "HF_HUB_OFFLINE", True)
+            if has_tf_offline:
+                setattr(tf_hub, "_is_offline_mode", True)
             self._ja_ocr = MangaOcr(force_cpu=not use_cuda)
         except OSError:
-            if prev_hf is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev_hf
-            if prev_tf is None:
-                os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            else:
-                os.environ["TRANSFORMERS_OFFLINE"] = prev_tf
+            _restore_offline_state()
             self._ja_ocr = MangaOcr(force_cpu=not use_cuda)
         finally:
-            if prev_hf is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev_hf
-            if prev_tf is None:
-                os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            else:
-                os.environ["TRANSFORMERS_OFFLINE"] = prev_tf
+            _restore_offline_state()
 
         self._ja_fp16 = False
         if use_cuda and self._ja_ocr is not None:
+            _notify("warming_ocr_gpu", "Warming up OCR on GPU")
             model = getattr(self._ja_ocr, "model", None)
             if model is not None and hasattr(model, "half"):
                 orig_preprocess = getattr(self._ja_ocr, "_preprocess", None)

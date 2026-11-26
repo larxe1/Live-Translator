@@ -250,11 +250,21 @@
         </div>
         <div class="stat-box">
           <div class="stat-label">Pipeline Stage</div>
-          <div id="loading-stage" class="stat-value">initializing</div>
+          <div id="loading-stage" class="stat-value">initializing (0%)</div>
         </div>
         <div class="stat-box">
           <div class="stat-label">Local Uncensored LLM</div>
           <div id="llm-model" class="stat-value">Loading...</div>
+        </div>
+      </div>
+
+      <div id="loading-progress-wrap" style="margin-bottom: 14px;">
+        <div class="vram-track" aria-label="Model loading progress">
+          <div id="loading-fill" class="vram-fill" style="background: linear-gradient(90deg, #f59e0b, #6c8cff);"></div>
+        </div>
+        <div class="vram-caption">
+          <span id="loading-detail">Starting engine...</span>
+          <span id="loading-pct">0%</span>
         </div>
       </div>
 
@@ -316,6 +326,10 @@
     const statusText = document.getElementById("status-text");
     const gpuNameEl = document.getElementById("gpu-name");
     const stageEl = document.getElementById("loading-stage");
+    const loadingProgressWrap = document.getElementById("loading-progress-wrap");
+    const loadingFill = document.getElementById("loading-fill");
+    const loadingDetailEl = document.getElementById("loading-detail");
+    const loadingPctEl = document.getElementById("loading-pct");
     const llmModelEl = document.getElementById("llm-model");
     const vramFill = document.getElementById("vram-fill");
     const vramLabel = document.getElementById("vram-label");
@@ -333,35 +347,56 @@
         const h = await res.json();
 
         const shortGpu = (h.gpu_name || "Local GPU").replace("NVIDIA GeForce ", "");
+        const stageBase = h.loading_stage || (h.ready ? "ready" : "loading");
+        const detail = (h.loading_detail || "").trim();
+        const rawPct = h.loading_progress;
+        const pct = Number.isFinite(Number(rawPct))
+          ? Math.max(0, Math.min(100, Math.round(Number(rawPct))))
+          : (h.ready && stageBase !== "restarting_llm" ? 100 : 0);
+        const isLoading = !h.ready || stageBase === "restarting_llm";
+
         gpuNameEl.textContent = h.gpu_name || "Unknown GPU";
-        stageEl.textContent = h.loading_stage || (h.ready ? "ready" : "loading");
+        stageEl.textContent = isLoading
+          ? `${stageBase} (${pct}%)${detail ? " — " + detail : ""}`
+          : `${stageBase} (${pct}%)`;
         llmModelEl.textContent = (h.llm_model || "Qwen2.5-7B-Instruct-abliterated") + (h.llm_ready ? " (Active)" : " (Starting)");
+
+        if (loadingProgressWrap) {
+          loadingProgressWrap.style.display = isLoading || h.status === "error" ? "" : "none";
+          loadingFill.style.width = pct + "%";
+          loadingDetailEl.textContent = detail || stageBase;
+          loadingPctEl.textContent = pct + "%";
+        }
 
         const used = Number(h.vram_used_mb || 0);
         const total = Number(h.vram_total_mb || 0);
         if (total > 0) {
-          const pct = Math.min(100, Math.round((used / total) * 100));
-          vramFill.style.width = pct + "%";
+          const vramPercent = Math.min(100, Math.round((used / total) * 100));
+          vramFill.style.width = vramPercent + "%";
           vramLabel.textContent = `VRAM: ${used.toLocaleString()} / ${total.toLocaleString()} MB`;
-          vramPct.textContent = pct + "%";
+          vramPct.textContent = vramPercent + "%";
         } else {
           vramFill.style.width = "0%";
           vramLabel.textContent = "VRAM: N/A";
           vramPct.textContent = "--";
         }
 
-        if (h.ready) {
-          badge.className = "status-badge ready";
-          statusText.textContent = `Ready — ${shortGpu} Active`;
-        } else if (h.status === "error") {
+        if (h.status === "error") {
           badge.className = "status-badge offline";
-          statusText.textContent = "Startup Error — Check Console";
+          badge.title = detail || stageBase;
+          statusText.textContent = `Startup Error (${pct}%) — Check Console`;
+        } else if (h.ready && stageBase !== "restarting_llm") {
+          badge.className = "status-badge ready";
+          badge.title = detail || "Ready";
+          statusText.textContent = `Ready — ${shortGpu} Active`;
         } else {
           badge.className = "status-badge loading";
-          statusText.textContent = `Loading... (${h.loading_stage || "starting"})`;
+          badge.title = detail || stageBase;
+          statusText.textContent = `Loading ${pct}% — ${detail || stageBase}`;
         }
       } catch (err) {
         badge.className = "status-badge offline";
+        badge.title = "";
         statusText.textContent = "Server Offline";
         stageEl.textContent = "offline";
       }

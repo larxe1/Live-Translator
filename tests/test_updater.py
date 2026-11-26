@@ -277,11 +277,16 @@ def test_fastapi_update_endpoints_and_health_contract(
             "llm_model",
             "llm_ready",
             "loading_stage",
+            "loading_progress",
+            "loading_detail",
             "extension_version",
             "extension_build_id",
             "has_remote",
             "update_available",
         }
+        assert health_data["loading_stage"] == "unloaded"
+        assert health_data["loading_progress"] == 0
+        assert health_data["loading_detail"] == ""
         assert health_data["extension_version"] == "1.1.0"
         assert len(health_data["extension_build_id"]) == 16
         assert health_data["has_remote"] is True

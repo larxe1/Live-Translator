@@ -739,11 +739,11 @@ test("6. Lazy-loaded placeholder img swapping src + load event triggers translat
 
   assert.equal(startedUrls.length, 1);
   assert.equal(startedUrls[0], "https://cdn.example.org/long-strip-page1.jpg");
-  assert.equal(badgeSeenWhileTranslating, "Translating...");
+  assert.equal(badgeSeenWhileTranslating, "Translating... 5%");
 
   finishStream();
   await new Promise((r) => setTimeout(r, 10));
-  assert.equal(badgeSeenAfterBubble, "Translating 1/1...");
+  assert.equal(badgeSeenAfterBubble, "Translating 1/1 (99%)");
   assert.equal(doc.body.children.filter((c) => c.className === "mlt-page-loading").length, 0);
 });
 
@@ -1428,9 +1428,21 @@ test("14. popup GPU guard & temperature rendering handles absent, ok, throttled,
 
   // 5) Loading state without gpu_guard does not throw
   const domLoading = makeDom();
-  popup.applyHealthUI({ ready: false, loading_stage: "starting_llm" }, domLoading);
+  domLoading.loadingProgressBar = { hidden: true };
+  domLoading.loadingProgressFill = { style: { width: "0%" } };
+  popup.applyHealthUI(
+    {
+      ready: false,
+      loading_stage: "starting_llm",
+      loading_detail: "Starting local Shisa LLM...",
+    },
+    domLoading
+  );
   assert.equal(domLoading.statusDot.className, "status-dot loading");
-  assert.equal(domLoading.statusText.textContent, "Loading LLM...");
+  assert.equal(domLoading.statusText.textContent, "Loading LLM... 25%");
+  assert.equal(domLoading.statusText.title, "Starting local Shisa LLM...");
+  assert.equal(domLoading.loadingProgressBar.hidden, false);
+  assert.equal(domLoading.loadingProgressFill.style.width, "25%");
   assert.equal(domLoading.statusVram.textContent, "");
   assert.equal(domLoading.gpuGuardNotice.hidden, true);
 });
@@ -1508,11 +1520,11 @@ test("15. stream OCR status events update per-image loading badge before meta ar
   await new Promise((r) => setTimeout(r, 10));
 
   assert.deepEqual(badgeLabels, [
-    "Translating...",
-    "Reading text (40)...",
-    "Reading text 8/40...",
-    "Translating 0/1...",
-    "Translating 1/1...",
+    "Translating... 5%",
+    "Reading text (40)... 15%",
+    "Reading text 8/40 (22%)",
+    "Translating 0/1 (50%)",
+    "Translating 1/1 (99%)",
   ]);
   assert.equal(getBadgeText(), "");
 });
@@ -1804,10 +1816,10 @@ test("18. stream translate status updates badge for Gemini/Local and forwards tr
   await new Promise((r) => setTimeout(r, 10));
 
   assert.deepEqual(badgeLabels, [
-    "Translating (Gemini)...",
-    "Translating (Local)...",
-    "Translating 0/1...",
-    "Translating 1/1...",
+    "Translating (Gemini)... 50%",
+    "Translating (Local)... 50%",
+    "Translating 0/1 (50%)",
+    "Translating 1/1 (99%)",
   ]);
   assert.equal(getBadgeText(), "");
 
@@ -2117,8 +2129,10 @@ test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before G
   makePopupEl("statusDot", { className: "status-dot" });
   makePopupEl("statusText", { textContent: "Checking local engine..." });
   makePopupEl("statusVram");
+  makePopupEl("loadingProgressBar", { hidden: true });
+  makePopupEl("loadingProgressFill", { style: { width: "0%" } });
   makePopupEl("gpuGuardNotice", { hidden: true });
-  makePopupEl("versionBadge", { textContent: "v1.3.3" });
+  makePopupEl("versionBadge", { textContent: "v1.4.0" });
   makePopupEl("siteHost");
   makePopupEl("siteToggle");
   makePopupEl("floatingToggle");
@@ -2183,7 +2197,7 @@ test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before G
         async sendMessage() {},
       },
       runtime: {
-        getManifest: () => ({ version: "1.3.3" }),
+        getManifest: () => ({ version: "1.4.0" }),
         sendMessage(msg) {
           if (msg.type === "GET_HEALTH") {
             return new Promise((r) => {
@@ -2191,7 +2205,7 @@ test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before G
             });
           }
           if (msg.type === "GET_UPDATE_STATUS") {
-            return Promise.resolve({ ok: true, localVersion: "1.3.3", autoUpdateEnabled: true, data: { has_remote: false } });
+            return Promise.resolve({ ok: true, localVersion: "1.4.0", autoUpdateEnabled: true, data: { has_remote: false } });
           }
           return Promise.resolve({ ok: true });
         },
@@ -2217,7 +2231,7 @@ test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before G
   sandbox.globalThis = sandbox;
 
   const popupSrc = fs.readFileSync(path.join(EXT_DIR, "popup.js"), "utf8");
-  assert.match(popupSrc, /return chrome\.runtime\?\.getManifest\?\.\(\)\?\.version \|\| "1\.3\.3"/);
+  assert.match(popupSrc, /return chrome\.runtime\?\.getManifest\?\.\(\)\?\.version \|\| "1\.4\.0"/);
   vm.runInNewContext(popupSrc, sandbox, { filename: "extension/popup.js" });
 
   // Wait for storage.get() microtasks to run, while GET_HEALTH is STILL unresolved
@@ -2228,7 +2242,7 @@ test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before G
   assert.equal(elements.get("statusVram").textContent, "1100/8192 MB · 48°C");
   assert.equal(elements.get("startEngineBtn").hidden, true);
   assert.equal(elements.get("shutdownBtn").hidden, false);
-  assert.equal(elements.get("versionBadge").textContent, "v1.3.3");
+  assert.equal(elements.get("versionBadge").textContent, "v1.4.0");
 
   // Resolve live GET_HEALTH and verify lastHealthSnapshot is refreshed in storage
   resolveHealth({
@@ -2246,4 +2260,341 @@ test("21. popup pre-renders cached lastHealthSnapshot with zero flicker before G
   await new Promise((r) => setTimeout(r, 15));
   assert.equal(elements.get("statusVram").textContent, "1250/8192 MB · 51°C");
   assert.equal(storage._data.lastHealthSnapshot?.data?.vram_used_mb, 1250);
+});
+
+test("22. startup & page progress helpers, 503 header forwarding, pill progress bar, and popup loading bar", async () => {
+  // 1) computePageProgressPct
+  assert.equal(content.computePageProgressPct("detect"), 5);
+  assert.equal(content.computePageProgressPct("ocr", 0, 10), 15);
+  assert.equal(content.computePageProgressPct("ocr", 5, 10), 33);
+  assert.equal(content.computePageProgressPct("ocr", 10, 10), 50);
+  assert.equal(content.computePageProgressPct("ocr", 0, 0), 25);
+  assert.equal(content.computePageProgressPct("translate_init"), 50);
+  assert.equal(content.computePageProgressPct("bubble", 0, 4), 50);
+  assert.equal(content.computePageProgressPct("bubble", 2, 4), 75);
+  assert.equal(content.computePageProgressPct("bubble", 4, 4), 99);
+  assert.equal(content.computePageProgressPct("bubble", 9, 4), 99);
+
+  // 2) formatStartingStatus + popup formatLoadingStage + renderStarting
+  assert.equal(content.formatStartingStatus("starting_llm", 25), "Loading LLM 25%");
+  assert.equal(content.formatStartingStatus("loading_detector", 42), "Loading detector 42%");
+  assert.equal(content.formatStartingStatus("loading_ocr", 78), "Loading OCR 78%");
+  assert.equal(content.formatStartingStatus("initializing_pipeline", 95), "Preparing pipeline 95%");
+  assert.equal(content.formatStartingStatus("", 5), "Starting Engine 5%");
+
+  assert.equal(popup.formatLoadingStage("starting_llm"), "Loading LLM... 25%");
+  assert.equal(popup.formatLoadingStage("loading_detector", 42), "Loading detector... 42%");
+  assert.equal(popup.formatLoadingStage("loading_ocr", 78), "Loading OCR... 78%");
+  assert.equal(popup.formatLoadingStage("initializing_pipeline"), "Preparing pipeline... 92%");
+
+  const startDom = {
+    statusDot: { className: "" },
+    statusText: { textContent: "", title: "old" },
+    statusVram: { textContent: "100 MB" },
+    loadingProgressBar: { hidden: true },
+    loadingProgressFill: { style: { width: "0%" } },
+  };
+  popup.renderStarting("Starting local engine...", 5, startDom);
+  assert.equal(startDom.statusText.textContent, "Starting local engine... 5%");
+  assert.equal(startDom.loadingProgressBar.hidden, false);
+  assert.equal(startDom.loadingProgressFill.style.width, "5%");
+
+  // 3) 503 headers forwarded on both /translate/stream and TRANSLATE_IMAGE
+  const make503Headers = () => ({
+    get(name) {
+      const k = String(name || "").toLowerCase();
+      if (k === "x-mlt-loading-stage") return "loading_ocr";
+      if (k === "x-mlt-loading-progress") return "78";
+      if (k === "x-mlt-loading-detail") return "Loading MangaOCR onto CUDA...";
+      return null;
+    },
+  });
+  const sb503 = loadBackgroundSandbox({
+    fetchImpl: async () => ({
+      ok: false,
+      status: 503,
+      headers: make503Headers(),
+      async text() {
+        return JSON.stringify({ detail: "Models are not ready yet (loading_ocr)" });
+      },
+    }),
+  });
+
+  const streamPair = sb503.connectPort("mlt-translate-stream");
+  const streamErr = await new Promise((resolve) => {
+    streamPair.clientPort.onMessage.addListener((evt) => resolve(evt));
+    streamPair.clientPort.postMessage({ type: "START", imageBase64: "AAAA", requestId: "s-503" });
+  });
+  assert.equal(streamErr.starting, true);
+  assert.equal(streamErr.status, 503);
+  assert.equal(streamErr.loadingStage, "loading_ocr");
+  assert.equal(streamErr.loadingProgress, 78);
+  assert.equal(streamErr.loadingDetail, "Loading MangaOCR onto CUDA...");
+
+  const msgErr = await sb503.sendMessage({
+    type: "TRANSLATE_IMAGE",
+    imageBase64: "AAAA",
+    requestId: "m-503",
+  });
+  assert.equal(msgErr.ok, false);
+  assert.equal(msgErr.starting, true);
+  assert.equal(msgErr.status, 503);
+  assert.equal(msgErr.loadingStage, "loading_ocr");
+  assert.equal(msgErr.loadingProgress, 78);
+  assert.equal(msgErr.loadingDetail, "Loading MangaOCR onto CUDA...");
+
+  // 4) Pill progress bar & overall percentage across 2 pages while translating
+  const { doc, win } = createMinimalDom("https://mangadex.org/chapter/200");
+  win.innerWidth = 1280;
+  win.innerHeight = 900;
+  const p1 = doc.createElement("img");
+  p1.src = "https://cdn.example.org/p1.jpg";
+  doc.body.appendChild(p1);
+  const p2 = doc.createElement("img");
+  p2.src = "https://cdn.example.org/p2.jpg";
+  doc.body.appendChild(p2);
+
+  let finishP1 = null;
+  const controller = content.createPageController({
+    document: doc,
+    window: win,
+    hostname: "mangadex.org",
+    storage: {
+      async get() {
+        return { enabledDomains: { "mangadex.org": true }, langMode: "ja", glossary: {} };
+      },
+    },
+    sendMessage: async () => ({ ok: true }),
+    connectPort: () => {
+      const listeners = [];
+      return {
+        onMessage: { addListener(fn) { listeners.push(fn); } },
+        onDisconnect: { addListener() {} },
+        disconnect() {},
+        postMessage(msg) {
+          if (msg.type !== "START") return;
+          if (msg.imageUrl.endsWith("p1.jpg")) {
+            finishP1 = () => {
+              for (const fn of listeners) {
+                fn({ type: "meta", lang: "ja", width: 800, height: 1200, bubbles: [{ id: 0 }, { id: 1 }] });
+                fn({ type: "bubble", id: 0, translated: "One", final: true });
+              }
+            };
+          }
+        },
+      };
+    },
+    overlayApi: overlay,
+    MutationObserver: null,
+    IntersectionObserver: null,
+  });
+
+  await controller.init();
+  const pill = doc.body.children.find((c) => c.className === "mlt-pill");
+  const statusText = pill.children[0].children[0].children[1];
+  const progressBar = pill.children[1];
+  const progressFill = progressBar.children[0];
+
+  assert.equal(statusText.textContent, "Translating 1/2 (3%)");
+  assert.equal(progressBar.hidden, false);
+  assert.equal(progressFill.style.width, "3%");
+
+  finishP1();
+  // p1 is at 1/2 bubbles -> 75% (bubble phase), p2 still at 5%, max p0 activePct = 75% -> overall = round((0 + 0.75)/2 * 100) = 38%
+  assert.equal(statusText.textContent, "Translating 1/2 (38%)");
+  assert.equal(progressFill.style.width, "38%");
+
+  controller.teardown();
+});
+
+test("23. popup treats ready:true + loading_stage:'restarting_llm' as loading, shows progress bar & tooltip, and keeps polling", async () => {
+  const domRestart = {
+    statusDot: { className: "" },
+    statusText: { textContent: "", title: "" },
+    statusVram: { textContent: "" },
+    loadingProgressBar: { hidden: true },
+    loadingProgressFill: { style: { width: "0%" } },
+    gpuGuardNotice: { hidden: true, textContent: "", title: "", className: "gpu-guard-notice" },
+    engineModeSelect: { value: "hybrid" },
+    geminiKeyStatus: { textContent: "", className: "key-status" },
+  };
+
+  const res = popup.applyHealthUI(
+    {
+      ready: true,
+      loading_stage: "restarting_llm",
+      loading_progress: 35,
+      loading_detail: "Restarting local LLM",
+      translation_mode: "local",
+      vram_used_mb: 2400,
+      vram_total_mb: 8192,
+    },
+    domRestart
+  );
+  assert.equal(res.ready, false);
+  assert.equal(domRestart.statusDot.className, "status-dot loading");
+  assert.equal(domRestart.statusText.textContent, "Reloading LLM... 35%");
+  assert.equal(domRestart.statusText.title, "Restarting local LLM");
+  assert.equal(domRestart.loadingProgressBar.hidden, false);
+  assert.equal(domRestart.loadingProgressFill.style.width, "35%");
+
+  // Full refreshHealth() + poll regression test in VM sandbox: keeps polling until stage !== restarting_llm
+  const elements = new Map();
+  const makePopupEl = (id, init = {}) => {
+    const el = {
+      id,
+      className: "",
+      textContent: "",
+      value: "",
+      title: "",
+      hidden: false,
+      checked: false,
+      disabled: false,
+      style: {},
+      dataset: {},
+      children: [],
+      classList: { toggle() {}, add() {}, remove() {} },
+      addEventListener() {},
+      appendChild(c) {
+        el.children.push(c);
+        return c;
+      },
+      ...init,
+    };
+    elements.set(id, el);
+    return el;
+  };
+  for (const id of [
+    "statusDot",
+    "statusText",
+    "statusVram",
+    "loadingProgressBar",
+    "loadingProgressFill",
+    "gpuGuardNotice",
+    "versionBadge",
+    "siteHost",
+    "siteToggle",
+    "floatingToggle",
+    "preloadToggle",
+    "engineModeSelect",
+    "geminiKeyInput",
+    "saveGeminiKeyBtn",
+    "clearGeminiKeyBtn",
+    "geminiKeyStatus",
+    "glossaryLookupForm",
+    "glossaryLookupInput",
+    "glossaryLookupBtn",
+    "glossaryClearBtn",
+    "glossaryForm",
+    "glossaryOrig",
+    "glossaryEng",
+    "glossaryList",
+    "clearMemoryBtn",
+    "openTestBtn",
+    "shutdownBtn",
+    "startEngineBtn",
+    "autoUpdateToggle",
+    "updateStatusText",
+    "checkUpdatesBtn",
+    "installUpdateBtn",
+    "serverUrlInput",
+    "saveServerUrlBtn",
+    "feedback",
+  ]) {
+    makePopupEl(id);
+  }
+  elements.get("loadingProgressBar").hidden = true;
+  elements.get("gpuGuardNotice").hidden = true;
+
+  let healthCalls = 0;
+  const storage = createMockStorage({ enabledDomains: {}, langMode: "auto" });
+  const sandbox = {
+    document: {
+      activeElement: null,
+      getElementById: (id) => elements.get(id) || null,
+      querySelectorAll: () => [],
+      createElement: (tag) => makePopupEl(`dyn-${tag}-${Math.random()}`),
+    },
+    window: { addEventListener() {} },
+    chrome: {
+      storage: { local: storage },
+      tabs: {
+        async query() {
+          return [{ id: 1, url: "https://mangadex.org/chapter/1" }];
+        },
+        async sendMessage() {},
+      },
+      runtime: {
+        getManifest: () => ({ version: "1.4.0" }),
+        async sendMessage(msg) {
+          if (msg.type === "GET_HEALTH") {
+            healthCalls += 1;
+            if (healthCalls === 1) {
+              return {
+                ok: true,
+                data: {
+                  ready: true,
+                  loading_stage: "restarting_llm",
+                  loading_progress: 35,
+                  loading_detail: "Restarting local LLM",
+                  translation_mode: "local",
+                },
+              };
+            }
+            return {
+              ok: true,
+              data: {
+                ready: true,
+                loading_stage: "ready",
+                loading_progress: 100,
+                loading_detail: "",
+                translation_mode: "local",
+                active_local_model: "shisa-v2-llama3.1-8b.gguf",
+                llm_ready: true,
+              },
+            };
+          }
+          if (msg.type === "GET_UPDATE_STATUS") {
+            return { ok: true, localVersion: "1.4.0", autoUpdateEnabled: true, data: { has_remote: false } };
+          }
+          return { ok: true };
+        },
+      },
+    },
+    URL,
+    Date,
+    Math,
+    JSON,
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Set,
+    Map,
+    Promise,
+    Error,
+    setTimeout: (fn, ms) => setTimeout(fn, Math.min(Number(ms) || 0, 15)),
+    clearTimeout,
+    console,
+  };
+  sandbox.globalThis = sandbox;
+
+  const popupSrc = fs.readFileSync(path.join(EXT_DIR, "popup.js"), "utf8");
+  vm.runInNewContext(popupSrc, sandbox, { filename: "extension/popup.js" });
+
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(healthCalls, 1);
+  assert.equal(elements.get("statusDot").className, "status-dot loading");
+  assert.equal(elements.get("statusText").textContent, "Reloading LLM... 35%");
+  assert.equal(elements.get("statusText").title, "Restarting local LLM");
+  assert.equal(elements.get("loadingProgressBar").hidden, false);
+  assert.equal(elements.get("loadingProgressFill").style.width, "35%");
+
+  // Scheduled poll runs and transitions to ready
+  await new Promise((r) => setTimeout(r, 35));
+  assert.ok(healthCalls >= 2);
+  assert.equal(elements.get("statusDot").className, "status-dot ready");
+  assert.equal(elements.get("statusText").textContent, "Local · Shisa JP");
+  assert.equal(elements.get("loadingProgressBar").hidden, true);
 });

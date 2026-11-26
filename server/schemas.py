@@ -70,6 +70,8 @@ class HealthResponse(BaseModel):
     llm_model: str
     llm_ready: bool
     loading_stage: str = ""
+    loading_progress: int = 0
+    loading_detail: str = ""
     extension_version: str = "1.0.0"
     extension_build_id: str = ""
     has_remote: bool = False

@@ -939,3 +939,241 @@ async def test_pipeline_stream_emits_incremental_ocr_status_events_and_cancels_b
     await pipeline2.stop()
     assert ocr_cancel_calls == 1
     assert translator2.calls == 0
+
+
+def test_startup_progress_tracker_monotonic_asymptotic_and_states() -> None:
+    from server.app import _StartupProgressTracker
+
+    now = [0.0]
+
+    def fake_now() -> float:
+        return now[0]
+
+    # 1. Local mode (lazy_llm=False)
+    tracker = _StartupProgressTracker(lazy_llm=False, stage="unloaded", now_fn=fake_now)
+    assert tracker.get_progress() == (0, "")
+
+    tracker.set_step("initializing")
+    p0, d0 = tracker.get_progress()
+    assert p0 == 0
+    assert d0
+
+    tracker.set_step("starting_llm", "Starting local LLM")
+    p_llm_start, d_llm = tracker.get_progress()
+    assert p_llm_start == 5
+    assert d_llm == "Starting local LLM"
+
+    now[0] = 15.0
+    p_llm_mid, _ = tracker.get_progress()
+    assert p_llm_start < p_llm_mid < 35
+
+    now[0] = 10_000.0
+    p_llm_cap, _ = tracker.get_progress()
+    assert p_llm_cap == 34  # capped at ceiling - 1
+
+    # Detector sub-steps advance monotonically
+    tracker.set_step("importing_transformers", "Importing vision libraries")
+    p_imp, _ = tracker.get_progress()
+    assert p_imp >= p_llm_cap
+    tracker.set_step("loading_weights", "Loading detector weights")
+    p_wt, _ = tracker.get_progress()
+    assert p_wt > p_imp
+
+    # Error freezes progress even as time advances
+    now[0] = 10_005.0
+    p_before_err, _ = tracker.get_progress()
+    tracker.mark_error("CUDA out of memory")
+    now[0] = 20_000.0
+    p_err, d_err = tracker.get_progress()
+    assert p_err == p_before_err
+    assert d_err == "CUDA out of memory"
+
+    # Ready returns 100; restarting_llm resets ramp and returns to 100 on completion
+    tracker.mark_ready()
+    assert tracker.get_progress()[0] == 100
+    tracker.set_step("restarting_llm", "Restarting local LLM")
+    p_restart, d_restart = tracker.get_progress()
+    assert 0 <= p_restart < 100
+    assert d_restart == "Restarting local LLM"
+    tracker.mark_ready()
+    assert tracker.get_progress()[0] == 100
+
+    # 2. Lazy LLM mode (lazy_llm=True)
+    now[0] = 0.0
+    lazy_tracker = _StartupProgressTracker(lazy_llm=True, stage="initializing", now_fn=fake_now)
+    lazy_tracker.set_step("loading_detector", "Loading bubble detector")
+    p_det, _ = lazy_tracker.get_progress()
+    lazy_tracker.set_step("loading_ocr_model", "Loading Japanese OCR")
+    p_ocr, _ = lazy_tracker.get_progress()
+    assert p_ocr > p_det
+
+
+def test_bubble_detector_load_emits_progress_callbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    from types import SimpleNamespace
+    from server import gpu_guard
+    from server.vision.detector import BubbleDetector
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+        def to(self, device):
+            return self
+
+        def half(self):
+            return self
+
+        def float(self):
+            return self
+
+    fake_transformers = SimpleNamespace(
+        AutoImageProcessor=SimpleNamespace(from_pretrained=lambda *a, **kw: object()),
+        AutoModelForObjectDetection=SimpleNamespace(from_pretrained=lambda *a, **kw: FakeModel()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(gpu_guard, "has_safe_vram_headroom", lambda min_free_mb: True)
+
+    events: list[tuple[str, str]] = []
+    det = BubbleDetector(device="cuda")
+    det.load(progress_cb=lambda step, detail: events.append((step, detail)))
+
+    assert events == [
+        ("importing_transformers", "Importing vision libraries"),
+        ("loading_processor", "Loading detector processor"),
+        ("loading_weights", "Loading detector weights"),
+        ("moving_to_gpu", "Moving detector to GPU"),
+    ]
+
+
+def test_api_503_progress_headers_health_progress_and_static_pages(tmp_path: Path) -> None:
+    cfg = AppConfig(project_root=Path(__file__).resolve().parent.parent, cache_dir=tmp_path / "cache")
+    app = create_app(cfg=cfg, pipeline=None, auto_load_models=False)
+    img_bytes = _make_sample_png_bytes()
+    b64_data_url = "data:image/png;base64," + base64.b64encode(img_bytes).decode("ascii")
+
+    with TestClient(app) as client:
+        # Unloaded state -> 0%
+        h_unloaded = client.get("/health").json()
+        assert h_unloaded["loading_stage"] == "unloaded"
+        assert h_unloaded["loading_progress"] == 0
+        assert h_unloaded["loading_detail"] == ""
+
+        # Active loading sub-step -> progress & headers on 503
+        app.state.loading_stage = "loading_ocr"
+        app.state.progress_tracker.set_step("loading_ocr_model", "Loading Japanese OCR")
+        h_loading = client.get("/health").json()
+        assert h_loading["ready"] is False
+        assert h_loading["loading_stage"] == "loading_ocr"
+        assert 1 <= h_loading["loading_progress"] <= 99
+        assert h_loading["loading_detail"] == "Loading Japanese OCR"
+
+        for endpoint in ("/translate", "/translate/stream"):
+            resp = client.post(endpoint, json={"image_base64": b64_data_url})
+            assert resp.status_code == 503
+            assert f"loading_ocr, {h_loading['loading_progress']}%" in resp.json()["detail"]
+            assert resp.headers["x-mlt-loading-stage"] == "loading_ocr"
+            assert int(resp.headers["x-mlt-loading-progress"]) == h_loading["loading_progress"]
+            assert resp.headers["x-mlt-loading-detail"] == "Loading Japanese OCR"
+
+        # Restarting LLM while ready -> progress < 100 in /health
+        app.state.ready = True
+        app.state.loading_stage = "restarting_llm"
+        app.state.progress_tracker.set_step("restarting_llm", "Restarting local LLM")
+        h_restart = client.get("/health").json()
+        assert h_restart["ready"] is True
+        assert h_restart["loading_stage"] == "restarting_llm"
+        assert 0 <= h_restart["loading_progress"] < 100
+        assert h_restart["loading_detail"] == "Restarting local LLM"
+
+        # Static UI pages surface loading_progress and loading_detail
+        idx_html = client.get("/").text
+        test_html = client.get("/test").text
+        assert "loading_progress" in idx_html and "loading_detail" in idx_html
+        assert "loading_progress" in test_html and "loading_detail" in test_html
+
+
+@pytest.mark.asyncio
+async def test_load_production_models_uses_to_thread_and_wires_progress_cb(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server.app as app_mod
+    import server.ocr.engine as ocr_mod
+    import server.translator.translator as tr_mod
+    import server.vision.detector as det_mod
+
+    to_thread_targets: list[str] = []
+    orig_to_thread = asyncio.to_thread
+
+    async def tracking_to_thread(func, /, *args, **kwargs):
+        to_thread_targets.append(getattr(func, "__name__", repr(func)))
+        return await orig_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(app_mod.asyncio, "to_thread", tracking_to_thread)
+    monkeypatch.setattr(app_mod, "_detect_torch_device", lambda: "cpu")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    seen_progress_cbs: list[str] = []
+
+    class FakeLlamaMgr:
+        base_url = "http://127.0.0.1:8766"
+
+        def __init__(self, cfg, gpu_guard=None):
+            self._process = None
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def is_healthy(self):
+            return True
+
+        def available_local_models(self):
+            return {"ja": True, "ko": False}
+
+    class FakeDetector:
+        def __init__(self, **kwargs):
+            pass
+
+        def load(self, progress_cb=None):
+            assert callable(progress_cb)
+            seen_progress_cbs.append("detector")
+            progress_cb("loading_weights", "Loading detector weights")
+
+    class FakeOcr:
+        def __init__(self, **kwargs):
+            pass
+
+        def load_ja(self, progress_cb=None):
+            assert callable(progress_cb)
+            seen_progress_cbs.append("ocr")
+            progress_cb("loading_ocr_model", "Loading Japanese OCR")
+
+    class FakeTranslator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("server.translator.llama_manager.LlamaServerManager", FakeLlamaMgr)
+    monkeypatch.setattr(det_mod, "BubbleDetector", FakeDetector)
+    monkeypatch.setattr(ocr_mod, "OcrEngine", FakeOcr)
+    monkeypatch.setattr(tr_mod, "DialogueTranslator", FakeTranslator)
+
+    cfg = AppConfig(project_root=tmp_path, cache_dir=tmp_path / "cache", translation_mode="local")
+    app = create_app(
+        cfg=cfg,
+        cache=TranslationCache(tmp_path / "cache" / "t.db"),
+        memory=ChapterMemoryStore(),
+        auto_load_models=False,
+    )
+    await app_mod._load_production_models(app)
+
+    assert app.state.ready is True
+    assert app.state.loading_stage == "ready"
+    assert seen_progress_cbs == ["detector", "ocr"]
+    assert "<lambda>" in to_thread_targets or "_detect_torch_device" in to_thread_targets
+    assert "load" in to_thread_targets
+    assert "load_ja" in to_thread_targets
+    await app.state.pipeline.stop()

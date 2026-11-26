@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Literal
 
 import numpy as np
@@ -265,8 +266,16 @@ class BubbleDetector:
         self._runtime_device: str = "cpu"
         self._use_fp16: bool = False
 
-    def load(self) -> None:
+    def load(self, progress_cb: Callable[[str, str], None] | None = None) -> None:
         """Load AutoImageProcessor and AutoModelForObjectDetection (RT-DETR / RT-DETR-v2) onto CUDA/CPU."""
+        def _notify(step: str, detail: str) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(step, detail)
+                except Exception:
+                    pass
+
+        _notify("importing_transformers", "Importing vision libraries")
         import torch
         from transformers import AutoImageProcessor, AutoModelForObjectDetection
         from server import gpu_guard
@@ -276,12 +285,19 @@ class BubbleDetector:
         )
         self._runtime_device = self.device if use_cuda else "cpu"
 
+        _notify("loading_processor", "Loading detector processor")
         try:
             self._processor = AutoImageProcessor.from_pretrained(self.model_id, local_files_only=True)
-            model = AutoModelForObjectDetection.from_pretrained(self.model_id, local_files_only=True)
         except OSError:
             self._processor = AutoImageProcessor.from_pretrained(self.model_id)
+
+        _notify("loading_weights", "Loading detector weights")
+        try:
+            model = AutoModelForObjectDetection.from_pretrained(self.model_id, local_files_only=True)
+        except OSError:
             model = AutoModelForObjectDetection.from_pretrained(self.model_id)
+
+        _notify("moving_to_gpu", "Moving detector to GPU")
         model.eval()
         model.to(self._runtime_device)
 
